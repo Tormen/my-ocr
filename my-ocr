@@ -13,7 +13,7 @@ NL="
 # deployed script cannot hide. SCRIPT_COMMIT is rewritten by 'stamp-version'
 # and is authoritative at runtime -- the deployed copy needs no git and no
 # repository. The build id is a hash of this file, so it is right even unstamped.
-SCRIPT_VERSION="v1.0"
+SCRIPT_VERSION="v1.1"
 SCRIPT_COMMIT="5be2558"           # rewritten by 'my-ocr stamp-version'
 
 WHOAMI="$(/usr/bin/whoami)"
