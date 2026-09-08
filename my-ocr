@@ -383,6 +383,7 @@ cleanup() { local rc=$?;
     # The mutex is a DIRECTORY, so it cannot go through schedule_for_cleanup,
     # whose remover is 'rm -f'.
     if [ $WE_HOLD_OCRAPP_MUTEX ]; then
+      close_ocrapp_if_ours
       rm -f "$OCRAPP_MUTEX_DIR/owner"; rmdir "$OCRAPP_MUTEX_DIR" 2>/dev/null \
         && { [ $DBG ] && echo "$$|      - '$OCRAPP_MUTEX_DIR' - Mutex released."; :; } \
         || echo "$$|      - '$OCRAPP_MUTEX_DIR' - FAILED to release the mutex!"
@@ -1813,6 +1814,22 @@ stale_run_files() {
   done
 }
 
+# If THIS run started the OCR application and is now dying before part-2 could
+# close it, close it here. Otherwise it is orphaned: every later run sees it
+# "already running" and leaves it be, so one crash leaks it permanently.
+close_ocrapp_if_ours() {
+  [ "$WE_HOLD_OCRAPP_MUTEX" = "1" ] || return 0     # not our run, not our app
+  [ -s "$OCRAPP_STATEFILE" ] && return 0            # it predates us: leave it be
+  _co_p="$(pgrep -x "$OCRAPP_NAME" 2>/dev/null | xargs echo)"
+  [ -n "$_co_p" ] || return 0
+  if pkill -x "$OCRAPP_NAME" 2>/dev/null; then
+    echo "$$| >>> [$WHAT] closed $OCRAPP_NAME (pid(s) $_co_p) -- we started it and are exiting"
+  else
+    echo "$$| >>> [$WHAT] WARNING :: could not close $OCRAPP_NAME (pid(s) $_co_p)"
+  fi
+  return 0
+}
+
 # Drop what a crashed run left behind, before it can poison this one. Only
 # provably dead owners. Runs at the start of every trigger-OCR.
 self_heal() {
@@ -1880,6 +1897,22 @@ do_reset() {
     else rm -f "$_rs_f" && { echo "    > removed ${_rs_f##*/}"; _rs_n=$(( _rs_n + 1 )); }; fi
   done
   [ -z "$_rs_any" ] && echo "    > none"
+
+  # A run that dies before part-2 orphans the OCR application. Every later run
+  # then sees it "already running", records it as pre-existing, and correctly
+  # leaves it alone -- so one crash leaks it for ever. With no my-ocr live, a
+  # running OCR app is by definition nobody's, and closing it is machinery.
+  echo "  >> $OCRAPP_NAME left over from a crashed run"
+  _rs_ap="$(pgrep -x "$OCRAPP_NAME" 2>/dev/null | xargs echo)"
+  if [ -z "$_rs_ap" ]; then
+    echo "    > not running"
+  elif [ -z "$_rs_go" ]; then
+    echo "    > WOULD CLOSE it (pid(s) $_rs_ap) -- no my-ocr run is live, so it is orphaned"
+  elif pkill -x "$OCRAPP_NAME" 2>/dev/null; then
+    echo "    > closed it (pid(s) $_rs_ap)"; _rs_n=$(( _rs_n + 1 ))
+  else
+    echo "    > FAILED to close it (pid(s) $_rs_ap) -- close it by hand"
+  fi
 
   echo "  >> lockfile / queued moves"
   if [ -s "$OCRAPP_LOCKFILE" ]; then
