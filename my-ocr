@@ -45,6 +45,18 @@ FILELIST_CNT=0; # number of files in the FILELIST
       [ -x "$_cp" ] && { c_pdfinfo="$_cp"; break; }
     done
   fi
+  # qpdf validates every object and stream, not just the trailer and page tree
+  # that pdfinfo reads -- which is exactly where a mangled OCR result hides.
+  if [ -z "$c_qpdf" ] || [ ! -x "$c_qpdf" ]; then
+    for _cq in /opt/homebrew/bin/qpdf /usr/local/bin/qpdf /usr/bin/qpdf; do
+      [ -x "$_cq" ] && { c_qpdf="$_cq"; break; }
+    done
+  fi
+  if [ -z "$c_pdftotext" ] || [ ! -x "$c_pdftotext" ]; then
+    for _ct in /opt/homebrew/bin/pdftotext /usr/local/bin/pdftotext /usr/bin/pdftotext; do
+      [ -x "$_ct" ] && { c_pdftotext="$_ct"; break; }
+    done
+  fi
   if [ -z "$c_convert" ] || [ ! -x "$c_convert" ]; then
     for _cc in /opt/homebrew/bin/convert /usr/local/bin/convert /usr/bin/convert; do
       [ -x "$_cc" ] && { c_convert="$_cc"; break; }
@@ -901,10 +913,50 @@ Should not be."
       if ! verify_ocr_result "$ocred_fp" "$orig_fp"; then
         VERIFY_REFUSED_CNT=$(( VERIFY_REFUSED_CNT + 1 ))
         echo "$$| >>> [$WHAT] REFUSING the result for '${orig_fp##*/}': $VERIFY_WHY"
-        echo "$$| >>> [$WHAT]   the ORIGINAL is untouched; the bad result stays at '$ocred_fp'"
+
+        # CLEAN ROLLBACK. Three things, in this order:
+        #   1. the bad result is TRASHED -- not left in the out-path where the
+        #      next run would trip over it, but recoverable if I judged wrong
+        #   2. the ORIGINAL is kept, and quarantined so it does not sit in the
+        #      queue looking pending. It is the document; the result is spoil.
+        #   3. the user is TOLD -- a silently refused document is the same as
+        #      a lost one, and only a person can decide to rescan.
+        _vo_dest="the queue"
+        if [ -n "$c_trash" ] && [ -x "$c_trash" ]; then
+          if "$c_trash" -- "$ocred_fp" >/dev/null 2>&1; then
+            echo "$$| >>> [$WHAT]   bad result trashed (recoverable): '${ocred_fp##*/}'"
+          else
+            echo "$$| >>> [$WHAT]   WARNING :: could not trash the bad result '$ocred_fp'"
+          fi
+        else
+          echo "$$| >>> [$WHAT]   WARNING :: no trash command -- bad result left at '$ocred_fp'"
+        fi
+
+        if [ -n "$MOVE_FAILED_TO" ]; then
+          mkdir -p "$MOVE_FAILED_TO" 2>/dev/null
+          _vo_q="$MOVE_FAILED_TO/${orig_fp##*/}"
+          [ -e "$_vo_q" ] && _vo_q="$MOVE_FAILED_TO/$(date +%Y-%m-%d_%H%M.%S)___${orig_fp##*/}"
+          if mv -- "$orig_fp" "$_vo_q" 2>/dev/null; then
+            echo "$$| >>> [$WHAT]   ORIGINAL rolled back and quarantined -> '$_vo_q'"
+            _vo_dest="$MOVE_FAILED_TO"
+          else
+            echo "$$| >>> [$WHAT]   WARNING :: could not quarantine '$orig_fp' -- it stays put"
+          fi
+        else
+          # the CLI case: no quarantine folder was given, so say where it IS
+          echo "$$| >>> [$WHAT]   ORIGINAL kept, unchanged: '$orig_fp'"
+          _vo_dest="${orig_fp%/*}"
+        fi
+
         [ -x "$my_notify" ] && "$my_notify" -- \
-          "[my-ocr] OCR result refused" \
-          "'${orig_fp##*/}': $VERIFY_WHY -- the original was NOT replaced." >/dev/null 2>&1
+          "[my-ocr] OCR REFUSED: ${orig_fp##*/}" \
+          "$VERIFY_WHY
+
+The original was NOT replaced -- it is in:
+  $_vo_dest
+
+The OCR result was discarded (to the Trash). The document has to be
+looked at, and probably scanned again." >/dev/null 2>&1
         continue
       fi
 
@@ -1857,13 +1909,16 @@ pages_of() { # $1 = file
 #     smaller result is the normal healthy outcome, not a symptom.
 verify_ocr_result() { # $1 = result, $2 = original.  0 = usable, 1 = refuse
   VERIFY_WHY=""
-  # Without pdfinfo nothing here can be decided. Refusing every result would
-  # turn a safety check into a total outage, and "cannot check" is not
-  # evidence of a bad result -- so proceed, loudly, exactly as before.
-  if [ -z "$c_pdfinfo" ] || [ ! -x "$c_pdfinfo" ]; then
-    echo "$$| >>> [$WHAT] WARNING :: cannot verify the result: no pdfinfo (c_pdfinfo='$c_pdfinfo')"
-    return 0
-  fi
+  # These tools are REQUIRED, not optional: a result that cannot be verified is
+  # about to replace an original that is then trashed. setup refuses to install
+  # without them, so reaching this without one means the host changed since.
+  for _vo_t in "$c_pdfinfo" "$c_qpdf" "$c_pdftotext"; do
+    [ -n "$_vo_t" ] && [ -x "$_vo_t" ] && continue
+    err 153 "Cannot verify the OCR result: pdfinfo/qpdf/pdftotext are all required
+(c_pdfinfo='$c_pdfinfo' c_qpdf='$c_qpdf' c_pdftotext='$c_pdftotext').
+Install them (brew install poppler qpdf) and re-run '$US setup'. Refusing to
+replace an original with a result nothing has checked."
+  done
   if ! "$c_pdfinfo" "$1" >/dev/null 2>&1; then
     VERIFY_WHY="it does not parse as a PDF"; return 1
   fi
@@ -1881,6 +1936,29 @@ verify_ocr_result() { # $1 = result, $2 = original.  0 = usable, 1 = refuse
     *"$OCRAPP_PRODUCER_TAG"*) ;;
     *) VERIFY_WHY="it was not produced by $OCRAPP_NAME (Producer: '${_vo_prod:-none}')"; return 1 ;;
   esac
+
+  # Structure: qpdf walks every object and stream. pdfinfo reads only the
+  # trailer, catalog and page tree, so a valid catalog over damaged content
+  # passes it and fails here -- which is the shape a mangled result takes.
+  "$c_qpdf" --check "$1" >/dev/null 2>&1
+  _vo_q=$?
+  # qpdf's exit codes are graded and MUST be read as such:
+  #   0 = clean, 3 = warnings only, 2 (and anything else) = real damage.
+  # Treating every non-zero as damage would quarantine healthy documents over
+  # cosmetic warnings, which plenty of real-world PDFs carry.
+  case "$_vo_q" in
+    0) ;;
+    3) echo "$$| >>> [$WHAT] note: qpdf reports warnings (not damage) for '${1##*/}'" ;;
+    *) VERIFY_WHY="qpdf reports it as structurally damaged (exit $_vo_q)"; return 1 ;;
+  esac
+
+  # A result with no text layer means the OCR produced nothing usable. That is
+  # the whole point of the run, so it is a failure, not a note.
+  _vo_tx="$("$c_pdftotext" "$1" - 2>/dev/null | tr -d '[:space:]' | wc -c | tr -d ' ')"
+  case "$_vo_tx" in ''|*[!0-9]*) _vo_tx=0 ;; esac
+  if [ "$_vo_tx" -eq 0 ]; then
+    VERIFY_WHY="it carries NO text layer -- the OCR recognised nothing"; return 1
+  fi
   if [ -n "$_vo_in" ] && [ "$_vo_out" -gt "$_vo_in" ]; then
     echo "$$| >>> [$WHAT] note: $OCRAPP_NAME split pages -- $_vo_in in, $_vo_out out ('${2##*/}')"
   fi
@@ -2539,7 +2617,7 @@ Try:   su - ${_su_gui:-<the console user>} -c '$US setup${1:+ $1}'"
 
   # An UNSET tool is not "nothing to check" -- it is a capability that will
   # fail at the first file that needs it. Name it rather than skipping it.
-  for _su_n in trash convert pdfinfo; do
+  for _su_n in trash convert pdfinfo qpdf pdftotext; do
     eval "_su_c=\$c_$_su_n"
     if [ -z "$_su_c" ]; then
       echo "    > $(printf '%-13s' "$_su_n") NOT SET (c_$_su_n) -- a declared capability that would fail at the first file needing it"
@@ -2715,26 +2793,47 @@ t_concurrency_state() {
 }
 
 # A PDF with N pages and a given Producer -- enough for pdfinfo to read both.
-t_mkpdf() { # $1 = file, $2 = pages, $3 = producer
-  /usr/bin/python3 - "$1" "$2" "$3" <<'_EOMK_'
+t_mkpdf() { # $1 = file, $2 = pages, $3 = producer, $4 = text ("" = no text layer)
+  /usr/bin/python3 - "$1" "$2" "$3" "${4-Hello OCR}" <<'_EOMK_'
 import sys
 path, npages, producer = sys.argv[1], int(sys.argv[2]), sys.argv[3]
-objs = []
-kids = " ".join("%d 0 R" % (3 + i) for i in range(npages))
-objs.append(b"<< /Type /Catalog /Pages 2 0 R >>")
-objs.append(("<< /Type /Pages /Kids [%s] /Count %d >>" % (kids, npages)).encode())
+text = sys.argv[4] if len(sys.argv) > 4 else ""
+objs, page_ids = [], []
+objs.append(None)                                    # 1: catalog, filled below
+objs.append(None)                                    # 2: pages,   filled below
+nxt = 3
+stream_id = font_id = None
+if text:
+    body = ("BT /F1 24 Tf 40 100 Td (%s) Tj ET" % text).encode()
+    stream_id = nxt; nxt += 1
+    font_id   = nxt; nxt += 1
 for _ in range(npages):
-    objs.append(b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] >>")
-objs.append(("<< /Producer (%s) >>" % producer).encode())
-out = b"%PDF-1.4\n"; offs = []
-for i, o in enumerate(objs, 1):
-    offs.append(len(out)); out += b"%d 0 obj\n" % i + o + b"\nendobj\n"
-x = len(out)
-out += b"xref\n0 %d\n" % (len(objs) + 1) + b"0000000000 65535 f \n"
-for o in offs:
-    out += b"%010d 00000 n \n" % o
+    page_ids.append(nxt); nxt += 1
+producer_id = nxt
+for pid in page_ids:
+    extra = ""
+    if text:
+        extra = " /Contents %d 0 R /Resources << /Font << /F1 %d 0 R >> >>" % (stream_id, font_id)
+    else:
+        extra = " /Resources << >>"
+    objs.append((pid, ("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 200]%s >>" % extra).encode()))
+kids = " ".join("%d 0 R" % p for p in page_ids)
+fixed = [(1, b"<< /Type /Catalog /Pages 2 0 R >>"),
+         (2, ("<< /Type /Pages /Kids [%s] /Count %d >>" % (kids, npages)).encode())]
+if text:
+    fixed.append((stream_id, b"<< /Length %d >>\nstream\n" % len(body) + body + b"\nendstream"))
+    fixed.append((font_id, b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"))
+fixed.append((producer_id, ("<< /Producer (%s) >>" % producer).encode()))
+allobjs = sorted(fixed + [o for o in objs if isinstance(o, tuple)], key=lambda t: t[0])
+out = b"%PDF-1.4\n"; offs = {}
+for num, payload in allobjs:
+    offs[num] = len(out); out += b"%d 0 obj\n" % num + payload + b"\nendobj\n"
+x = len(out); top = max(offs) + 1
+out += b"xref\n0 %d\n" % top + b"0000000000 65535 f \n"
+for n in range(1, top):
+    out += b"%010d 00000 n \n" % offs.get(n, 0)
 out += ("trailer\n<< /Size %d /Root 1 0 R /Info %d 0 R >>\nstartxref\n%d\n%%%%EOF\n"
-        % (len(objs) + 1, len(objs), x)).encode()
+        % (top, producer_id, x)).encode()
 open(path, "wb").write(out)
 _EOMK_
 }
@@ -2752,6 +2851,7 @@ t_verify_result() {
   t_mkpdf "$_vd/out3.pdf" 3 "FineReader"
   t_mkpdf "$_vd/out5.pdf" 5 "FineReader"
   t_mkpdf "$_vd/notours.pdf" 3 "SomethingElse"
+  t_mkpdf "$_vd/notext.pdf"  3 "FineReader" ""
 
   if verify_ocr_result "$_vd/out1.pdf" "$_vd/in3.pdf"; then
     t_bad "verify: a result that LOST pages is refused" "3 in, 1 out was accepted -- that is a lost document"
@@ -2786,6 +2886,49 @@ t_verify_result() {
     t_bad "verify: an unparseable result is refused" "an empty file was accepted"
   else
     t_ok "verify: an unparseable result is refused"
+  fi
+
+  # A structurally damaged result: valid header, truncated body. pdfinfo can
+  # be fooled by this shape; qpdf is what catches it.
+  head -c 400 "$_vd/out3.pdf" >"$_vd/cut.pdf" 2>/dev/null
+  if verify_ocr_result "$_vd/cut.pdf" "$_vd/in3.pdf"; then
+    t_bad "verify: a structurally damaged result is refused" "a truncated PDF was accepted"
+  else
+    t_ok "verify: a structurally damaged result is refused ($VERIFY_WHY)"
+  fi
+
+  # No text layer = the OCR recognised nothing. t_mkpdf writes pages with no
+  # content stream at all, so out3.pdf has no extractable text.
+  if [ -n "$c_pdftotext" ] && [ -x "$c_pdftotext" ]; then
+    if verify_ocr_result "$_vd/notext.pdf" "$_vd/in3.pdf"; then
+      t_bad "verify: a result with NO text layer is refused" "the OCR recognised nothing, yet it was accepted"
+    else
+      case "$VERIFY_WHY" in
+        *"NO text layer"*) t_ok "verify: a result with NO text layer is refused";;
+        *) t_bad "verify: a result with NO text layer is refused" "wrong reason: $VERIFY_WHY";;
+      esac
+    fi
+  fi
+
+  # A refusal must be a CLEAN rollback: bad result gone, original kept and
+  # quarantined, user told. Any one of the three missing turns a refusal into
+  # a silent loss or a stale file the next run trips over.
+  _vr="$(awk '/^do_part_2\(\)/,/^\}/' "$0")"
+  if printf '%s' "$_vr" | grep -q 'c_trash" -- "\$ocred_fp"'; then
+    t_ok "refusal: the bad result is trashed, not left in the out-path"
+  else
+    t_bad "refusal: the bad result is trashed, not left in the out-path" \
+      "the next run would find it sitting there"
+  fi
+  if printf '%s' "$_vr" | grep -q 'MOVE_FAILED_TO/\$'; then
+    t_ok "refusal: the original is quarantined, not left looking pending"
+  else
+    t_bad "refusal: the original is quarantined, not left looking pending" ""
+  fi
+  if printf '%s' "$_vr" | grep -q 'OCR REFUSED'; then
+    t_ok "refusal: the user is told"
+  else
+    t_bad "refusal: the user is told" "a silently refused document is a lost one"
   fi
 
   # ...and it must run BEFORE anything is trashed, or it protects nothing
