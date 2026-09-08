@@ -53,6 +53,32 @@ my-ocr --run-tests          the regression suite; starts no OCR
 document: anything stranded mid-flight is *moved* to `RESET_RETRY_TO` and the
 command to retry it is printed. It refuses while a run is live.
 
+## Checking the result before it replaces the original
+
+The result replaces the original in place, and the original goes to the Trash a
+moment earlier -- so an unchecked bad result is a lost document. Before that
+happens my-ocr requires all of:
+
+- it parses as a PDF
+- its page count is **not lower** than the input's. More is fine: the OCR
+  application splits a sheet it believes holds several pages.
+- its Producer names the OCR application -- proof the result is really its
+  output and not a passthrough or a stale file from an earlier run
+- `qpdf --check` passes. qpdf walks every object and stream; `pdfinfo` reads
+  only the trailer, catalogue and page tree, so a valid catalogue over damaged
+  content passes that and fails this. Its exit is graded: 0 clean, 3 warnings
+  only, 2 damage.
+- it carries a text layer. No text means the OCR recognised nothing, which is
+  the entire point of the run.
+
+Deliberately NOT checked: file size, because MRC compression is on and a much
+smaller result is the healthy outcome; and image counts, because MRC splits one
+scan image into mask/foreground/background layers.
+
+**A refusal is a clean rollback:** the bad result is trashed, the ORIGINAL is
+kept and moved to `--move-failed-to`, and you are notified with the reason and
+where the document now is.
+
 ## Requirements
 
 - macOS with the OCR application installed, exposing its Automator action

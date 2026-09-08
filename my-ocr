@@ -14,7 +14,7 @@ NL="
 # and is authoritative at runtime -- the deployed copy needs no git and no
 # repository. The build id is a hash of this file, so it is right even unstamped.
 SCRIPT_VERSION="v1.1"
-SCRIPT_COMMIT="5be2558"           # rewritten by 'my-ocr stamp-version'
+SCRIPT_COMMIT="c76082e"           # rewritten by 'my-ocr stamp-version'
 
 WHOAMI="$(/usr/bin/whoami)"
 [ "$USER" = "$WHOAMI" ] || err 126 "USER '$USER' ? != ? '$WHOAMI' WHOAMI"
