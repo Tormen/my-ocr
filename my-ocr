@@ -40,6 +40,11 @@ FILELIST_CNT=0; # number of files in the FILELIST
   # host -- on one machine it defines convert, on another it does not, and the
   # JPEG/PNG health check then ran '' and died with 127 on an empty command.
   # A declared capability must not depend on a config file being complete.
+  if [ -z "$c_pdfinfo" ] || [ ! -x "$c_pdfinfo" ]; then
+    for _cp in /opt/homebrew/bin/pdfinfo /usr/local/bin/pdfinfo /usr/bin/pdfinfo; do
+      [ -x "$_cp" ] && { c_pdfinfo="$_cp"; break; }
+    done
+  fi
   if [ -z "$c_convert" ] || [ ! -x "$c_convert" ]; then
     for _cc in /opt/homebrew/bin/convert /usr/local/bin/convert /usr/bin/convert; do
       [ -x "$_cc" ] && { c_convert="$_cc"; break; }
@@ -875,6 +880,7 @@ $(cat "$QUEUED_FILE_MOVES_LOG"|sed -e "s/.*/${PFX}       | '&'/")"
 
     local moved_cnt=0;
     local ocred_cnt=0;
+    VERIFY_REFUSED_CNT=0;
     [ $DBG ] && echo "${PFX}Going through PROVIDED_FILES_FILELIST to find matches within the QUEUED_FILE_MOVES_LOG..."
     while read ocred_fp; do
       ocred_cnt=$(( $ocred_cnt + 1 ));
@@ -889,6 +895,18 @@ Should not be."
       [ $DBG ] && echo "${PFX}   file #$ocred_cnt: Found corresponding orig filename '$orig_fp'"
 
       [ -e "$orig_fp" ] || err 058 "FAILED to locate file \"$orig_fp\" (pwd='$(pwd)'). Should not be."
+
+      # Check BEFORE anything is trashed or overwritten: from here on the
+      # original is destroyed, so this is the last moment it can be saved.
+      if ! verify_ocr_result "$ocred_fp" "$orig_fp"; then
+        VERIFY_REFUSED_CNT=$(( VERIFY_REFUSED_CNT + 1 ))
+        echo "$$| >>> [$WHAT] REFUSING the result for '${orig_fp##*/}': $VERIFY_WHY"
+        echo "$$| >>> [$WHAT]   the ORIGINAL is untouched; the bad result stays at '$ocred_fp'"
+        [ -x "$my_notify" ] && "$my_notify" -- \
+          "[my-ocr] OCR result refused" \
+          "'${orig_fp##*/}': $VERIFY_WHY -- the original was NOT replaced." >/dev/null 2>&1
+        continue
+      fi
 
       if [ "$orig_fp" = "$result_fp" ]; then # ... we trash BEFORE we move (in order to make place for the move)!
         # TRASH does NOT work on NETWORK SHARES !
@@ -931,6 +949,10 @@ _EOF_
     [ $new_queued_cnt -eq 0 ] && tmp=" -- all files queued for move done :)" || tmp=". !!! STILL $new_queued_cnt files LEFT in queue for move:
 $(cat "$QUEUED_FILE_MOVES_LOG"|sed -e "s/^/${PFX}       | /")"
     echo "$$| >>> [part-2] ${x}Moved $moved_cnt /of/ $ocred_cnt just OCRed files${tmp}"
+    if [ "${VERIFY_REFUSED_CNT:-0}" -gt 0 ]; then
+      echo "$$| >>> [part-2] ${x}REFUSED $VERIFY_REFUSED_CNT result(s): the original was kept, not replaced."
+      echo "$$| >>> [part-2] ${x}  Look at them in '$T_PATH' before deciding what to do."
+    fi
 
     [ $new_queued_cnt -eq 0 ] || err 053 "QUEUED_FILE_MOVES_LOG *should* be EMPTY at this point${tmp}
 
@@ -1814,6 +1836,57 @@ stale_run_files() {
   done
 }
 
+# Pages in a file. A picture is one page; "" means we could not tell.
+pages_of() { # $1 = file
+  case "$(file --brief "$1" 2>/dev/null | cut -f1 -d' ')" in
+    PDF)           "$c_pdfinfo" "$1" 2>/dev/null | awk '/^Pages:/{print $2; exit}' ;;
+    JPEG|PNG|TIFF) echo 1 ;;
+    *)             echo "" ;;
+  esac
+}
+
+# The result REPLACES the original, and the original is moved to the Trash a
+# moment BEFORE that -- so an unchecked bad result is a lost document. Look
+# at it while the original is still there.
+#
+# PAGES is the check that matters: a truncated or half-recognised result comes
+# back with fewer pages than went in, and nothing else notices.
+#   - MORE pages is NOT a failure. The OCR application splits a sheet it
+#     believes holds several pages; that is a feature, common with book scans.
+#   - SIZE is deliberately not checked. MRC compression is on, so a much
+#     smaller result is the normal healthy outcome, not a symptom.
+verify_ocr_result() { # $1 = result, $2 = original.  0 = usable, 1 = refuse
+  VERIFY_WHY=""
+  # Without pdfinfo nothing here can be decided. Refusing every result would
+  # turn a safety check into a total outage, and "cannot check" is not
+  # evidence of a bad result -- so proceed, loudly, exactly as before.
+  if [ -z "$c_pdfinfo" ] || [ ! -x "$c_pdfinfo" ]; then
+    echo "$$| >>> [$WHAT] WARNING :: cannot verify the result: no pdfinfo (c_pdfinfo='$c_pdfinfo')"
+    return 0
+  fi
+  if ! "$c_pdfinfo" "$1" >/dev/null 2>&1; then
+    VERIFY_WHY="it does not parse as a PDF"; return 1
+  fi
+  _vo_out="$(pages_of "$1")"
+  case "$_vo_out" in ''|*[!0-9]*)
+    VERIFY_WHY="its page count cannot be read"; return 1 ;;
+  esac
+  _vo_in="$(pages_of "$2")"
+  case "$_vo_in" in ''|*[!0-9]*) _vo_in="" ;; esac
+  if [ -n "$_vo_in" ] && [ "$_vo_out" -lt "$_vo_in" ]; then
+    VERIFY_WHY="it LOST pages -- $_vo_in went in, $_vo_out came out"; return 1
+  fi
+  _vo_prod="$("$c_pdfinfo" "$1" 2>/dev/null | awk -F': *' '/^Producer:/{print $2; exit}')"
+  case "$_vo_prod" in
+    *"$OCRAPP_PRODUCER_TAG"*) ;;
+    *) VERIFY_WHY="it was not produced by $OCRAPP_NAME (Producer: '${_vo_prod:-none}')"; return 1 ;;
+  esac
+  if [ -n "$_vo_in" ] && [ "$_vo_out" -gt "$_vo_in" ]; then
+    echo "$$| >>> [$WHAT] note: $OCRAPP_NAME split pages -- $_vo_in in, $_vo_out out ('${2##*/}')"
+  fi
+  return 0
+}
+
 # If THIS run started the OCR application and is now dying before part-2 could
 # close it, close it here. Otherwise it is orphaned: every later run sees it
 # "already running" and leaves it be, so one crash leaks it permanently.
@@ -2641,6 +2714,93 @@ t_concurrency_state() {
   fi
 }
 
+# A PDF with N pages and a given Producer -- enough for pdfinfo to read both.
+t_mkpdf() { # $1 = file, $2 = pages, $3 = producer
+  /usr/bin/python3 - "$1" "$2" "$3" <<'_EOMK_'
+import sys
+path, npages, producer = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+objs = []
+kids = " ".join("%d 0 R" % (3 + i) for i in range(npages))
+objs.append(b"<< /Type /Catalog /Pages 2 0 R >>")
+objs.append(("<< /Type /Pages /Kids [%s] /Count %d >>" % (kids, npages)).encode())
+for _ in range(npages):
+    objs.append(b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] >>")
+objs.append(("<< /Producer (%s) >>" % producer).encode())
+out = b"%PDF-1.4\n"; offs = []
+for i, o in enumerate(objs, 1):
+    offs.append(len(out)); out += b"%d 0 obj\n" % i + o + b"\nendobj\n"
+x = len(out)
+out += b"xref\n0 %d\n" % (len(objs) + 1) + b"0000000000 65535 f \n"
+for o in offs:
+    out += b"%010d 00000 n \n" % o
+out += ("trailer\n<< /Size %d /Root 1 0 R /Info %d 0 R >>\nstartxref\n%d\n%%%%EOF\n"
+        % (len(objs) + 1, len(objs), x)).encode()
+open(path, "wb").write(out)
+_EOMK_
+}
+
+# The result REPLACES the original and the original is trashed a moment
+# earlier, so this check is the only thing standing between a mangled OCR and
+# a lost document.
+t_verify_result() {
+  if [ -z "$c_pdfinfo" ] || [ ! -x "$c_pdfinfo" ]; then
+    t_ok "result verification: skipped, no pdfinfo on this host"; return 0
+  fi
+  _vd="$T_TMP/verify"; mkdir -p "$_vd"
+  t_mkpdf "$_vd/in3.pdf"  3 "SomeScanner"
+  t_mkpdf "$_vd/out1.pdf" 1 "FineReader"
+  t_mkpdf "$_vd/out3.pdf" 3 "FineReader"
+  t_mkpdf "$_vd/out5.pdf" 5 "FineReader"
+  t_mkpdf "$_vd/notours.pdf" 3 "SomethingElse"
+
+  if verify_ocr_result "$_vd/out1.pdf" "$_vd/in3.pdf"; then
+    t_bad "verify: a result that LOST pages is refused" "3 in, 1 out was accepted -- that is a lost document"
+  else
+    case "$VERIFY_WHY" in
+      *"LOST pages"*) t_ok "verify: a result that LOST pages is refused ($VERIFY_WHY)";;
+      *) t_bad "verify: a result that LOST pages is refused" "refused, but for the wrong reason: $VERIFY_WHY";;
+    esac
+  fi
+
+  if verify_ocr_result "$_vd/out3.pdf" "$_vd/in3.pdf"; then
+    t_ok "verify: an equal-page result is accepted"
+  else
+    t_bad "verify: an equal-page result is accepted" "$VERIFY_WHY"
+  fi
+
+  # MORE pages is legitimate: the OCR app splits a sheet holding several pages
+  if verify_ocr_result "$_vd/out5.pdf" "$_vd/in3.pdf" >/dev/null; then
+    t_ok "verify: MORE pages out is accepted (page splitting is a feature)"
+  else
+    t_bad "verify: MORE pages out is accepted (page splitting is a feature)" "$VERIFY_WHY"
+  fi
+
+  if verify_ocr_result "$_vd/notours.pdf" "$_vd/in3.pdf"; then
+    t_bad "verify: a result not produced by the OCR app is refused" "it was accepted"
+  else
+    t_ok "verify: a result not produced by the OCR app is refused"
+  fi
+
+  : >"$_vd/empty.pdf"
+  if verify_ocr_result "$_vd/empty.pdf" "$_vd/in3.pdf"; then
+    t_bad "verify: an unparseable result is refused" "an empty file was accepted"
+  else
+    t_ok "verify: an unparseable result is refused"
+  fi
+
+  # ...and it must run BEFORE anything is trashed, or it protects nothing
+  _vc="$(awk '/^do_part_2\(\)/,/^\}/' "$0" \
+        | awk '/verify_ocr_result/ { v=NR }
+               /mv\" -- \"\$orig_fp\"|c_trash\" -- \"\$orig_fp/ { if (!t) t=NR }
+               END { print (v>0 && (t==0 || v<t)) ? "ok" : "bad v=" v " t=" t }')"
+  if [ "$_vc" = "ok" ]; then
+    t_ok "verify: the check runs before the original is trashed"
+  else
+    t_bad "verify: the check runs before the original is trashed" \
+      "$_vc -- checking after the trash protects nothing"
+  fi
+}
+
 t_status_and_setup() {
   _pre_mutex=""; [ -d "$OCRAPP_MUTEX_DIR" ] && _pre_mutex=1
   _o="$("$0" --status 2>&1)"
@@ -2700,6 +2860,7 @@ do_run_tests() {
   t_wait_is_evidence_based
   t_mutex
   t_concurrency_state
+  t_verify_result
   t_status_and_setup
   rm -rf "$T_TMP"
   echo "  ----"
