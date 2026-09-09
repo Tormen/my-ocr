@@ -3,6 +3,14 @@
 Drives a single-instance OCR application (ABBYY FineReader) from the shell, and
 guarantees that only one OCR run exists at a time.
 
+Built for and verified against **ABBYY FineReader Pro for Mac 12.1.14**
+(`/Applications/FineReader.app`, bundle `com.abbyy.FineReaderPro`) -- a GUI-only
+application with no command line. **Together with [my-scan](../my-scan/) it is
+especially useful**: my-scan receives the scanner's delivery and files the
+result, my-ocr turns that FineReader into an unattended, scriptable OCR step.
+my-ocr is usable on its own from the shell; the OCR itself is not -- without
+that FineReader installed there is nothing to drive.
+
 ```sh
 my-ocr scan.pdf                  # OCR in place; blocks until it is our turn
 printf '%s\n' a.pdf b.png | my-ocr
