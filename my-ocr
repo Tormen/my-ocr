@@ -1,6 +1,6 @@
 #!/bin/dash
 
-# 135 == highest used errCode
+# 155 == highest used errCode
 
 US="${0##*/}";   # get filename without path
 
@@ -14,7 +14,7 @@ NL="
 # and is authoritative at runtime -- the deployed copy needs no git and no
 # repository. The build id is a hash of this file, so it is right even unstamped.
 SCRIPT_VERSION="v1.1"
-SCRIPT_COMMIT="c76082e"           # rewritten by 'my-ocr stamp-version'
+SCRIPT_COMMIT="a34a831"           # rewritten by 'my-ocr stamp-version'
 
 WHOAMI="$(/usr/bin/whoami)"
 [ "$USER" = "$WHOAMI" ] || err 126 "USER '$USER' ? != ? '$WHOAMI' WHOAMI"
@@ -218,6 +218,9 @@ a file called '--part-1' ;))
                  can never report the same string.
 stamp-version    Record the current commit into this file (run before deploying).
 --run-tests      Run the built-in regression tests and exit. Starts no OCR.
+--test-mail      Send ONE test alert the way a STUCK alert goes (my-notify:
+                 a notification plus a mail) and exit. Fails, with
+                 my-notify's exit status, when it cannot be sent.
 -S|--status OR status
                  Print what my-ocr is doing (mutex, OCR app, queue) and exit.
                  Read-only: starts nothing and takes no lock. -V adds paths.
@@ -1189,18 +1192,23 @@ prepare_file_for_ocr() { local fp="$1"; local cnt="$2";  local expected_path="$3
 }
 
 
+# The one way an alert leaves my-ocr, shared by alert_stuck and --test-mail so
+# that a passing test says something about the real alerts. ONE my-notify call
+# does both a notification and a mail; '--mail' ends the '--' parameter list.
+# stderr is NOT redirected: if my-notify cannot alert, that belongs in the log
+# -- it is the one failure we must not lose. Returns my-notify's exit status.
+send_alert() { # $1 = subject, $2 = notification text, $3 = mail body
+  "$my_notify" -- "$1" "$2" --mail "$1" "$3"
+}
+
 # Three channels, because each one alone can be missed: a notification for
 # whoever is at the machine, a mail for whoever is not, and a file on the
 # Desktop that is still there tomorrow.
 alert_stuck() { _as_m="$1"
   echo "$$| >>> [trigger-OCR] !!! $_as_m"
 
-  # ONE my-notify call does both; '--mail' ends the '--' parameter list.
-  # stderr is NOT redirected: if my-notify cannot alert, that belongs in this
-  # log -- it is the one failure we must not lose.
   # $(cat ...) is the portable slurp; $(<file) yields an EMPTY string in dash.
-  "$my_notify" -- "my-ocr STUCK" "$_as_m" \
-               --mail "my-ocr STUCK" "$_as_m
+  send_alert "my-ocr STUCK" "$_as_m" "$_as_m
 
 still queued in '$QUEUED_FILE_MOVES_LOG':
 $(cat "$QUEUED_FILE_MOVES_LOG")" \
@@ -1556,7 +1564,7 @@ t_cleanup_pattern_interpreter_agnostic() {
 t_help_claims() {
   _h="$("$0" --help 2>&1)"
   # every option --help lists must be accepted by the parser
-  for _o in --part-1 --part-2 -F -V -D --log --no-log -f --file; do
+  for _o in --part-1 --part-2 -F -V -D --log --no-log -f --file --test-mail; do
     case "$_h" in *"$_o"*) ;; *) continue;; esac
     # an option may be written '-F)' or, alternated, '-F|--force)'
     if grep -q -- "$_o)" "$0" || grep -q -- "$_o|" "$0"; then :; else
@@ -1664,7 +1672,7 @@ t_wait_is_evidence_based() {
                  || t_bad "the AUTOMATOR wait ends on evidence, never on a clock" \
                           "a timeout here releases the lock while $OCRAPP_NAME may still run"
   # the alert must reach all three channels
-  _a="$(awk '/^alert_stuck\(\)/,/^}/' "$0")"
+  _a="$(awk '/^alert_stuck\(\)/,/^}/; /^send_alert\(\)/,/^}/' "$0")"
   _n=0
   case "$_a" in *'"$my_notify" --'*)   _n=$(( $_n + 1 ));; esac
   case "$_a" in *'--mail'*)            _n=$(( $_n + 1 ));; esac
@@ -1816,6 +1824,27 @@ do_version() {
   else
     echo "$US $SCRIPT_VERSION (build $_bid, unstamped)"
   fi
+}
+
+# --test-mail: ONE alert through send_alert(), the call the real STUCK alerts
+# make -- a notification and a mail -- so a passing test says something about
+# them. my-ocr has no config file; the recipient is my-notify's own default.
+do_test_mail() {
+  [ -x "$my_notify" ] || err 154 "my_notify='$my_notify' is not executable."
+  _tm_to="the my-notify default recipient"
+  send_alert "$US test mail" "test alert -- a test mail went out too" \
+"This is a test mail from '$US --test-mail'. It went out through
+send_alert(), the call my-ocr's real STUCK alerts use.
+
+Host:    $(hostname -s)
+User:    $(id -un)
+Time:    $(date '+%Y-%m-%d %H:%M:%S %Z')
+Config:  none -- my-ocr keeps its settings in the script: $0
+Version: $(do_version)"
+  _tm_rc=$?
+  [ "$_tm_rc" -eq 0 ] || err 155 "test mail to $_tm_to NOT sent [my-notify rc $_tm_rc]"
+  echo " >>> test mail sent to $_tm_to [my-notify rc $_tm_rc]"
+  return 0
 }
 
 # Record the commit this file came from, INTO the file, then amend that commit.
@@ -2989,6 +3018,66 @@ t_status_and_setup() {
   fi
 }
 
+# --- --test-mail goes the STUCK alert's way, and a failure is not a pass.
+#     Runs a COPY of this file whose my_notify is a stub: no real mail, ever.
+t_test_mail() {
+  _d="$T_TMP/testmail"; mkdir -p "$_d"; _a="$_d/notify.args"
+  cat >"$_d/my-notify.stub" <<'_EOSTUB_'
+#!/bin/dash
+_d="$(dirname "$0")"
+printf '%s\n' "$@" --- >>"$_d/notify.args"
+exit "$(cat "$_d/notify.rc" 2>/dev/null || echo 0)"
+_EOSTUB_
+  chmod +x "$_d/my-notify.stub"
+  sed -e "s|^  my_notify=.*|  my_notify=\"$_d/my-notify.stub\"|" "$0" >"$_d/my-ocr"
+  chmod +x "$_d/my-ocr"
+  if ! grep -q "^  my_notify=\"$_d/my-notify.stub\"" "$_d/my-ocr"; then
+    t_bad "test-mail: stub my-notify wired in" "my_notify line not found -- refusing to risk a real mail"
+    return 0
+  fi
+
+  # sent: ONE my-notify call, notification + mail; no file argument is touched
+  _o="$("$_d/my-ocr" --test-mail /nonexistent/not-a-file 2>&1 </dev/null)"; _r=$?
+  case "$_r|$_o" in
+    "0|"*"test mail sent to the my-notify default recipient [my-notify rc 0]"*)
+      t_ok "test-mail: sent, and says so [rc 0]";;
+    *) t_bad "test-mail: sent, and says so [rc 0]" "rc=$_r: $(printf '%s' "$_o" | tail -n 1)";;
+  esac
+  _calls="$(grep -c '^---$' "$_a" 2>/dev/null)"
+  _args="$(tr '\n' '|' <"$_a" 2>/dev/null)"
+  # the copy is named my-ocr, so that is the name in its subject
+  case "$_calls|$_args" in
+    "1|--|my-ocr test mail|"*"|--mail|my-ocr test mail|"*)
+      t_ok "test-mail: one my-notify call, the same '-- ... --mail ...' as STUCK";;
+    *) t_bad "test-mail: one my-notify call, the same '-- ... --mail ...' as STUCK" "calls=$_calls args=$_args";;
+  esac
+  if grep -q '^Host:  ' "$_a" && grep -q '^User:  ' "$_a" && grep -q '^Time:  ' "$_a" \
+     && grep -q '^Config:  ' "$_a"; then
+    t_ok "test-mail: the body names host, user, time and the config"
+  else
+    t_bad "test-mail: the body names host, user, time and the config" "$_args"
+  fi
+
+  # my-notify fails: non-zero, and its rc is shown
+  rm -f "$_a"; echo 3 >"$_d/notify.rc"
+  _o="$("$_d/my-ocr" --test-mail 2>&1 </dev/null)"; _r=$?
+  rm -f "$_d/notify.rc"
+  case "$_r|$_o" in
+    0\|*) t_bad "test-mail: a failing my-notify fails the test, with its rc" "rc=0";;
+    *"ERROR 155"*"[my-notify rc 3]"*) t_ok "test-mail: a failing my-notify fails the test, with its rc";;
+    *) t_bad "test-mail: a failing my-notify fails the test, with its rc" "$(printf '%s' "$_o" | tail -n 1)";;
+  esac
+
+  # no my-notify at all: a failure, not a silent pass
+  sed -e "s|^  my_notify=.*|  my_notify=\"$_d/absent\"|" "$0" >"$_d/my-ocr.nonotify"
+  _o="$(dash "$_d/my-ocr.nonotify" --test-mail 2>&1 </dev/null)"; _r=$?
+  case "$_r|$_o" in
+    0\|*) t_bad "test-mail: a missing my-notify fails" "rc=0";;
+    *"ERROR 154"*) t_ok "test-mail: a missing my-notify fails (err 154)";;
+    *) t_bad "test-mail: a missing my-notify fails" "$(printf '%s' "$_o" | tail -n 1)";;
+  esac
+}
+
 do_run_tests() {
   echo "$US --run-tests   ($(head -1 "$0"))"
   T_TMP="$(mktemp -d /tmp/my-ocr.tests.XXXXXX)" || { echo "mktemp failed"; return 1; }
@@ -3005,6 +3094,7 @@ do_run_tests() {
   t_concurrency_state
   t_verify_result
   t_status_and_setup
+  t_test_mail
   rm -rf "$T_TMP"
   echo "  ----"
   printf '  %d passed, %d failed\n' "$T_PASS" "$T_FAIL"
@@ -3026,6 +3116,7 @@ for arg in "$@"; do
     --move-failed-to) ;; # value consumed in the main loop
     -h|--help)  usage;;
     --run-tests) RUN_TESTS=1;;
+    --test-mail) DO_TEST_MAIL=1;;
     # 'status' as a bare word too: 'setup' is one, my-scan spells it that way,
     # and without it a bare 'status' is taken for a FILENAME TO OCR.
     --status|-S|status) DO_STATUS=1;;
@@ -3042,6 +3133,8 @@ for arg in "$@"; do
 done
 
 [ -n "$RUN_TESTS" ] && { do_run_tests; exit $?; }
+# --test-mail sends one alert and touches no state, takes no lock, OCRs nothing
+[ -n "$DO_TEST_MAIL" ] && { do_test_mail; exit $?; }
 
 # --status and setup are read-mostly and must never take the OCR lock, so they
 # run before anything else and exit.

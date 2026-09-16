@@ -55,6 +55,7 @@ my-ocr uninstall [go]       remove that wiring again
 my-ocr reset [go]           clean up after a crashed run; retry what was stranded
 my-ocr --version            version, commit and a build id of these exact bytes
 my-ocr --run-tests          the regression suite; starts no OCR
+my-ocr --test-mail          one test alert (notification + mail) the STUCK way
 ```
 
 `setup` and `uninstall` are dry runs unless given `go`. `reset` never deletes a
