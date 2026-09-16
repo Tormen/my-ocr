@@ -88,6 +88,13 @@ scan image into mask/foreground/background layers.
 kept and moved to `--move-failed-to`, and you are notified with the reason and
 where the document now is.
 
+**A refusal is reported as REFUSED, not as FAILED** -- with the reason, per
+document. The two are different outcomes and call for different actions: a
+failure means the OCR could not run, a refusal means it ran and produced
+something unusable, most often because the page carries no text to find. A
+photograph of an object scanned on the flatbed refuses every time, and the
+honest report of it is "there was nothing to OCR", not "the file FAILED".
+
 ## Requirements
 
 - macOS with the OCR application installed, exposing its Automator action

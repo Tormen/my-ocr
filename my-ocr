@@ -14,7 +14,7 @@ NL="
 # and is authoritative at runtime -- the deployed copy needs no git and no
 # repository. The build id is a hash of this file, so it is right even unstamped.
 SCRIPT_VERSION="v1.1"
-SCRIPT_COMMIT="a34a831"           # rewritten by 'my-ocr stamp-version'
+SCRIPT_COMMIT="2b1713f"           # rewritten by 'my-ocr stamp-version'
 
 WHOAMI="$(/usr/bin/whoami)"
 [ "$USER" = "$WHOAMI" ] || err 126 "USER '$USER' ? != ? '$WHOAMI' WHOAMI"
@@ -175,6 +175,13 @@ FILELIST_CNT=0; # number of files in the FILELIST
   MOVE_FAILED_TO=""
 
   QUEUED_FILE_MOVES_LOG="/var/lib/mine/${US%.*}.$OCRAPP_NAME.files-2-move" # <<<< contains 2 TAB separated columns: {source}\t{target}
+  # A REFUSAL is not a FAILURE. The OCR ran; the verification gate judged the
+  # result unusable and rolled back. part-2 records those here (2 TAB separated
+  # columns: {original}\t{why}) so trigger-OCR's summary can say what actually
+  # happened instead of calling it "FAILED to be OCRed" -- which sends you
+  # hunting for a broken tool when the honest answer is "there was nothing to
+  # OCR on that page".
+  REFUSED_FILES_LOG="/var/lib/mine/${US%.*}.$OCRAPP_NAME.refused"
   # All files we got (via stdin and/or via command-line) that are not yet OCR-ed will have an entry in this file!
 
 # for do_trigger_ocr / trigger-OCR
@@ -443,9 +450,31 @@ cleanup() { local rc=$?;
     printf "${PFX}Got %4d files in total:\n${PFX}  > %4d files already OCRed.\n${PFX}  > %4d files with invalid file-type (NOT %s)\n${PFX}  > %4d files ignored (e.g. dirs, *___encrypted.[pP][dD][fF])\n${PFX}  > %4d files encrypted (see below).\n" "$TOTAL_FILES_CNT" "$ALREADY_OCRED_CNT" "$WRONG_FILETYPE_CNT" "$S_EXPECTED_FILE_TYPE___REGEX" "$IGNORED_CNT" "$ENCRYPTED_CNT"
 
     if   [ -s "$QUEUED_FILE_MOVES_LOG" ]; then
-      failed_cnt=$(( $(cat "$QUEUED_FILE_MOVES_LOG"|wc -l) + 0 ));
-      printf "${PFX}\n${PFX}--> %4d/$TOTAL_FILES2OCR_CNT files *FAILED* to be OCRed:\n%s\n" "$failed_cnt" "$(cat "$QUEUED_FILE_MOVES_LOG"|cut -f1|sed -e 's/.*/                  "&"/')"
-      printf "${PFX}\n${PFX}--> %4d/$TOTAL_FILES2OCR_CNT files were SUCCESSFULLY OCRed.\n" "$(( $TOTAL_FILES2OCR_CNT - $failed_cnt ))"
+      left_cnt=$(( $(cat "$QUEUED_FILE_MOVES_LOG"|wc -l) + 0 ));
+      refused_cnt=0
+      [ -s "$REFUSED_FILES_LOG" ] && refused_cnt=$(( $(cat "$REFUSED_FILES_LOG"|wc -l) + 0 ));
+      [ "$refused_cnt" -gt "$left_cnt" ] && refused_cnt="$left_cnt"
+      failed_cnt=$(( left_cnt - refused_cnt ));
+
+      # REFUSED first, and with the reason: it is the outcome a person has to
+      # act on, and the action differs from a failure's. "1/1 files *FAILED* to
+      # be OCRed" for a page that simply carries no text is a lie about which
+      # part of the system went wrong.
+      if [ "$refused_cnt" -gt 0 ]; then
+        printf "${PFX}\n${PFX}--> %4d/$TOTAL_FILES2OCR_CNT result(s) REFUSED -- the OCR ran, the result was not usable:\n" "$refused_cnt"
+        while IFS="$(printf '\t')" read -r _rf _rw; do
+          [ -n "$_rf" ] || continue
+          printf "${PFX}      - \"%s\"\n${PFX}        %s\n" "$_rf" "$_rw"
+        done <"$REFUSED_FILES_LOG"
+        printf '%s        The original was KEPT, not replaced; the OCR result went to the Trash.\n' "$PFX"
+      fi
+      if [ "$failed_cnt" -gt 0 ]; then
+        _rtmp="$(mktemp /tmp/my-ocr.refused.XXXXXX)"
+        cut -f1 "$REFUSED_FILES_LOG" >"$_rtmp" 2>/dev/null
+        printf "${PFX}\n${PFX}--> %4d/$TOTAL_FILES2OCR_CNT files *FAILED* to be OCRed:\n%s\n" "$failed_cnt" "$(cut -f1 "$QUEUED_FILE_MOVES_LOG" | grep -vFxf "$_rtmp" | sed -e 's/.*/                  "&"/')"
+        rm -f "$_rtmp"
+      fi
+      printf "${PFX}\n${PFX}--> %4d/$TOTAL_FILES2OCR_CNT files were SUCCESSFULLY OCRed.\n" "$(( $TOTAL_FILES2OCR_CNT - $left_cnt ))"
         # Every file that completed had its line deleted, so what is left here
         # IS the failure list -- and the originals are untouched, because only
         # a successful OCR trashes them. So they can be quarantined.
@@ -474,7 +503,7 @@ _EOMF_
     else
       printf "\nERROR QUEUED_FILE_MOVES_LOG neither non-empty, nor existant?! Should not be.\n"
     fi
-    rm -f "$QUEUED_FILE_MOVES_LOG"
+    rm -f "$QUEUED_FILE_MOVES_LOG" "$REFUSED_FILES_LOG"
 
     if [ -s "$ENCRYPTED_PDFS_FILELIST" ]; then
       printf "\n${PFX}Found the following $ENCRYPTED_CNT ENCRYPTED file(s). Please decrypt manually and come back:\n\n'$ENCRYPTED_PDFS_FILELIST'\n";
@@ -723,6 +752,7 @@ do_part_2() {
 #  echo "$$| ~~~ [part-2] [BEGIN] ls -la T_PATH '$T_PATH':
 #$( ls -la "$T_PATH" )"
 
+  : >"$REFUSED_FILES_LOG" 2>/dev/null   # this round's refusals, not the last one's
   touch "$QUEUED_FILE_MOVES_LOG" || err 041 "Failed '$QUEUED_FILE_MOVES_LOG' (QUEUED_FILE_MOVES_LOG: touch, chmod :my-system, chown g-w,o-rwx)"
 
   ############################################################################################################
@@ -960,6 +990,11 @@ The original was NOT replaced -- it is in:
 
 The OCR result was discarded (to the Trash). The document has to be
 looked at, and probably scanned again." >/dev/null 2>&1
+
+        # The queue entry STAYS: the original was not replaced, and
+        # trigger-OCR's summary still has to quarantine and report it. What it
+        # must not do is call this a failure -- hence the separate record.
+        printf '%s\t%s\n' "$orig_fp" "$VERIFY_WHY" >>"$REFUSED_FILES_LOG" 2>/dev/null
         continue
       fi
 
@@ -1006,10 +1041,17 @@ $(cat "$QUEUED_FILE_MOVES_LOG"|sed -e "s/^/${PFX}       | /")"
     echo "$$| >>> [part-2] ${x}Moved $moved_cnt /of/ $ocred_cnt just OCRed files${tmp}"
     if [ "${VERIFY_REFUSED_CNT:-0}" -gt 0 ]; then
       echo "$$| >>> [part-2] ${x}REFUSED $VERIFY_REFUSED_CNT result(s): the original was kept, not replaced."
-      echo "$$| >>> [part-2] ${x}  Look at them in '$T_PATH' before deciding what to do."
+      echo "$$| >>> [part-2] ${x}  The OCR result was discarded (to the Trash); the original was kept."
     fi
 
-    [ $new_queued_cnt -eq 0 ] || err 053 "QUEUED_FILE_MOVES_LOG *should* be EMPTY at this point${tmp}
+    # Refused results leave their queue entry ON PURPOSE (see above), so the
+    # queue being non-empty is only wrong for entries that are NOT refusals.
+    # Treating an expected outcome as an error is what made one refused page
+    # raise ERROR 053 -> PARTx_ERRORED_FLAGFILE -> ERROR 066 -> my-ocr exit 1,
+    # and my-scan report a working pipeline as broken.
+    _refused_cnt=0
+    [ -s "$REFUSED_FILES_LOG" ] && _refused_cnt=$(( $(cat "$REFUSED_FILES_LOG"|wc -l) + 0 ))
+    [ $new_queued_cnt -le $_refused_cnt ] || err 053 "QUEUED_FILE_MOVES_LOG *should* be EMPTY at this point${tmp}
 
 QUEUED_FILE_MOVES_LOG should have been created by trigger-OCR / do_trigger_ocr.
 And thus now at the end of part-2 we should have moved back all files --> queue empty!"
@@ -3078,6 +3120,59 @@ _EOSTUB_
   esac
 }
 
+# A REFUSAL is not a FAILURE. One refused page used to report the whole run as
+# broken: the queue entry it leaves on purpose tripped err 053 -> the errored
+# flagfile -> err 066 -> exit 1 -> my-scan's err 069; and the summary called a
+# page with nothing to OCR "1/1 files *FAILED* to be OCRed".
+t_refusal_reporting() {
+  _rv="$(awk '/^do_part_2\(\)/,/^\}/' "$0")"
+
+  if printf '%s' "$_rv" | grep -q 'REFUSED_FILES_LOG'; then
+    t_ok "refusal: it is recorded, so the summary can tell refused from failed"
+  else
+    t_bad "refusal: it is recorded, so the summary can tell refused from failed" \
+          "nothing distinguishes the two"
+  fi
+
+  if printf '%s' "$_rv" | grep -q '_refused_cnt'; then
+    t_ok "refusal: err 053 tolerates the queue entry a refusal leaves behind"
+  else
+    t_bad "refusal: err 053 tolerates the queue entry a refusal leaves behind" \
+          "one refused page reports the whole run as broken"
+  fi
+
+  if grep -q 'REFUSED -- the OCR ran' "$0"; then
+    t_ok "summary: a refusal is reported as REFUSED, with its reason"
+  else
+    t_bad "summary: a refusal is reported as REFUSED, with its reason" "still only *FAILED*"
+  fi
+
+  # shellcheck disable=SC2016  # matching literal source text: $ must not expand
+  if grep -q 'if \[ "\$failed_cnt" -gt 0 \]; then' "$0"; then
+    t_ok "summary: '*FAILED* to be OCRed' is printed only when something failed"
+  else
+    t_bad "summary: '*FAILED* to be OCRed' is printed only when something failed" \
+          "a refused-only run still claims files FAILED"
+  fi
+
+  # the result was trashed, so pointing at the out-path sends you to an empty
+  # directory -- the message must say where the DOCUMENT is
+  if printf '%s' "$_rv" | grep -q 'Look at them in'; then
+    t_bad "refusal: the user is not sent to an empty out-path" "it still says 'Look at them in'"
+  else
+    t_ok "refusal: the user is not sent to an empty out-path"
+  fi
+
+  # the refusal list belongs to ONE round, or yesterday's refusals are counted
+  # shellcheck disable=SC2016  # matching literal source text: $ must not expand
+  if printf '%s' "$_rv" | grep -q ': >"\$REFUSED_FILES_LOG"'; then
+    t_ok "refusal: the list is emptied at the start of each round"
+  else
+    t_bad "refusal: the list is emptied at the start of each round" \
+          "a stale list would mask a real failure as a refusal"
+  fi
+}
+
 do_run_tests() {
   echo "$US --run-tests   ($(head -1 "$0"))"
   T_TMP="$(mktemp -d /tmp/my-ocr.tests.XXXXXX)" || { echo "mktemp failed"; return 1; }
@@ -3093,6 +3188,7 @@ do_run_tests() {
   t_mutex
   t_concurrency_state
   t_verify_result
+  t_refusal_reporting
   t_status_and_setup
   t_test_mail
   rm -rf "$T_TMP"
