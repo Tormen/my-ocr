@@ -14,7 +14,7 @@ NL="
 # and is authoritative at runtime -- the deployed copy needs no git and no
 # repository. The build id is a hash of this file, so it is right even unstamped.
 SCRIPT_VERSION="v1.1"
-SCRIPT_COMMIT="778331f"           # rewritten by 'my-ocr stamp-version'
+SCRIPT_COMMIT="d3edea5"           # rewritten by 'my-ocr stamp-version'
 
 WHOAMI="$(/usr/bin/whoami)"
 [ "$USER" = "$WHOAMI" ] || err 126 "USER '$USER' ? != ? '$WHOAMI' WHOAMI"
@@ -1036,6 +1036,9 @@ looked at, and probably scanned again." >/dev/null 2>&1
             echo "$$| >>> [$WHAT]   WARNING :: no trash command -- result left at '$ocred_fp'"
           fi
           printf '%s\n' "$orig_fp" >>"$NOTEXT_FILES_LOG" 2>/dev/null
+          last_file="$orig_fp"   # the tagged original is what to reveal; without
+                                 # this, part-2 ends with no last_file and raises
+                                 # err 035 on a run that did the right thing
           sed -i "" -e "\|	$orig_fp$|d" "$QUEUED_FILE_MOVES_LOG" \
             || err 019 "Failed to dequeue '$orig_fp' after tagging it in place."
           moved_cnt=$(( moved_cnt + 1 ));
@@ -3364,6 +3367,14 @@ t_refusal_reporting() {
     t_ok "refusal: the user is not sent to an empty out-path"
   fi
 
+  # the tagging branch skips the normal path's last_file assignment, so it must
+  # make its own -- this raised err 035 on a run that had just succeeded
+  if printf '%s' "$_rv" | awk '/VERIFY_NOTEXT/,/^      fi/' | grep -q 'last_file='; then
+    t_ok "no text: the tagging branch sets last_file (no spurious err 035)"
+  else
+    t_bad "no text: the tagging branch sets last_file (no spurious err 035)" \
+          "part-2 will end with no last_file and error on a successful run"
+  fi
   if printf '%s' "$_rv" | grep -q 'VERIFY_NOTEXT'; then
     t_ok "no text: filed as its own outcome, not sent down the refusal path"
   else
