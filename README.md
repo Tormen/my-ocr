@@ -77,8 +77,31 @@ happens my-ocr requires all of:
   only the trailer, catalogue and page tree, so a valid catalogue over damaged
   content passes that and fails this. Its exit is graded: 0 clean, 3 warnings
   only, 2 damage.
-- it carries a text layer. No text means the OCR recognised nothing, which is
-  the entire point of the run.
+**No text is NOT a refusal.** The checks above are the evidence that the OCR
+application ran correctly -- there is no exit code to read, so they are all the
+evidence there is. A page with nothing to recognise then yields no text, and
+that is a finding about the DOCUMENT (a photograph, a blank sheet), not a fault
+in the run. Such a result is **filed as done** like any other success, and
+reported on a line of its own, so that "forty of forty found nothing" -- a
+misconfigured OCR -- cannot hide inside the success total.
+
+**The ORIGINAL is kept, and tagged.** The OCR application's output for such a
+page is strictly worse -- one A3 photograph came back as 6.1 MB split across
+two A4 pages, cutting the picture in half, against 665 KB for the original. But
+the original carries no Producer, so a later run would OCR it again for ever.
+So my-ocr writes the Producer onto the original instead:
+
+    Producer: FineReader (my-ocr: no text found -- original kept)
+
+and discards the OCR output (to the Trash, recoverable). The tag is written
+with qpdf's JSON round-trip, which copies the page content through untouched --
+the file grows by the metadata alone, roughly 64 bytes -- and it is verified
+before it is installed: same page count, still sound under `qpdf --check`.
+Ghostscript cannot do this, as `pdfwrite` stamps its own `/Producer` over
+anything you set.
+
+If the input was a JPEG, PNG or TIFF there is no PDF original to tag, so the
+OCR application's PDF is kept instead, as it always was.
 
 Deliberately NOT checked: file size, because MRC compression is on and a much
 smaller result is the healthy outcome; and image counts, because MRC splits one
