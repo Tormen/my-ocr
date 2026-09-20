@@ -14,11 +14,11 @@ NL="
 # and is authoritative at runtime -- the deployed copy needs no git and no
 # repository. The build id is a hash of this file, so it is right even unstamped.
 SCRIPT_VERSION="v1.0"
-SCRIPT_COMMIT="1971c5e"           # rewritten by 'my-ocr stamp-version'
+SCRIPT_COMMIT="1c45284"           # rewritten by 'my-ocr stamp-version'
 # What git said when this build was stamped: 'git describe --tags --long' --
 # <nearest tag>-<commits since it>-g<short sha>. It says whether these bytes
 # ARE that release or work on top of it, on a machine with no git.
-SCRIPT_RELEASE="v1.0-13-g1971c5e"
+SCRIPT_RELEASE="v1.0-14-g1c45284"
 
 WHOAMI="$(/usr/bin/whoami)"
 [ "$USER" = "$WHOAMI" ] || err 126 "USER '$USER' ? != ? '$WHOAMI' WHOAMI"
@@ -1962,6 +1962,14 @@ _self_dir() {
 do_version() {
   _bid="$(build_id)"
   _vd="$(git -c safe.directory='*' -C "$(_self_dir)" describe --tags --long 2>/dev/null)"
+  # describe answers about WHERE this file sits, not about what it is: a copy
+  # dropped in a foreign repo gets THAT repo's tags (/LINKS/global is one, and
+  # it holds the copies update-LINKS promotes). The stamped commit is the
+  # proof -- a repo that does not have it is not this tool's repo.
+  if [ -n "$_vd" ] && [ -n "$SCRIPT_COMMIT" ] \
+     && ! git -c safe.directory='*' -C "$(_self_dir)" cat-file -e "${SCRIPT_COMMIT}^{commit}" 2>/dev/null; then
+    _vd=""
+  fi
   [ -n "$_vd" ] || _vd="$SCRIPT_RELEASE"
   case "$_vd" in
     *-*-g*)
