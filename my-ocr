@@ -14,7 +14,7 @@ NL="
 # and is authoritative at runtime -- the deployed copy needs no git and no
 # repository. The build id is a hash of this file, so it is right even unstamped.
 SCRIPT_VERSION="v1.1"
-SCRIPT_COMMIT="d3edea5"           # rewritten by 'my-ocr stamp-version'
+SCRIPT_COMMIT="a83a993"           # rewritten by 'my-ocr stamp-version'
 
 WHOAMI="$(/usr/bin/whoami)"
 [ "$USER" = "$WHOAMI" ] || err 126 "USER '$USER' ? != ? '$WHOAMI' WHOAMI"
@@ -486,9 +486,23 @@ cleanup() { local rc=$?;
           moved_cnt=0
           # heredoc, not 'cut | while': a pipe runs the loop in a subshell and
           # moved_cnt would come back 0.
-          while IFS= read -r ff; do
+          stranded_cnt=0
+          # Field 3 is where the OCR result was to be collected. If it EXISTS,
+          # the OCR finished and only the move failed -- calling that a failure
+          # files a finished document under FAILED and strands its result. Five
+          # documents went that way when FineReader died mid-round (2026-09-18);
+          # their results sat in the out-path with up to 96805 characters of
+          # text while the originals were quarantined as "*FAILED*".
+          while IFS="$(printf '\t')" read -r ff _sf out_fp _rest; do
             [ -z "$ff" ] && continue
             [ -e "$ff" ] || continue
+            if [ -n "$out_fp" ] && [ -e "$out_fp" ]; then
+              stranded_cnt=$(( stranded_cnt + 1 ))
+              printf '%s      - NOT a failure: %s\n' "$PFX" "$ff"
+              printf '%s        the OCR finished; its result was never filed:\n' "$PFX"
+              printf '%s          %s\n' "$PFX" "$out_fp"
+              continue
+            fi
             ft="$MOVE_FAILED_TO/${ff##*/}"
             [ -e "$ft" ] && ft="$MOVE_FAILED_TO/$(date +%Y-%m-%d_%H%M.%S)___${ff##*/}"
             if /bin/mv -- "$ff" "$ft"; then
@@ -498,9 +512,12 @@ cleanup() { local rc=$?;
               printf "${PFX}      - FAILED to move '%s' -> '%s' !\n" "$ff" "$ft"
             fi
           done <<_EOMF_
-$(cut -f1 "$QUEUED_FILE_MOVES_LOG")
+$(cat "$QUEUED_FILE_MOVES_LOG")
 _EOMF_
           printf "${PFX}      (%d failed file(s) quarantined in '%s')\n" "$moved_cnt" "$MOVE_FAILED_TO"
+          [ "$stranded_cnt" -gt 0 ] && \
+            printf '%s      (%s document(s) NOT quarantined: the OCR finished, the move did not)\n' \
+                   "$PFX" "$stranded_cnt"
         fi
     elif [ -e "$QUEUED_FILE_MOVES_LOG" ]; then
       [ $TOTAL_FILES2OCR_CNT -gt 0 ] && printf "\n${PFX}--> %4d/$TOTAL_FILES2OCR_CNT files were SUCCESSFULLY OCRed :))\n" "$TOTAL_FILES2OCR_CNT"
@@ -3396,6 +3413,31 @@ t_refusal_reporting() {
   fi
 }
 
+# A finished OCR whose move failed is NOT a failure. Quarantining it filed
+# five good documents under FAILED and stranded their results (2026-09-18).
+t_stranded_not_failed() {
+  _cl="$(awk '/Every file that completed had its line deleted/,/quarantined in/' "$0")"
+  if printf '%s' "$_cl" | grep -q 'out_fp'; then
+    t_ok "quarantine: the out-path is consulted before calling a document failed"
+  else
+    t_bad "quarantine: the out-path is consulted before calling a document failed" \
+          "a finished document with an unfiled result is still quarantined"
+  fi
+  if printf '%s' "$_cl" | grep -q 'NOT a failure'; then
+    t_ok "quarantine: a stranded result is reported as such, not as a failure"
+  else
+    t_bad "quarantine: a stranded result is reported as such, not as a failure" "not wired in"
+  fi
+  # ...and the loop must read the WHOLE record, not just column 1
+  # shellcheck disable=SC2016  # matching literal source text: $ must not expand
+  if printf '%s' "$_cl" | grep -q 'cut -f1 "\$QUEUED_FILE_MOVES_LOG"'; then
+    t_bad "quarantine: the loop reads every field of the queue record" \
+          "still 'cut -f1' -- the out-path is not even read"
+  else
+    t_ok "quarantine: the loop reads every field of the queue record"
+  fi
+}
+
 do_run_tests() {
   echo "$US --run-tests   ($(head -1 "$0"))"
   T_TMP="$(mktemp -d /tmp/my-ocr.tests.XXXXXX)" || { echo "mktemp failed"; return 1; }
@@ -3413,6 +3455,7 @@ do_run_tests() {
   t_verify_result
   t_refusal_reporting
   t_tag_in_place
+  t_stranded_not_failed
   t_status_and_setup
   t_test_mail
   rm -rf "$T_TMP"
