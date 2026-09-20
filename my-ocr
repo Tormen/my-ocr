@@ -13,8 +13,12 @@ NL="
 # deployed script cannot hide. SCRIPT_COMMIT is rewritten by 'stamp-version'
 # and is authoritative at runtime -- the deployed copy needs no git and no
 # repository. The build id is a hash of this file, so it is right even unstamped.
-SCRIPT_VERSION="v1.1"
-SCRIPT_COMMIT="a83a993"           # rewritten by 'my-ocr stamp-version'
+SCRIPT_VERSION="v1.0"
+SCRIPT_COMMIT="ef6a66d"           # rewritten by 'my-ocr stamp-version'
+# What git said when this build was stamped: 'git describe --tags --long' --
+# <nearest tag>-<commits since it>-g<short sha>. It says whether these bytes
+# ARE that release or work on top of it, on a machine with no git.
+SCRIPT_RELEASE="v1.0-12-gef6a66d"
 
 WHOAMI="$(/usr/bin/whoami)"
 [ "$USER" = "$WHOAMI" ] || err 126 "USER '$USER' ? != ? '$WHOAMI' WHOAMI"
@@ -1934,13 +1938,31 @@ build_id() {
   echo "$_h"
 }
 
+# SCRIPT_VERSION names the release these bytes are BASED on -- only a release
+# commit sets it. Whether they ARE that release is git's own describe string,
+# printed verbatim. Git first (exact in a checkout), the stamp second (a
+# deployed copy has no git; it lags one release step, because stamping
+# happens before the tag exists).
 do_version() {
   _bid="$(build_id)"
-  if [ -n "$SCRIPT_COMMIT" ]; then
-    echo "$US $SCRIPT_VERSION (commit $SCRIPT_COMMIT, build $_bid)"
-  else
-    echo "$US $SCRIPT_VERSION (build $_bid, unstamped)"
-  fi
+  _vd="$(git -c safe.directory='*' -C "$(dirname "$0")" describe --tags --long 2>/dev/null)"
+  [ -n "$_vd" ] || _vd="$SCRIPT_RELEASE"
+  case "$_vd" in
+    *-*-g*)
+      _vtag="${_vd%-*-g*}"
+      _vn="${_vd%-g*}"; _vn="${_vn##*-}"
+      if [ "$_vn" = 0 ]; then
+        echo "$US $SCRIPT_VERSION ($_vd: the $_vtag tag, build $_bid)"
+      else
+        echo "$US $SCRIPT_VERSION+$_vn ($_vd: $_vn commit(s) past $_vtag, unreleased, build $_bid)"
+      fi ;;
+    *)
+      if [ -n "$SCRIPT_COMMIT" ]; then
+        echo "$US $SCRIPT_VERSION (commit $SCRIPT_COMMIT, build $_bid)"
+      else
+        echo "$US $SCRIPT_VERSION (build $_bid, unstamped)"
+      fi ;;
+  esac
 }
 
 # --test-mail: ONE alert through send_alert(), the call the real STUCK alerts
@@ -1997,8 +2019,11 @@ do_stamp_version() {
     err 146 "--run-tests fails -- refusing to stamp a build that does not pass."
   fi
 
+  # git's own spelling, kept verbatim so it can be pasted back into git
+  _desc="$(git -c safe.directory='*' -C "$(dirname "$0")" describe --tags --long 2>/dev/null)"
   _tmp="$0.stamp.$$"
-  sed -e "s|^SCRIPT_COMMIT=\".*\"|SCRIPT_COMMIT=\"$_sha\"|" "$0" >"$_tmp" \
+  sed -e "s|^SCRIPT_COMMIT=\".*\"|SCRIPT_COMMIT=\"$_sha\"|" \
+      -e "s|^SCRIPT_RELEASE=\".*\"|SCRIPT_RELEASE=\"$_desc\"|" "$0" >"$_tmp" \
     || { rm -f "$_tmp"; err 147 "FAILED to rewrite SCRIPT_COMMIT."; }
   grep -q "^SCRIPT_COMMIT=\"$_sha\"" "$_tmp" \
     || { rm -f "$_tmp"; err 148 "SCRIPT_COMMIT line not found -- refusing to install."; }
@@ -2011,7 +2036,7 @@ do_stamp_version() {
   git -C "$_dir" add -- "$US" || err 150 "git add failed."
   git -C "$_dir" commit --amend --no-edit >/dev/null || err 151 "git commit --amend failed."
 
-  echo " >>> Stamped $US with commit $_sha [$(build_id)]"
+  echo " >>> Stamped $US with commit $_sha, release ${_desc:-<no tag yet>} [$(build_id)]"
   echo "    > the stamped sha lags HEAD by one: amending changes the sha. That is"
   echo "      expected; do not 'fix' it. The build id identifies these exact bytes."
   return 0
@@ -2956,17 +2981,25 @@ t_concurrency_state() {
     *"build "*) t_ok "--version prints a build id taken from the file itself";;
     *) t_bad "--version prints a build id taken from the file itself" "got: $_v";;
   esac
-  # A tag this version has already moved past means the number was reused.
+  # The number NAMES the release these bytes are based on; only a release
+  # commit sets it. Whether this build IS that release is what the describe
+  # string in '--version' says, so the check here is that the number still
+  # names the nearest tag.
   _vd="$(cd "$(dirname "$0")" && pwd)"
   if git -C "$_vd" rev-parse --git-dir >/dev/null 2>&1; then
-    _vt="$(git -C "$_vd" rev-parse -q --verify "refs/tags/$SCRIPT_VERSION" 2>/dev/null)"
-    if [ -z "$_vt" ]; then
-      t_ok "version $SCRIPT_VERSION is not yet a tag (unreleased)"
-    elif [ "$_vt" = "$(git -C "$_vd" rev-parse HEAD 2>/dev/null)" ]; then
-      t_ok "version $SCRIPT_VERSION IS this release"
+    _vnear="$(git -C "$_vd" describe --tags --abbrev=0 2>/dev/null)"
+    if [ -z "$_vnear" ]; then
+      t_ok "no release tag yet -- nothing for the version to name"
+    elif [ "$_vnear" = "$SCRIPT_VERSION" ]; then
+      t_ok "version $SCRIPT_VERSION names the release it is based on"
     else
-      t_bad "version $SCRIPT_VERSION was already released" "bump SCRIPT_VERSION"
+      t_bad "version $SCRIPT_VERSION does not name the nearest tag $_vnear" \
+        "set SCRIPT_VERSION to $_vnear, or tag this release"
     fi
+    case "$("$0" --version 2>/dev/null)" in
+      *unreleased*|*"the $_vnear tag"*) t_ok "--version says whether these bytes are that release";;
+      *) t_bad "--version says whether these bytes are that release" "got: $("$0" --version 2>/dev/null)";;
+    esac
   else
     t_ok "version check skipped (not a git checkout)"
   fi
