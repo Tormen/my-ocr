@@ -1,6 +1,6 @@
 #!/bin/dash
 
-# 155 == highest used errCode
+# 156 == highest used errCode
 
 US="${0##*/}";   # get filename without path
 
@@ -14,11 +14,11 @@ NL="
 # and is authoritative at runtime -- the deployed copy needs no git and no
 # repository. The build id is a hash of this file, so it is right even unstamped.
 SCRIPT_VERSION="v1.0"
-SCRIPT_COMMIT="5653f79"           # rewritten by 'my-ocr stamp-version'
+SCRIPT_COMMIT="0c8bfac"           # rewritten by 'my-ocr stamp-version'
 # What git said when this build was stamped: 'git describe --tags --long' --
 # <nearest tag>-<commits since it>-g<short sha>. It says whether these bytes
 # ARE that release or work on top of it, on a machine with no git.
-SCRIPT_RELEASE="v1.0-15-g5653f79"
+SCRIPT_RELEASE="v1.0-16-g0c8bfac"
 
 WHOAMI="$(/usr/bin/whoami)"
 [ "$USER" = "$WHOAMI" ] || err 126 "USER '$USER' ? != ? '$WHOAMI' WHOAMI"
@@ -2034,6 +2034,12 @@ do_stamp_version() {
     git -C "$_dir" merge-base --is-ancestor HEAD '@{upstream}' 2>/dev/null \
       && err 144 "HEAD is already pushed -- amending it would rewrite published history."
   fi
+
+  # The repo may be SHARED -- other sessions commit here too -- and an amend
+  # rewrites whatever HEAD happens to be. Stamp only the commit that carries
+  # THIS file: if HEAD does not touch it, HEAD is somebody else's work.
+  [ -n "$(git -C "$_dir" show --name-only --format= HEAD -- "$US" 2>/dev/null)" ] \
+    || err 156 "HEAD does not touch this file -- it is not this file's commit (commit it first; in a shared repo the amend would rewrite someone else's)."
 
   _sha="$(git -C "$_dir" rev-parse --short HEAD)" || err 145 "git rev-parse HEAD failed."
   if [ "$SCRIPT_COMMIT" = "$_sha" ]; then
