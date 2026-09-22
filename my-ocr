@@ -14,11 +14,11 @@ NL="
 # and is authoritative at runtime -- the deployed copy needs no git and no
 # repository. The build id is a hash of this file, so it is right even unstamped.
 SCRIPT_VERSION="v1.0"
-SCRIPT_COMMIT="166cf19"           # rewritten by 'my-ocr stamp-version'
+SCRIPT_COMMIT="109f576"           # rewritten by 'my-ocr stamp-version'
 # What git said when this build was stamped: 'git describe --tags --long' --
 # <nearest tag>-<commits since it>-g<short sha>. It says whether these bytes
 # ARE that release or work on top of it, on a machine with no git.
-SCRIPT_RELEASE="v1.0-18-g166cf19"
+SCRIPT_RELEASE="v1.0-19-g109f576"
 
 WHOAMI="$(/usr/bin/whoami)"
 [ "$USER" = "$WHOAMI" ] || err 126 "USER '$USER' ? != ? '$WHOAMI' WHOAMI"
@@ -953,11 +953,8 @@ _EOF_
     if [ -z "$ocrapp_pids" ]; then
       echo "$$| >>> [part-2] ${x}$OCRAPP_NAME is not running anymore --> Nothing to do :)"
     else
-      if pkill -x "$OCRAPP_NAME"; then
-        echo "$$| >>> [part-2] ${x}$OCRAPP_NAME was NOT running when part-1 was called --> we killed it (pid(s) $ocrapp_pids) now!"
-      else
-        echo "$$| >>> [part-2] ${x}WARNING :: FAILED to kill $OCRAPP_NAME (pid(s) $ocrapp_pids)."
-      fi
+      echo "$$| >>> [part-2] ${x}$OCRAPP_NAME was NOT running when part-1 was called --> closing it (pid(s) $ocrapp_pids)"
+      ocrapp_quit
     fi
   else
     echo "$$| >>> [part-2] ${x}$OCRAPP_NAME was already running when part-1 was called --> We leave it be."
@@ -1384,6 +1381,43 @@ ocrapp_no_window_restore() {  # <defaults domain>
 # here: say so and leave it. The dialog then blocks the run and the operator is
 # told why, which is the better failure -- deleting someone's pages on a guess
 # is not recoverable, a blocked run is.
+# CLOSE the OCR app, do not kill it. 'pkill' sends SIGTERM, and a Cocoa app
+# does not run its quit path on a signal: macOS records an ABNORMAL exit, so
+# the user gets "FineReader quit unexpectedly", the half-built document is left
+# behind, and the NEXT launch stops on a recovery dialog nobody answers. In
+# other words my-ocr's own tidy-up planted the thing that blocks its next run.
+# An AppleScript 'quit' runs the app's real shutdown: documents are closed, no
+# crash is recorded, nothing is left to recover.
+#
+# Escalation, because a hung app must not block the queue for ever: quit ->
+# TERM -> KILL, each given time to work, and EVERY step past the first says so,
+# since those are the ones that leave a dialog behind.
+ocrapp_quit() {
+  _q_p="$(pgrep -x "$OCRAPP_NAME" 2>/dev/null | xargs echo)"
+  [ -n "$_q_p" ] || return 0
+  osa_run <<_EOQUIT_ >/dev/null 2>&1
+tell application id "$OCRAPP_BUNDLE_ID" to quit
+_EOQUIT_
+  _q_w=0
+  while [ "$_q_w" -lt 20 ]; do
+    pgrep -x "$OCRAPP_NAME" >/dev/null 2>&1 || {
+      echo "$$| >>> [$WHAT] closed $OCRAPP_NAME (pid(s) $_q_p) -- quit cleanly after ${_q_w}s"
+      return 0
+    }
+    sleep 1; _q_w=$(( _q_w + 1 ))
+  done
+  echo "$$| >>> [$WHAT] WARNING :: $OCRAPP_NAME (pid(s) $_q_p) did not answer 'quit' in ${_q_w}s -- sending TERM (this leaves a crash dialog)"
+  pkill -x "$OCRAPP_NAME" 2>/dev/null
+  _q_w=0
+  while [ "$_q_w" -lt 10 ]; do
+    pgrep -x "$OCRAPP_NAME" >/dev/null 2>&1 || { echo "$$| >>> [$WHAT] $OCRAPP_NAME ended on TERM"; return 0; }
+    sleep 1; _q_w=$(( _q_w + 1 ))
+  done
+  echo "$$| >>> [$WHAT] WARNING :: $OCRAPP_NAME (pid(s) $_q_p) survived TERM -- sending KILL"
+  pkill -9 -x "$OCRAPP_NAME" 2>/dev/null
+  return 0
+}
+
 ocrapp_clear_stale_batch() { # $1 = staging prefix (nothing outside it is ours)
   _sb_stage="$1"
   # never touch a document while the app that owns it is running
@@ -2354,8 +2388,8 @@ close_ocrapp_if_ours() {
   [ -s "$OCRAPP_STATEFILE" ] && return 0            # it predates us: leave it be
   _co_p="$(pgrep -x "$OCRAPP_NAME" 2>/dev/null | xargs echo)"
   [ -n "$_co_p" ] || return 0
-  if pkill -x "$OCRAPP_NAME" 2>/dev/null; then
-    echo "$$| >>> [$WHAT] closed $OCRAPP_NAME (pid(s) $_co_p) -- we started it and are exiting"
+  if ocrapp_quit; then
+    :
   else
     echo "$$| >>> [$WHAT] WARNING :: could not close $OCRAPP_NAME (pid(s) $_co_p)"
   fi
@@ -2440,7 +2474,7 @@ do_reset() {
     echo "    > not running"
   elif [ -z "$_rs_go" ]; then
     echo "    > WOULD CLOSE it (pid(s) $_rs_ap) -- no my-ocr run is live, so it is orphaned"
-  elif pkill -x "$OCRAPP_NAME" 2>/dev/null; then
+  elif ocrapp_quit; then
     echo "    > closed it (pid(s) $_rs_ap)"; _rs_n=$(( _rs_n + 1 ))
   else
     echo "    > FAILED to close it (pid(s) $_rs_ap) -- close it by hand"
@@ -3058,6 +3092,35 @@ Try:   su - ${_su_gui:-<the console user>} -c '$US setup${1:+ $1}'"
 # A plist PATH is a defaults domain too, so nothing of the user's is touched.
 # --- the leftover document: cleared only when it is provably my-ocr's own.
 # The decision is made from _FRBatch.pac, the only place a source is named.
+# --- the OCR app is CLOSED, never killed: a signal skips a Cocoa app's quit
+# path, and the abnormal exit is what leaves the crash dialog AND the document
+# that blocks the next run.
+t_ocrapp_quit() {
+  # it must be a no-op, and instant, when the app is not running at all
+  _q_t0=$(date +%s)
+  ( OCRAPP_NAME="no-such-process-xyzzy"; ocrapp_quit ) >/dev/null 2>&1
+  _q_el=$(( $(date +%s) - _q_t0 ))
+  if [ "$_q_el" -le 2 ]; then t_ok "closing an app that is not running returns at once (${_q_el}s)"
+  else t_bad "closing an app that is not running returns at once" "took ${_q_el}s"; fi
+  # NO path may signal the OCR app without trying 'quit' first: strip the
+  # helper out of the source and nothing signalling it may remain.
+  # shellcheck disable=SC2016  # the literal source text is what is searched for
+  _q_outside="$(awk '/^ocrapp_quit\(\) \{/{skip=1} skip&&/^\}/{skip=0;next} !skip' "$0" \
+                | grep -c 'pkill -[0-9x].*OCRAPP_NAME')"
+  if [ "$_q_outside" = "0" ]; then
+    t_ok "every signal to the OCR app lives inside ocrapp_quit, after 'quit' was tried"
+  else
+    t_bad "every signal to the OCR app lives inside ocrapp_quit, after 'quit' was tried" \
+          "$_q_outside signal(s) bypass it"
+  fi
+  # and the helper must actually ask the app to quit, by bundle id
+  if awk '/^ocrapp_quit\(\) \{/,/^\}/' "$0" | grep -q 'to quit'; then
+    t_ok "it asks the application to quit before any signal"
+  else
+    t_bad "it asks the application to quit before any signal" "no AppleScript quit in the helper"
+  fi
+}
+
 t_stale_batch() {
   _sb_t="$T_TMP/stale-batch"; mkdir -p "$_sb_t/bin"
   # a stub trash, so a test never puts anything in the user's Trash
@@ -3703,6 +3766,7 @@ do_run_tests() {
   t_test_mail
   t_window_restore
   t_stale_batch
+  t_ocrapp_quit
   rm -rf "$T_TMP"
   echo "  ----"
   printf '  %d passed, %d failed\n' "$T_PASS" "$T_FAIL"
