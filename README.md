@@ -132,6 +132,12 @@ file needing it.
 
 - Files already carrying the OCR application's `Producer` tag are skipped unless
   `--force`; encrypted PDFs are detected and listed rather than mangled.
+- Every run makes sure window restore is off for the OCR application
+  (`defaults write com.abbyy.FineReaderPro ApplePersistenceIgnoreState -bool
+  YES`, as the user running it). After a crash, macOS would otherwise ask at
+  the next launch whether to reopen its windows, and an unattended run would
+  wait on that dialog. It is written once and reported then; later runs find it
+  off and say nothing.
 - `--move-failed-to <DIR>` quarantines what could not be OCRed, so a caller does
   not have to work out which files those were.
 - stdin is read only when no filenames were given another way -- otherwise a

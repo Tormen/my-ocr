@@ -1,6 +1,6 @@
 #!/bin/dash
 
-# 156 == highest used errCode
+# 157 == highest used errCode
 
 US="${0##*/}";   # get filename without path
 
@@ -14,11 +14,11 @@ NL="
 # and is authoritative at runtime -- the deployed copy needs no git and no
 # repository. The build id is a hash of this file, so it is right even unstamped.
 SCRIPT_VERSION="v1.0"
-SCRIPT_COMMIT="0c8bfac"           # rewritten by 'my-ocr stamp-version'
+SCRIPT_COMMIT="ccab472"           # rewritten by 'my-ocr stamp-version'
 # What git said when this build was stamped: 'git describe --tags --long' --
 # <nearest tag>-<commits since it>-g<short sha>. It says whether these bytes
 # ARE that release or work on top of it, on a machine with no git.
-SCRIPT_RELEASE="v1.0-16-g0c8bfac"
+SCRIPT_RELEASE="v1.0-17-gccab472"
 
 WHOAMI="$(/usr/bin/whoami)"
 [ "$USER" = "$WHOAMI" ] || err 126 "USER '$USER' ? != ? '$WHOAMI' WHOAMI"
@@ -72,6 +72,9 @@ FILELIST_CNT=0; # number of files in the FILELIST
   # OCR app that is not installed: the failure would otherwise only surface on
   # the first real scan, long after setup said it was fine.
   OCRAPP_PATH="/Applications/$OCRAPP_NAME.app"
+  # Its preferences domain: trigger-OCR turns window restore off there, so a
+  # crash cannot leave a "reopen its windows?" dialog blocking the next run.
+  OCRAPP_BUNDLE_ID="com.abbyy.FineReaderPro"
   OCRAPP_PRODUCER_TAG="FineReader"
   OCRAPP_OUTPUT_SUFFIX="pdf" # suffix used by OCRAPP on ocr'ed files
 
@@ -268,6 +271,10 @@ LOGGING: In this case --no-log(ging) is the DEFAULT.
          Now that LOCKFILE is gone, we create a fresh EMPTY LOCKFILE.
      (1) Checks if OCRAPP '$OCRAPP_NAME' is already running and stores PIDS
          in the '$OCRAPP_STATEFILE'.
+         Turns off window restore for '$OCRAPP_BUNDLE_ID' (once; a later run
+         finds it off and says nothing): after a crash macOS would otherwise ask
+         at the next launch whether to reopen its windows, and the run would
+         wait on a dialog nobody sees.
      (2) Collect files to OCR by copying them into TMP_PATH '$TMP_PRE_INP_PATH':
          {a} Read filenames provided on COMMANDLINE      (if applicable)
          {b} Read filenames provided on stdin            (if applicable)
@@ -1344,6 +1351,19 @@ $(cat "$QUEUED_FILE_MOVES_LOG")" \
   fi
 }
 
+# Nobody watches FineReader while my-ocr drives it. After a crash, macOS asks at
+# the next launch whether to reopen its windows, and until someone answers,
+# FineReader does nothing and the run waits on it. With window restore off for
+# the app there is no such dialog. Read first, write only when it differs, so
+# the run after a run changes nothing and prints nothing.
+ocrapp_no_window_restore() {  # <defaults domain>
+  _nw_was="$(/usr/bin/defaults read "$1" ApplePersistenceIgnoreState 2>/dev/null)" || _nw_was="unset"
+  [ "$_nw_was" = "1" ] && return 0
+  /usr/bin/defaults write "$1" ApplePersistenceIgnoreState -bool YES \
+    || err 157 "defaults write '$1' ApplePersistenceIgnoreState -bool YES"
+  echo "$$| >>> [trigger-OCR] $OCRAPP_NAME: window restore off (was: $_nw_was)"
+}
+
 do_trigger_ocr() {
 
   # Same reasoning as setup: as root every path is /Users/root/... and the
@@ -1441,6 +1461,7 @@ Should not be."
   echo "$ocrapp_pids">"$OCRAPP_STATEFILE" || err 020 "Failed to create OCRAPP_STATEFILE '$OCRAPP_STATEFILE'"
   [ $DBG ] && echo "$$|  ~~ [trigger-OCR] (1) Wrote found PID(s) to OCRAPP_STATEFILE '$OCRAPP_STATEFILE' (will be removed in step 6 in part-2)."
   echo "$$| >>> [trigger-OCR] ${x}Created '$OCRAPP_STATEFILE' [pids of '$OCRAPP_NAME': '$ocrapp_pids']"
+  ocrapp_no_window_restore "$OCRAPP_BUNDLE_ID"
 
   [ -t 0 ] && [ $FILELIST_CNT -eq 0 -a $PROVIDED_FILES_CNT -eq 0 ] && err 127 "No <FILES-TO-OCR> provided. Neither as parameters, nor on stdin. Please call with --help for how to use this script.";
 
@@ -2962,6 +2983,34 @@ Try:   su - ${_su_gui:-<the console user>} -c '$US setup${1:+ $1}'"
 # --- --status and setup must be READ-ONLY: no lock, no OCR, no side effects
 # Two my-ocr processes overlap by design: one holds the mutex while another
 # queues. Anything they share by NAME, or create before their turn, is a race.
+# --- a crash must not leave a dialog that blocks the next unattended run.
+# A plist PATH is a defaults domain too, so nothing of the user's is touched.
+t_window_restore() {
+  _wr="$T_TMP/window-restore"; mkdir -p "$_wr"
+  _o1="$( ocrapp_no_window_restore "$_wr/unset" 2>&1 )"
+  _v1="$(/usr/bin/defaults read "$_wr/unset" ApplePersistenceIgnoreState 2>/dev/null)"
+  case "$_v1:$_o1" in
+    "1:"*"window restore off (was: unset)"*) t_ok "window restore is turned off and the output says what it was";;
+    *) t_bad "window restore is turned off and the output says what it was" "value='$_v1' out='$_o1'";;
+  esac
+  _o2="$( ocrapp_no_window_restore "$_wr/unset" 2>&1 )"
+  if [ -z "$_o2" ]; then t_ok "the run after a run changes nothing and prints nothing"
+  else t_bad "the run after a run changes nothing and prints nothing" "out='$_o2'"; fi
+  /usr/bin/defaults write "$_wr/on" ApplePersistenceIgnoreState -bool NO
+  _o3="$( ocrapp_no_window_restore "$_wr/on" 2>&1 )"
+  _v3="$(/usr/bin/defaults read "$_wr/on" ApplePersistenceIgnoreState 2>/dev/null)"
+  case "$_v3:$_o3" in
+    "1:"*"(was: 0)"*) t_ok "an explicit 'reopen windows' setting is overridden too";;
+    *) t_bad "an explicit 'reopen windows' setting is overridden too" "value='$_v3' out='$_o3'";;
+  esac
+  # shellcheck disable=SC2016  # the literal source text is what is searched for
+  if awk '/^do_trigger_ocr\(\) \{/,/^\}/' "$0" | grep -q 'ocrapp_no_window_restore "\$OCRAPP_BUNDLE_ID"'; then
+    t_ok "trigger-OCR applies it to the OCR app's own domain"
+  else
+    t_bad "trigger-OCR applies it to the OCR app's own domain" "the helper is not called before the run"
+  fi
+}
+
 t_concurrency_state() {
   # 1. per-invocation scratch names
   if awk "/^ *PROVIDED_FILES_FILELIST=/" "$0" | grep -q '[$][$]'; then
@@ -3524,6 +3573,7 @@ do_run_tests() {
   t_stranded_not_failed
   t_status_and_setup
   t_test_mail
+  t_window_restore
   rm -rf "$T_TMP"
   echo "  ----"
   printf '  %d passed, %d failed\n' "$T_PASS" "$T_FAIL"
