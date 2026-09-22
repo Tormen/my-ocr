@@ -14,11 +14,11 @@ NL="
 # and is authoritative at runtime -- the deployed copy needs no git and no
 # repository. The build id is a hash of this file, so it is right even unstamped.
 SCRIPT_VERSION="v1.0"
-SCRIPT_COMMIT="39f31c0"           # rewritten by 'my-ocr stamp-version'
+SCRIPT_COMMIT="f585ee0"           # rewritten by 'my-ocr stamp-version'
 # What git said when this build was stamped: 'git describe --tags --long' --
 # <nearest tag>-<commits since it>-g<short sha>. It says whether these bytes
 # ARE that release or work on top of it, on a machine with no git.
-SCRIPT_RELEASE="v1.0-23-g39f31c0"
+SCRIPT_RELEASE="v1.0-24-gf585ee0"
 
 WHOAMI="$(/usr/bin/whoami)"
 [ "$USER" = "$WHOAMI" ] || err 126 "USER '$USER' ? != ? '$WHOAMI' WHOAMI"
@@ -2328,6 +2328,7 @@ stranded_origin() { # $1 = basename of the stranded file
 # facts printed side by side. Returns 0 when the file was dealt with here,
 # 1 when the caller should keep it.
 stranded_verdict() { # $1 = stranded file, $2 = "go" or ""
+  _sv_p=""             # the document it belongs to; read by the caller
   _sv_b="${1##*/}"
   _sv_o="$(stranded_origin "$_sv_b")"
   if [ -z "$_sv_o" ]; then
@@ -2346,6 +2347,18 @@ stranded_verdict() { # $1 = stranded file, $2 = "go" or ""
   fi
   echo "        -> DIFFERS from its $_sv_lbl copy: kept"
   return 1
+}
+
+# One paste-ready command that opens every file listed in $1 (one path per
+# line), each quoted. What a person does next with a kept file is LOOK at it
+# beside its document; spelling the paths out saves them the digging.
+print_open_cmd() { # $1 = file listing the paths
+  [ -s "$1" ] || return 0
+  printf '    > look at them:  open'
+  while IFS= read -r _oc_p; do
+    [ -n "$_oc_p" ] && printf ' \\\n        "%s"' "$_oc_p"
+  done <"$1"
+  printf '\n'
 }
 
 # Pages in a file. A picture is one page; "" means we could not tell.
@@ -2623,6 +2636,7 @@ do_reset() {
   _rs_dest="$RESET_RETRY_TO"
   [ -z "$_rs_dest" ] && _rs_dest="$T_PATH.retry"
   _rs_d=0
+  _rs_look="/tmp/${US%.*}.$$.look"; : >"$_rs_look"
   for _rs_src in "$TMP_PRE_INP_PATH" "$S_PATH" "$T_PATH"; do
     [ -d "$_rs_src" ] || continue
     find "$_rs_src" -mindepth 1 -maxdepth 2 -type f ! -name '.DS_Store' \
@@ -2634,14 +2648,17 @@ do_reset() {
         [ -n "$_rs_go" ] && _rs_n=$(( _rs_n + 1 ))
         continue
       fi
+      _rs_cp="$_sv_p"
       if [ -z "$_rs_go" ]; then
+        { echo "$_rs_f"; [ -n "$_rs_cp" ] && echo "$_rs_cp"; } >>"$_rs_look"
         echo "        WOULD MOVE it -> '$_rs_dest/'"
       else
         mkdir -p "$_rs_dest" 2>/dev/null
         _rs_t="$_rs_dest/${_rs_f##*/}"
         [ -e "$_rs_t" ] && _rs_t="$_rs_dest/$(date +%Y-%m-%d_%H%M.%S)___${_rs_f##*/}"
         if mv "$_rs_f" "$_rs_t" 2>/dev/null; then
-          echo "    > moved '${_rs_f##*/}' -> '$_rs_t'"; _rs_n=$(( _rs_n + 1 ))
+          { echo "$_rs_t"; [ -n "$_rs_cp" ] && echo "$_rs_cp"; } >>"$_rs_look"
+          echo "        moved it -> '$_rs_t'"; _rs_n=$(( _rs_n + 1 ))
         else
           echo "    > FAILED to move '$_rs_f' -- left where it is"
         fi
@@ -2651,9 +2668,11 @@ do_reset() {
   done
   if [ "$_rs_d" -eq 0 ]; then
     echo "    > none in flight"
-  elif [ -n "$_rs_go" ]; then
-    echo "    > retry them with:  $US $_rs_dest/*"
+  else
+    print_open_cmd "$_rs_look"
+    [ -n "$_rs_go" ] && echo "    > retry them with:  $US $_rs_dest/*"
   fi
+  rm -f "$_rs_look"
 
   # The queued-moves log goes LAST: it is the only record of which document a
   # stranded file came from, so it must still exist while those files are
@@ -3273,6 +3292,26 @@ t_stranded_verdict() {
   case "$_o" in *"stranded: "*" B, 2 pages, 6 words, 22 chars"*"filed:    "*" B, 2 pages, 6 words, 22 chars"*)
     t_ok "verdict: both copies show bytes, pages, words and chars";;
   *) t_bad "verdict: both copies show bytes, pages, words and chars" "$_o";; esac
+}
+
+# --- what reset keeps, it hands over as ONE command that opens it
+t_open_cmd() {
+  _oc="$T_TMP/opencmd"; mkdir -p "$_oc"
+  printf '%s\n' "/a b/,ocr.out/x.#1.pdf" "/docs/,scans/x.pdf" >"$_oc/list"
+  _o="$(print_open_cmd "$_oc/list")"
+  # shellcheck disable=SC1003  # the backslashes ARE the line continuations being matched
+  case "$_o" in
+    *'open \'*'"/a b/,ocr.out/x.#1.pdf" \'*'"/docs/,scans/x.pdf"'*)
+      t_ok "reset prints one paste-ready 'open' with every kept file and its document, quoted";;
+    *) t_bad "reset prints one paste-ready 'open' with every kept file and its document, quoted" "$_o";;
+  esac
+  : >"$_oc/empty"
+  if [ -z "$(print_open_cmd "$_oc/empty")" ]; then t_ok "nothing kept, no 'open' line"
+  else t_bad "nothing kept, no 'open' line" "printed one anyway"; fi
+  # and the printed command must actually be valid shell: parse it
+  _cmd="$(print_open_cmd "$_oc/list" | sed 's/^    > look at them:  //')"
+  if printf '%s\n' "$_cmd" | /bin/dash -n 2>/dev/null; then t_ok "the 'open' line is valid shell as printed"
+  else t_bad "the 'open' line is valid shell as printed" "$_cmd"; fi
 }
 
 t_reset_log_last() {
@@ -4014,6 +4053,7 @@ do_run_tests() {
   t_counts_reconcile
   t_stall_recovery
   t_reset_log_last
+  t_open_cmd
   t_stranded_verdict
   rm -rf "$T_TMP"
   echo "  ----"
