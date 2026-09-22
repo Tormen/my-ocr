@@ -14,11 +14,11 @@ NL="
 # and is authoritative at runtime -- the deployed copy needs no git and no
 # repository. The build id is a hash of this file, so it is right even unstamped.
 SCRIPT_VERSION="v1.0"
-SCRIPT_COMMIT="f585ee0"           # rewritten by 'my-ocr stamp-version'
+SCRIPT_COMMIT="fd875e4"           # rewritten by 'my-ocr stamp-version'
 # What git said when this build was stamped: 'git describe --tags --long' --
 # <nearest tag>-<commits since it>-g<short sha>. It says whether these bytes
 # ARE that release or work on top of it, on a machine with no git.
-SCRIPT_RELEASE="v1.0-24-gf585ee0"
+SCRIPT_RELEASE="v1.0-25-gfd875e4"
 
 WHOAMI="$(/usr/bin/whoami)"
 [ "$USER" = "$WHOAMI" ] || err 126 "USER '$USER' ? != ? '$WHOAMI' WHOAMI"
@@ -2340,10 +2340,18 @@ stranded_verdict() { # $1 = stranded file, $2 = "go" or ""
   echo "    > '$_sv_b'"
   echo "        stranded: $(doc_facts "$1")"
   echo "        $_sv_lbl:$( [ "$_sv_lbl" = filed ] && echo '   ' ) $(doc_facts "$_sv_p")  '$_sv_p'"
-  if [ "$2" = "go" ]; then
-    cmp -s "$1" "$_sv_p" && rm -f "$1" && { echo "        -> byte-identical to its $_sv_lbl copy: REMOVED"; return 0; }
-  elif cmp -s "$1" "$_sv_p"; then
-    echo "        -> byte-identical to its $_sv_lbl copy: WOULD REMOVE"; return 0
+  # TRASHED, never rm: a byte-identical copy is still a file someone might
+  # want back, and the Trash is what makes a wrong call recoverable. cmp, not
+  # diff: same answer on binary files, and it says nothing when they match.
+  if cmp -s "$1" "$_sv_p"; then
+    if [ "$2" != "go" ]; then
+      echo "        -> byte-identical to its $_sv_lbl copy: WOULD TRASH it (recoverable from the Trash)"; return 0
+    fi
+    if [ -n "$c_trash" ] && [ -x "$c_trash" ] && "$c_trash" -- "$1" >/dev/null 2>&1; then
+      echo "        -> byte-identical to its $_sv_lbl copy: TRASHED it -- in the Trash, recoverable"; return 0
+    fi
+    echo "        -> byte-identical to its $_sv_lbl copy, but it could NOT be trashed: kept where it is"
+    return 1
   fi
   echo "        -> DIFFERS from its $_sv_lbl copy: kept"
   return 1
@@ -3267,7 +3275,8 @@ t_stranded_verdict() {
     printf '%s%s/,ocr.in/same.#1.pdf%s/,ocr.out/same.#1.pdf%s%s\n'   "$_v/o1" "$T$_v" "$T$_v" "$T" "$_v/filed.pdf"
     printf '%s%s/,ocr.in/other.#1.pdf%s/,ocr.out/other.#1.pdf%s%s\n' "$_v/o2" "$T$_v" "$T$_v" "$T" "$_v/filed.pdf"
   } >"$_v/log"
-  _o="$( QUEUED_FILE_MOVES_LOG="$_v/log"
+  printf '#!/bin/dash\nshift 2>/dev/null\nrm -rf "$@"\n' >"$_v/trash"; chmod +x "$_v/trash"
+  _o="$( QUEUED_FILE_MOVES_LOG="$_v/log"; c_trash="$_v/trash"
          stranded_verdict "$_v/same.#1.pdf" "";   echo "rc=$?"
          [ -e "$_v/same.#1.pdf" ] && echo "DRYRUN-KEPT"
          stranded_verdict "$_v/same.#1.pdf" go;   echo "rc=$?"
@@ -3276,12 +3285,18 @@ t_stranded_verdict() {
          [ -e "$_v/other.#1.pdf" ] && echo "OTHER-KEPT"
          stranded_verdict "$_v/nolog.#1.pdf" go;  echo "rc=$?"
          [ -e "$_v/nolog.#1.pdf" ] && echo "NOLOG-KEPT" )"
-  case "$_o" in *"WOULD REMOVE"*"DRYRUN-KEPT"*)
-    t_ok "verdict: a dry run names the byte-identical copy and removes NOTHING";;
-  *) t_bad "verdict: a dry run names the byte-identical copy and removes NOTHING" "$_o";; esac
-  case "$_o" in *"REMOVED"*"GONE"*)
-    t_ok "verdict: with go, a byte-identical copy is removed";;
-  *) t_bad "verdict: with go, a byte-identical copy is removed" "$_o";; esac
+  case "$_o" in *"WOULD TRASH"*"DRYRUN-KEPT"*)
+    t_ok "verdict: a dry run names the byte-identical copy and trashes NOTHING";;
+  *) t_bad "verdict: a dry run names the byte-identical copy and trashes NOTHING" "$_o";; esac
+  case "$_o" in *"TRASHED it -- in the Trash, recoverable"*"GONE"*)
+    t_ok "verdict: with go, a byte-identical copy goes to the TRASH, never rm";;
+  *) t_bad "verdict: with go, a byte-identical copy goes to the TRASH, never rm" "$_o";; esac
+  # shellcheck disable=SC2016  # matching literal source text
+  if awk '/^stranded_verdict\(\) \{/,/^\}/' "$0" | grep -q 'rm -f "\$1"'; then
+    t_bad "verdict: the removal path uses trash, not rm" "an rm is still in there"
+  else
+    t_ok "verdict: the removal path uses trash, not rm"
+  fi
   case "$_o" in *"DIFFERS from its filed copy: kept"*"OTHER-KEPT"*)
     t_ok "verdict: same scan, different OCR -- DIFFERS and is kept, never removed";;
   *) t_bad "verdict: same scan, different OCR -- DIFFERS and is kept, never removed" "$_o";; esac
