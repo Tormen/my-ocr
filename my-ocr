@@ -14,11 +14,11 @@ NL="
 # and is authoritative at runtime -- the deployed copy needs no git and no
 # repository. The build id is a hash of this file, so it is right even unstamped.
 SCRIPT_VERSION="v1.0"
-SCRIPT_COMMIT="6b339bf"           # rewritten by 'my-ocr stamp-version'
+SCRIPT_COMMIT="39f31c0"           # rewritten by 'my-ocr stamp-version'
 # What git said when this build was stamped: 'git describe --tags --long' --
 # <nearest tag>-<commits since it>-g<short sha>. It says whether these bytes
 # ARE that release or work on top of it, on a machine with no git.
-SCRIPT_RELEASE="v1.0-22-g6b339bf"
+SCRIPT_RELEASE="v1.0-23-g39f31c0"
 
 WHOAMI="$(/usr/bin/whoami)"
 [ "$USER" = "$WHOAMI" ] || err 126 "USER '$USER' ? != ? '$WHOAMI' WHOAMI"
@@ -2293,6 +2293,61 @@ stale_run_files() {
   done
 }
 
+# What a document IS, in one line: bytes, pages, and what the OCR found in it.
+# Printed side by side for two copies, so a person can see how they differ
+# without opening either.
+doc_facts() { # $1 = file
+  _df_b="$(wc -c <"$1" 2>/dev/null | tr -d ' ')"
+  _df_p="$(pages_of "$1")"
+  _df_t="$("$c_pdftotext" "$1" - 2>/dev/null)"
+  _df_w="$(printf '%s' "$_df_t" | wc -w | tr -d ' ')"
+  _df_c="$(printf '%s' "$_df_t" | tr -d '[:space:]' | wc -c | tr -d ' ')"
+  printf '%s B, %s pages, %s words, %s chars' \
+    "${_df_b:-?}" "${_df_p:-?}" "${_df_w:-0}" "${_df_c:-0}"
+}
+
+# The document a stranded file came from, from the queued-moves log: field 2
+# is its name under ,ocr.in, field 3 under ,ocr.out; field 4 is where it was
+# filed, field 1 the original. Prints "<label><TAB><path>" for the first that
+# still EXISTS, nothing when there is no record or no copy left.
+stranded_origin() { # $1 = basename of the stranded file
+  [ -s "$QUEUED_FILE_MOVES_LOG" ] || return 0
+  awk -F'\t' -v b="$1" '{ n=split($2,a,"/"); m=split($3,c,"/")
+      if (a[n]==b || c[m]==b) { print $4 "\t" $1; exit } }' "$QUEUED_FILE_MOVES_LOG" |
+  while IFS="$(printf '\t')" read -r _so_final _so_orig; do
+    if   [ -n "$_so_final" ] && [ -e "$_so_final" ]; then printf 'filed\t%s\n' "$_so_final"
+    elif [ -n "$_so_orig" ]  && [ -e "$_so_orig" ];  then printf 'original\t%s\n' "$_so_orig"; fi
+  done
+}
+
+# A stranded file is a copy or a result, never the document itself -- but
+# "same name as the filed one" proves only that it came from the same SCAN:
+# two OCR runs of one scan differ in bytes AND in recognised text. So a file is
+# removed only when it is BYTE-IDENTICAL to its document (cmp, one call, no
+# window between check and removal); anything else is kept, with both copies'
+# facts printed side by side. Returns 0 when the file was dealt with here,
+# 1 when the caller should keep it.
+stranded_verdict() { # $1 = stranded file, $2 = "go" or ""
+  _sv_b="${1##*/}"
+  _sv_o="$(stranded_origin "$_sv_b")"
+  if [ -z "$_sv_o" ]; then
+    echo "    > '$_sv_b' -- no record of the document it came from: kept"
+    echo "        stranded: $(doc_facts "$1")"
+    return 1
+  fi
+  _sv_lbl="${_sv_o%%	*}"; _sv_p="${_sv_o#*	}"
+  echo "    > '$_sv_b'"
+  echo "        stranded: $(doc_facts "$1")"
+  echo "        $_sv_lbl:$( [ "$_sv_lbl" = filed ] && echo '   ' ) $(doc_facts "$_sv_p")  '$_sv_p'"
+  if [ "$2" = "go" ]; then
+    cmp -s "$1" "$_sv_p" && rm -f "$1" && { echo "        -> byte-identical to its $_sv_lbl copy: REMOVED"; return 0; }
+  elif cmp -s "$1" "$_sv_p"; then
+    echo "        -> byte-identical to its $_sv_lbl copy: WOULD REMOVE"; return 0
+  fi
+  echo "        -> DIFFERS from its $_sv_lbl copy: kept"
+  return 1
+}
+
 # Pages in a file. A picture is one page; "" means we could not tell.
 pages_of() { # $1 = file
   case "$(file --brief "$1" 2>/dev/null | cut -f1 -d' ')" in
@@ -2575,8 +2630,12 @@ do_reset() {
     while IFS= read -r _rs_f; do
       [ -n "$_rs_f" ] || continue
       _rs_d=$(( _rs_d + 1 ))
+      if stranded_verdict "$_rs_f" "${_rs_go:+go}"; then
+        [ -n "$_rs_go" ] && _rs_n=$(( _rs_n + 1 ))
+        continue
+      fi
       if [ -z "$_rs_go" ]; then
-        echo "    > WOULD MOVE '${_rs_f##*/}' -> '$_rs_dest/'"
+        echo "        WOULD MOVE it -> '$_rs_dest/'"
       else
         mkdir -p "$_rs_dest" 2>/dev/null
         _rs_t="$_rs_dest/${_rs_f##*/}"
@@ -3177,6 +3236,45 @@ Try:   su - ${_su_gui:-<the console user>} -c '$US setup${1:+ $1}'"
 # --- a summary may not print a number that cannot be true.
 # --- a stalled OCR app: grinding, or waiting on a dialog? CPU time decides.
 # --- reset keeps its only evidence until it has dealt with the documents
+# --- a stranded file is removed only when BYTE-IDENTICAL to its document
+t_stranded_verdict() {
+  _v="$T_TMP/verdict"; mkdir -p "$_v"
+  t_mkpdf "$_v/filed.pdf" 2 FineReader "one two three"
+  cp "$_v/filed.pdf" "$_v/same.#1.pdf"                       # a true copy
+  t_mkpdf "$_v/other.#1.pdf" 2 FineReader "one two four"     # same scan, other OCR
+  t_mkpdf "$_v/nolog.#1.pdf" 1 FineReader "alone"            # no record at all
+  T='	'
+  {
+    printf '%s%s/,ocr.in/same.#1.pdf%s/,ocr.out/same.#1.pdf%s%s\n'   "$_v/o1" "$T$_v" "$T$_v" "$T" "$_v/filed.pdf"
+    printf '%s%s/,ocr.in/other.#1.pdf%s/,ocr.out/other.#1.pdf%s%s\n' "$_v/o2" "$T$_v" "$T$_v" "$T" "$_v/filed.pdf"
+  } >"$_v/log"
+  _o="$( QUEUED_FILE_MOVES_LOG="$_v/log"
+         stranded_verdict "$_v/same.#1.pdf" "";   echo "rc=$?"
+         [ -e "$_v/same.#1.pdf" ] && echo "DRYRUN-KEPT"
+         stranded_verdict "$_v/same.#1.pdf" go;   echo "rc=$?"
+         [ -e "$_v/same.#1.pdf" ] || echo "GONE"
+         stranded_verdict "$_v/other.#1.pdf" go;  echo "rc=$?"
+         [ -e "$_v/other.#1.pdf" ] && echo "OTHER-KEPT"
+         stranded_verdict "$_v/nolog.#1.pdf" go;  echo "rc=$?"
+         [ -e "$_v/nolog.#1.pdf" ] && echo "NOLOG-KEPT" )"
+  case "$_o" in *"WOULD REMOVE"*"DRYRUN-KEPT"*)
+    t_ok "verdict: a dry run names the byte-identical copy and removes NOTHING";;
+  *) t_bad "verdict: a dry run names the byte-identical copy and removes NOTHING" "$_o";; esac
+  case "$_o" in *"REMOVED"*"GONE"*)
+    t_ok "verdict: with go, a byte-identical copy is removed";;
+  *) t_bad "verdict: with go, a byte-identical copy is removed" "$_o";; esac
+  case "$_o" in *"DIFFERS from its filed copy: kept"*"OTHER-KEPT"*)
+    t_ok "verdict: same scan, different OCR -- DIFFERS and is kept, never removed";;
+  *) t_bad "verdict: same scan, different OCR -- DIFFERS and is kept, never removed" "$_o";; esac
+  case "$_o" in *"no record of the document"*"NOLOG-KEPT"*)
+    t_ok "verdict: no record of its document -- kept";;
+  *) t_bad "verdict: no record of its document -- kept" "$_o";; esac
+  # the fixture writes its text on EVERY page: 2 x "one two three" = 6 words, 22 chars
+  case "$_o" in *"stranded: "*" B, 2 pages, 6 words, 22 chars"*"filed:    "*" B, 2 pages, 6 words, 22 chars"*)
+    t_ok "verdict: both copies show bytes, pages, words and chars";;
+  *) t_bad "verdict: both copies show bytes, pages, words and chars" "$_o";; esac
+}
+
 t_reset_log_last() {
   _rl="$(awk '/^do_reset\(\)/,/^\}/' "$0")"
   _rl_docs="$(printf '%s\n' "$_rl" | grep -n 'retry them with' | head -n 1 | cut -d: -f1)"
@@ -3916,6 +4014,7 @@ do_run_tests() {
   t_counts_reconcile
   t_stall_recovery
   t_reset_log_last
+  t_stranded_verdict
   rm -rf "$T_TMP"
   echo "  ----"
   printf '  %d passed, %d failed\n' "$T_PASS" "$T_FAIL"
