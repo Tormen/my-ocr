@@ -14,11 +14,11 @@ NL="
 # and is authoritative at runtime -- the deployed copy needs no git and no
 # repository. The build id is a hash of this file, so it is right even unstamped.
 SCRIPT_VERSION="v1.0"
-SCRIPT_COMMIT="fd875e4"           # rewritten by 'my-ocr stamp-version'
+SCRIPT_COMMIT="dc51019"           # rewritten by 'my-ocr stamp-version'
 # What git said when this build was stamped: 'git describe --tags --long' --
 # <nearest tag>-<commits since it>-g<short sha>. It says whether these bytes
 # ARE that release or work on top of it, on a machine with no git.
-SCRIPT_RELEASE="v1.0-25-gfd875e4"
+SCRIPT_RELEASE="v1.0-26-gdc51019"
 
 WHOAMI="$(/usr/bin/whoami)"
 [ "$USER" = "$WHOAMI" ] || err 126 "USER '$USER' ? != ? '$WHOAMI' WHOAMI"
@@ -215,6 +215,13 @@ FILELIST_CNT=0; # number of files in the FILELIST
   # queue is also stalled, before my-ocr stops believing it is working.
   # 0 disables the recovery and my-ocr waits for a person, as it always did.
   OCRAPP_IDLE_GIVEUP=120;     # (seconds) of ZERO cpu while stalled -> recover
+  # The hand-over only starts the OCR if the folder action FIRES. On 2026-09-22
+  # one filesystem event went missing: the dispatcher was alive and logged
+  # nothing, and the run sat for 300s for a workflow that was never started --
+  # then the identical hand-over worked twice, in 14s and 6s. So: if the OCR app
+  # has not come up this many seconds after the hand-over, make the hand-over
+  # again ONCE. 0 disables the nudge and my-ocr waits as it always did.
+  OCRAPP_TRIGGER_WAIT=60;     # (seconds) no OCR app after hand-over -> re-trigger
   STUCK_MARKER_DIR="/Users/$WHOAMI/Desktop"   # where the marker file lands
 
 ##############################################################
@@ -1751,6 +1758,7 @@ $(ls -la "$S_PATH"|sed -e "s/^/${PFX}     | /")"
   # conclusive -- that $OCRAPP_NAME is not running at all.
   local i=0; local stalled=0; local last_q=""; local next_alert=$STALL_ALERT_AFTER
   local _cpu_was=""; local _cpu_still=0
+  local _fr_seen=""; local _nudged=""; local _tw=0
   while [ -s "$QUEUED_FILE_MOVES_LOG" ]; do
 
     if [ -s "$PARTx_ERRORED_FLAGFILE" ]; then
@@ -1761,6 +1769,30 @@ $(ls -la "$S_PATH"|sed -e "s/^/${PFX}     | /")"
 
     sleep 1;
     i=$(( $i + 1 ));
+
+    # Has the OCR app come up at all? Until it has, the hand-over may simply
+    # never have been noticed -- a stall of a run that never started.
+    if [ -z "$_fr_seen" ]; then
+      if pgrep -x "$OCRAPP_NAME" >/dev/null 2>&1; then
+        _fr_seen=1
+      elif [ "${OCRAPP_TRIGGER_WAIT:-0}" -gt 0 ]; then
+        _tw=$(( _tw + 1 ))
+        if [ "$_tw" -ge "$OCRAPP_TRIGGER_WAIT" ] && [ -z "$_nudged" ] \
+           && ! pgrep -f "$US --part-1" >/dev/null 2>&1; then
+          _nudged=1; _tw=0
+          if nudge_handover "$S_PATH/$COLLECT_INP_PATH" "$TMP_PRE_INP_PATH"; then
+            echo "$$| >>> [trigger-OCR] $OCRAPP_NAME had not started ${OCRAPP_TRIGGER_WAIT}s after the hand-over -- made the hand-over again (no file was touched)"
+          else
+            echo "$$| >>> [trigger-OCR] WARNING :: could not re-make the hand-over -- the documents are still in '$S_PATH/$COLLECT_INP_PATH' or '$TMP_PRE_INP_PATH'"
+          fi
+        elif [ "$_tw" -ge "$OCRAPP_TRIGGER_WAIT" ] && [ -n "$_nudged" ]; then
+          m="$OCRAPP_NAME never started -- the hand-over was made twice and the folder action did not fire either time.
+Check that Folder Actions are enabled and that '$S_PATH' still has ours attached:  $US setup"
+          alert_stuck "$m"
+          err 159 "$m${NL}Still queued in '$QUEUED_FILE_MOVES_LOG':${NL}$(cat "$QUEUED_FILE_MOVES_LOG")"
+        fi
+      fi
+    fi
 
     # progress == the queue shrank since the last look
     q="$(wc -l < "$QUEUED_FILE_MOVES_LOG" | tr -d ' ')"
@@ -2369,6 +2401,22 @@ print_open_cmd() { # $1 = file listing the paths
   printf '\n'
 }
 
+# Make the hand-over AGAIN: move the staging directory out of the watched
+# folder and straight back, so the folder action gets a fresh event. The files
+# travel with the directory and are never touched -- this moves, never copies
+# or deletes. Returns 1 if either move fails, leaving the files wherever the
+# last successful move put them, which is always one of the two directories.
+nudge_handover() { # $1 = staging dir inside the watched folder, $2 = a path outside it
+  [ -d "$1" ] || return 1
+  [ -e "$2" ] && { rmdir "$2" 2>/dev/null || return 1; }
+  mv "$1" "$2" || return 1
+  sleep 1
+  mv "$2" "$1" || return 1      # back to the SAME path: moving it into the
+                                # parent would rename it to $2's basename
+  [ -d "$1" ] || return 1
+  return 0
+}
+
 # Pages in a file. A picture is one page; "" means we could not tell.
 pages_of() { # $1 = file
   case "$(file --brief "$1" 2>/dev/null | cut -f1 -d' ')" in
@@ -2551,6 +2599,18 @@ close_ocrapp_if_ours() {
 # provably dead owners. Runs at the start of every trigger-OCR.
 self_heal() {
   _sh_n=0
+  # A staging directory left in the watched folder belongs to a run that died
+  # before its cleanup ran. EMPTY, it is junk that misleads whoever looks.
+  # Holding files, it is DOCUMENTS: never removed here, and never merged into --
+  # the next hand-over would fail on it (err 108). 'reset' puts those files
+  # where they can be retried, and only then is the directory empty.
+  if [ -d "$S_PATH/$COLLECT_INP_PATH" ]; then
+    if rmdir "$S_PATH/$COLLECT_INP_PATH" 2>/dev/null; then
+      _sh_n=$(( _sh_n + 1 ))
+    else
+      echo "$$| >>> [$WHAT] '$S_PATH/$COLLECT_INP_PATH' is left over from a run that died and still holds document(s) -- '$US reset' puts them where they can be retried"
+    fi
+  fi
   for _sf in $(stale_run_files); do
     rm -f "$_sf" 2>/dev/null && _sh_n=$(( _sh_n + 1 ))
   done
@@ -2676,6 +2736,14 @@ do_reset() {
   done
   if [ "$_rs_d" -eq 0 ]; then
     echo "    > none in flight"
+    for _rs_sd in "$S_PATH/$COLLECT_INP_PATH" "$TMP_PRE_INP_PATH"; do
+      [ -d "$_rs_sd" ] || continue
+      if [ -z "$_rs_go" ]; then
+        rmdir "$_rs_sd" 2>/dev/null && { mkdir -p "$_rs_sd"; echo "    > WOULD REMOVE the now-empty staging dir '$_rs_sd'"; }
+      elif rmdir "$_rs_sd" 2>/dev/null; then
+        echo "    > removed the now-empty staging dir '$_rs_sd'"; _rs_n=$(( _rs_n + 1 ))
+      fi
+    done
   else
     print_open_cmd "$_rs_look"
     [ -n "$_rs_go" ] && echo "    > retry them with:  $US $_rs_dest/*"
@@ -3310,6 +3378,53 @@ t_stranded_verdict() {
 }
 
 # --- what reset keeps, it hands over as ONE command that opens it
+# --- the hand-over can be made AGAIN, and it moves documents, never loses them
+t_nudge() {
+  _n="$T_TMP/nudge"; mkdir -p "$_n/watched/staging" "$_n/out"; rmdir "$_n/out"
+  : >"$_n/watched/staging/doc.#1.pdf"; : >"$_n/watched/staging/two.#1.pdf"
+  if nudge_handover "$_n/watched/staging" "$_n/out" \
+     && [ -f "$_n/watched/staging/doc.#1.pdf" ] && [ -f "$_n/watched/staging/two.#1.pdf" ] \
+     && [ ! -e "$_n/out" ]; then
+    t_ok "nudge: the staging dir leaves the watched folder and comes back, with both documents"
+  else
+    t_bad "nudge: the staging dir leaves the watched folder and comes back, with both documents" \
+          "$(find "$_n" | tr '\n' ' ')"
+  fi
+  if nudge_handover "$_n/watched/absent" "$_n/out"; then
+    t_bad "nudge: nothing to hand over means it says so" "returned 0 for a missing dir"
+  else
+    t_ok "nudge: nothing to hand over means it says so"
+  fi
+  # shellcheck disable=SC2016  # matching literal source text
+  if grep -q 'OCRAPP_TRIGGER_WAIT=' "$0" && awk '/^wait_for_/,0' "$0" | grep -q nudge_handover \
+     || grep -q 'nudge_handover "\$S_PATH/\$COLLECT_INP_PATH"' "$0"; then
+    t_ok "nudge: the wait re-triggers after OCRAPP_TRIGGER_WAIT, and 0 disables it"
+  else
+    t_bad "nudge: the wait re-triggers after OCRAPP_TRIGGER_WAIT, and 0 disables it" "not wired in"
+  fi
+}
+
+# --- a staging dir left by a dead run: empty is junk, full is DOCUMENTS
+t_staging_sweep() {
+  _ss="$T_TMP/sweep"; mkdir -p "$_ss/in/staging"
+  _o="$( S_PATH="$_ss/in"; COLLECT_INP_PATH=staging; WHAT=sweeptest
+         PARTx_ERRORED_FLAGFILE="$_ss/flag"; self_heal 2>&1 )"
+  if [ ! -d "$_ss/in/staging" ]; then t_ok "sweep: an EMPTY staging leftover is removed"
+  else t_bad "sweep: an EMPTY staging leftover is removed" "$_o"; fi
+  mkdir -p "$_ss/in/staging"; : >"$_ss/in/staging/doc.#1.pdf"
+  _o="$( S_PATH="$_ss/in"; COLLECT_INP_PATH=staging; WHAT=sweeptest
+         PARTx_ERRORED_FLAGFILE="$_ss/flag"; self_heal 2>&1 )"
+  case "$_o" in
+    *"still holds document"*"reset"*)
+      if [ -f "$_ss/in/staging/doc.#1.pdf" ]; then
+        t_ok "sweep: one holding DOCUMENTS is left alone and points at reset"
+      else
+        t_bad "sweep: one holding DOCUMENTS is left alone and points at reset" "the document is gone!"
+      fi ;;
+    *) t_bad "sweep: one holding DOCUMENTS is left alone and points at reset" "$_o";;
+  esac
+}
+
 t_open_cmd() {
   _oc="$T_TMP/opencmd"; mkdir -p "$_oc"
   printf '%s\n' "/a b/,ocr.out/x.#1.pdf" "/docs/,scans/x.pdf" >"$_oc/list"
@@ -4069,6 +4184,8 @@ do_run_tests() {
   t_stall_recovery
   t_reset_log_last
   t_open_cmd
+  t_nudge
+  t_staging_sweep
   t_stranded_verdict
   rm -rf "$T_TMP"
   echo "  ----"
