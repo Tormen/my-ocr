@@ -14,11 +14,11 @@ NL="
 # and is authoritative at runtime -- the deployed copy needs no git and no
 # repository. The build id is a hash of this file, so it is right even unstamped.
 SCRIPT_VERSION="v1.0"
-SCRIPT_COMMIT="ccab472"           # rewritten by 'my-ocr stamp-version'
+SCRIPT_COMMIT="166cf19"           # rewritten by 'my-ocr stamp-version'
 # What git said when this build was stamped: 'git describe --tags --long' --
 # <nearest tag>-<commits since it>-g<short sha>. It says whether these bytes
 # ARE that release or work on top of it, on a machine with no git.
-SCRIPT_RELEASE="v1.0-17-gccab472"
+SCRIPT_RELEASE="v1.0-18-g166cf19"
 
 WHOAMI="$(/usr/bin/whoami)"
 [ "$USER" = "$WHOAMI" ] || err 126 "USER '$USER' ? != ? '$WHOAMI' WHOAMI"
@@ -75,6 +75,12 @@ FILELIST_CNT=0; # number of files in the FILELIST
   # Its preferences domain: trigger-OCR turns window restore off there, so a
   # crash cannot leave a "reopen its windows?" dialog blocking the next run.
   OCRAPP_BUNDLE_ID="com.abbyy.FineReaderPro"
+  # Where it keeps its documents. A killed run leaves a half-built one here and
+  # the next launch offers to RECOVER it -- a second dialog, its own, that the
+  # window-restore setting does not touch. The BASE is a plain path -- it holds
+  # a space, so it must stay quoted at the use site; only the version suffix and
+  # the document name are globbed. Tests point the base at a temp directory.
+  OCRAPP_DOCSTORE_BASE="/Users/${WHOAMI}/Library/Application Support"
   OCRAPP_PRODUCER_TAG="FineReader"
   OCRAPP_OUTPUT_SUFFIX="pdf" # suffix used by OCRAPP on ocr'ed files
 
@@ -1364,6 +1370,70 @@ ocrapp_no_window_restore() {  # <defaults domain>
   echo "$$| >>> [trigger-OCR] $OCRAPP_NAME: window restore off (was: $_nw_was)"
 }
 
+# The OTHER dialog. ocrapp_no_window_restore silences macOS's "reopen windows?";
+# this clears what makes FineReader ask its own "recover the Untitled document?".
+# Both block an unattended run for ever, and a kill -- including my-ocr's own
+# recovery from a stuck run -- is what creates them.
+#
+# The call is decided at BATCH level because that is the only level the evidence
+# exists at: _FRBatch.pac names the source of every page, while nothing inside a
+# page directory says where it came from. So the document goes only when EVERY
+# /Users/ path it references lies under my-ocr's own staging -- then it is this
+# tool's unfinished work and nobody loses anything. A single foreign path, or a
+# batch file that cannot be read, means a person may have opened a document
+# here: say so and leave it. The dialog then blocks the run and the operator is
+# told why, which is the better failure -- deleting someone's pages on a guess
+# is not recoverable, a blocked run is.
+ocrapp_clear_stale_batch() { # $1 = staging prefix (nothing outside it is ours)
+  _sb_stage="$1"
+  # never touch a document while the app that owns it is running
+  [ -n "$(pgrep -x "$OCRAPP_NAME" 2>/dev/null)" ] && return 0
+  for _sb_d in "$OCRAPP_DOCSTORE_BASE/$OCRAPP_BUNDLE_ID"*/Untitled.FR*; do
+    [ -d "$_sb_d" ] || continue
+    _sb_pac="$_sb_d/_FRBatch.pac"
+    if [ ! -r "$_sb_pac" ]; then
+      echo "$$| >>> [trigger-OCR] $OCRAPP_NAME: leftover '$_sb_d' has no readable batch file -- LEFT ALONE (it may be a document of yours; its recovery dialog will block the run)"
+      continue
+    fi
+    # Binary file: one token per printable run, then take each token from its
+    # first '/' -- the format writes a length byte in front of the path.
+    # LC_ALL=C because tr refuses binary input in a UTF-8 locale ("Illegal byte
+    # sequence"), and a tr that fails yields NO paths, which reads exactly like
+    # "nothing maps this to us" -- the cleaner would refuse for ever and look
+    # like it was working. Every ABSOLUTE path counts, not just /Users/ ones:
+    # the staging prefix decides what is ours, so nothing else may be assumed.
+    _sb_paths="$(LC_ALL=C tr -c '[:print:]' '\n' <"$_sb_pac" | sed -n 's|^[^/]*\(/.*\)$|\1|p' | sort -u)"
+    if [ -z "$_sb_paths" ]; then
+      echo "$$| >>> [trigger-OCR] $OCRAPP_NAME: leftover '$_sb_d' names no source at all -- LEFT ALONE (nothing maps it to this tool)"
+      continue
+    fi
+    _sb_foreign=""; _sb_n=0
+    while IFS= read -r _sb_p; do
+      [ -n "$_sb_p" ] || continue
+      _sb_n=$(( _sb_n + 1 ))
+      case "$_sb_p" in
+        "$_sb_stage"/*) ;;
+        *) _sb_foreign="$_sb_p"; break ;;
+      esac
+    done <<_EOSB_
+$_sb_paths
+_EOSB_
+    if [ -n "$_sb_foreign" ]; then
+      echo "$$| >>> [trigger-OCR] $OCRAPP_NAME: leftover '$_sb_d' references '$_sb_foreign', which is not my-ocr's staging -- LEFT ALONE"
+      continue
+    fi
+    if [ -n "$c_trash" ] && [ -x "$c_trash" ]; then
+      if "$c_trash" -- "$_sb_d" >/dev/null 2>&1; then
+        echo "$$| >>> [trigger-OCR] $OCRAPP_NAME: cleared leftover document ($_sb_n source(s), all from staging) -- trashed '$_sb_d'"
+      else
+        echo "$$| >>> [trigger-OCR] $OCRAPP_NAME: WARNING could not trash leftover '$_sb_d' -- its recovery dialog may block the run"
+      fi
+    else
+      echo "$$| >>> [trigger-OCR] $OCRAPP_NAME: WARNING no trash command -- leftover left at '$_sb_d'"
+    fi
+  done
+}
+
 do_trigger_ocr() {
 
   # Same reasoning as setup: as root every path is /Users/root/... and the
@@ -1462,6 +1532,7 @@ Should not be."
   [ $DBG ] && echo "$$|  ~~ [trigger-OCR] (1) Wrote found PID(s) to OCRAPP_STATEFILE '$OCRAPP_STATEFILE' (will be removed in step 6 in part-2)."
   echo "$$| >>> [trigger-OCR] ${x}Created '$OCRAPP_STATEFILE' [pids of '$OCRAPP_NAME': '$ocrapp_pids']"
   ocrapp_no_window_restore "$OCRAPP_BUNDLE_ID"
+  ocrapp_clear_stale_batch "$S_PATH"
 
   [ -t 0 ] && [ $FILELIST_CNT -eq 0 -a $PROVIDED_FILES_CNT -eq 0 ] && err 127 "No <FILES-TO-OCR> provided. Neither as parameters, nor on stdin. Please call with --help for how to use this script.";
 
@@ -2985,6 +3056,63 @@ Try:   su - ${_su_gui:-<the console user>} -c '$US setup${1:+ $1}'"
 # queues. Anything they share by NAME, or create before their turn, is a race.
 # --- a crash must not leave a dialog that blocks the next unattended run.
 # A plist PATH is a defaults domain too, so nothing of the user's is touched.
+# --- the leftover document: cleared only when it is provably my-ocr's own.
+# The decision is made from _FRBatch.pac, the only place a source is named.
+t_stale_batch() {
+  _sb_t="$T_TMP/stale-batch"; mkdir -p "$_sb_t/bin"
+  # a stub trash, so a test never puts anything in the user's Trash
+  printf '#!/bin/dash\nshift 2>/dev/null\nrm -rf "$@"\n' >"$_sb_t/bin/trash"
+  chmod +x "$_sb_t/bin/trash"
+  _sb_stage="$_sb_t/stage"
+  # build one document whose pages all came from staging, and one that did not
+  _mk() { # $1 = doc dir, $2.. = source paths written into the batch file
+    mkdir -p "$1/0001/Image"; _d="$1"; shift
+    # BINARY, like the real thing: a high byte in front of every path, so a
+    # tr without LC_ALL=C fails here exactly as it does on a real batch file.
+    for _p in "$@"; do printf '\377\376W%s\377' "$_p" >>"$_d/_FRBatch.pac"; done
+  }
+  # shellcheck disable=SC2030  # deliberate: the subshell is what keeps these
+  # overrides out of the rest of the suite
+  (
+    OCRAPP_DOCSTORE_BASE="$_sb_t/store"; OCRAPP_BUNDLE_ID="com.test.app"
+    c_trash="$_sb_t/bin/trash"; OCRAPP_NAME="no-such-process-xyzzy"
+    _mine="$_sb_t/store/com.test.app12.00/Untitled.FR12.0"
+    _mk "$_mine" "$_sb_stage/a.#1.pdf" "$_sb_stage/b.#1.pdf"
+    _o="$(ocrapp_clear_stale_batch "$_sb_stage" 2>&1)"
+    if [ ! -d "$_mine" ]; then echo "OK1 $_o"; else echo "BAD1 $_o"; fi
+
+    _mixed="$_sb_t/store/com.test.app12.00/Untitled.FR12.0"
+    _mk "$_mixed" "$_sb_stage/a.#1.pdf" "/Users/someone/Documents/their-thesis.pdf"
+    _o="$(ocrapp_clear_stale_batch "$_sb_stage" 2>&1)"
+    if [ -d "$_mixed" ]; then echo "OK2 $_o"; else echo "BAD2 $_o"; fi
+    rm -rf "$_mixed"
+
+    _nopac="$_sb_t/store/com.test.app12.00/Untitled.FR12.0"
+    mkdir -p "$_nopac/0001/Image"
+    _o="$(ocrapp_clear_stale_batch "$_sb_stage" 2>&1)"
+    if [ -d "$_nopac" ]; then echo "OK3 $_o"; else echo "BAD3 $_o"; fi
+  ) >"$_sb_t/out" 2>&1
+  _r="$(cat "$_sb_t/out")"
+  case "$_r" in
+    *"OK1"*"cleared leftover document (2 source(s)"*) t_ok "a leftover whose pages all came from staging is cleared";;
+    *) t_bad "a leftover whose pages all came from staging is cleared" "out='$_r'";;
+  esac
+  case "$_r" in
+    *"OK2"*"their-thesis.pdf"*"LEFT ALONE"*) t_ok "one foreign source and the whole document is LEFT ALONE, named in the output";;
+    *) t_bad "one foreign source and the whole document is LEFT ALONE, named in the output" "out='$_r'";;
+  esac
+  case "$_r" in
+    *"OK3"*"no readable batch file"*"LEFT ALONE"*) t_ok "no batch file to read means no decision -- LEFT ALONE, and it says why";;
+    *) t_bad "no batch file to read means no decision -- LEFT ALONE, and it says why" "out='$_r'";;
+  esac
+  # shellcheck disable=SC2016  # the literal source text is what is searched for
+  if awk '/^do_trigger_ocr\(\) \{/,/^\}/' "$0" | grep -q 'ocrapp_clear_stale_batch "\$S_PATH"'; then
+    t_ok "trigger-OCR clears it against my-ocr's own staging path"
+  else
+    t_bad "trigger-OCR clears it against my-ocr's own staging path" "the helper is not called before the run"
+  fi
+}
+
 t_window_restore() {
   _wr="$T_TMP/window-restore"; mkdir -p "$_wr"
   _o1="$( ocrapp_no_window_restore "$_wr/unset" 2>&1 )"
@@ -3574,6 +3702,7 @@ do_run_tests() {
   t_status_and_setup
   t_test_mail
   t_window_restore
+  t_stale_batch
   rm -rf "$T_TMP"
   echo "  ----"
   printf '  %d passed, %d failed\n' "$T_PASS" "$T_FAIL"
