@@ -14,11 +14,11 @@ NL="
 # and is authoritative at runtime -- the deployed copy needs no git and no
 # repository. The build id is a hash of this file, so it is right even unstamped.
 SCRIPT_VERSION="v1.0"
-SCRIPT_COMMIT="dc51019"           # rewritten by 'my-ocr stamp-version'
+SCRIPT_COMMIT="3c36829"           # rewritten by 'my-ocr stamp-version'
 # What git said when this build was stamped: 'git describe --tags --long' --
 # <nearest tag>-<commits since it>-g<short sha>. It says whether these bytes
 # ARE that release or work on top of it, on a machine with no git.
-SCRIPT_RELEASE="v1.0-26-gdc51019"
+SCRIPT_RELEASE="v1.0-27-g3c36829"
 
 WHOAMI="$(/usr/bin/whoami)"
 [ "$USER" = "$WHOAMI" ] || err 126 "USER '$USER' ? != ? '$WHOAMI' WHOAMI"
@@ -144,7 +144,22 @@ FILELIST_CNT=0; # number of files in the FILELIST
   du_unit_str="1/2 KB"
 
 # for do_part_1 / --part-1:
-  S_PATH="/Users/${WHOAMI}/Public/,ocr.in" # == INP_PATH, we'll exptect files to be here
+  # RESOLUTION CLASSES. The export settings that suit a 200 dpi document ruin a
+  # 600 dpi picture and the other way round, and they live in the Automator
+  # workflow -- so there is one WATCHED FOLDER and one WORKFLOW per class, both
+  # static. Rewriting one workflow per run was rejected: a lost race would OCR
+  # documents under the wrong setting and nothing would say so.
+  # Measured on ada, same files through both settings:
+  #   MRC on  -- a 600 dpi picture comes back at 300 dpi (763 KB)
+  #   MRC off -- it keeps its 600 dpi (895 KB), but a 200 dpi text scan is
+  #              upsampled to 400 dpi and grows 2.4-3x for nothing
+  # so: MRC off only where there is resolution to save. Recognised text was
+  # identical either way. Quality stays at 2 for both (1 is more compressed,
+  # 3 crashes FineReader).
+  OCR_CLASSES="std-res high-res"
+  OCR_CLASS_DEFAULT="std-res"
+  S_PATH_BASE="/Users/${WHOAMI}/Public/,ocr.in"   # + "." + class
+  S_PATH="$S_PATH_BASE.$OCR_CLASS_DEFAULT"        # recomputed once the class is known
   # for do_health_check()
   S_EXPECTED_FILE_TYPE___REGEX="JPEG \|PDF \|PNG \|TIFF " # <<< matches the BEGINNING of 'file --brief ...'
   S_HEALTH_CHECK___MAX_REPEAT="1"
@@ -158,7 +173,8 @@ FILELIST_CNT=0; # number of files in the FILELIST
 
 # for setup / the Automator workflow it generates:
   WORKFLOW_DIR="/Users/${WHOAMI}/Library/Workflows/Applications/Folder Actions"
-  WORKFLOW_NAME="my-ocr.workflow"
+  WORKFLOW_NAME_BASE="my-ocr"                     # + "." + class + ".workflow"
+  WORKFLOW_NAME="$WORKFLOW_NAME_BASE.$OCR_CLASS_DEFAULT.workflow"
   # The workflow's shell steps MUST invoke this exact path: cleanup() finds its
   # own children by matching "/LINKS/bin/my-ocr --part-N" in ps output, so a
   # different path here would leave those children unkilled. setup checks it.
@@ -2417,6 +2433,20 @@ nudge_handover() { # $1 = staging dir inside the watched folder, $2 = a path out
   return 0
 }
 
+# One class, one watched folder, one workflow, one export setting. Every
+# derivation lives here, so adding a class is adding a line -- not hunting for
+# the places that assumed there was only one.
+class_is_known() { # $1 = class
+  for _ck in $OCR_CLASSES; do [ "$_ck" = "$1" ] && return 0; done
+  return 1
+}
+class_inpath()   { printf '%s.%s\n' "$S_PATH_BASE" "$1"; }
+class_workflow() { printf '%s.%s.workflow\n' "$WORKFLOW_NAME_BASE" "$1"; }
+# MRC compresses by splitting the page and downsampling what it splits off.
+# That is right for text and wrong for a picture, which is the whole point of
+# the class.
+class_mrc()      { case "$1" in high-res) printf 'False\n';; *) printf 'True\n';; esac; }
+
 # Pages in a file. A picture is one page; "" means we could not tell.
 pages_of() { # $1 = file
   case "$(file --brief "$1" 2>/dev/null | cut -f1 -d' ')" in
@@ -2875,6 +2905,8 @@ _EOIP_
   OCR_SAVE="$T_PATH" \
   OCR_LANGS="$OCR_LANGUAGES" \
   OCR_INPATH="$S_PATH" \
+  OCR_MRC="$(class_mrc "$OCR_CLASS")" \
+  OCR_CLASS_ARG="$OCR_CLASS" \
   /usr/bin/python3 - "$_sw_doc" 2>"$_sw_err" <<'_EOPY_'
 import os, plistlib, sys, uuid
 
@@ -2885,6 +2917,10 @@ APP    = os.environ["OCR_APPNAME"]
 SAVE   = os.environ["OCR_SAVE"]
 LANGS  = os.environ["OCR_LANGS"]
 INPATH = os.environ["OCR_INPATH"]
+# MRC on downsamples what it splits off: right for a document, wrong for a
+# picture. That one setting is the whole difference between the classes.
+MRC    = os.environ.get("OCR_MRC", "True") == "True"
+CLASS  = os.environ.get("OCR_CLASS_ARG", "std-res")
 
 def shell(cmd, uid):
     return {"action": {
@@ -2962,7 +2998,7 @@ def ocr(uid):
             "exportPdfMakePdfACompliant": False,
             "exportPdfPaperMargins": "1.180555, 0.7881944, 0,59027777, 0.7881944",
             "exportPdfPaperSize": "0,0",
-            "exportPdfUseMRC": True,
+            "exportPdfUseMRC": MRC,
             "exportSaveOption": 3,
             "preferencesRecognitionLanguages": LANGS},
         "BundleIdentifier": "com.abbyy.ExportToPdf",
@@ -2983,9 +3019,9 @@ def ocr(uid):
 
 u1, u2, u3 = (str(uuid.uuid4()) for _ in range(3))
 acts = [
-    shell('while read a; do echo "$a"; done|%s --part-1' % BIN, u1),
+    shell('while read a; do echo "$a"; done|%s --part-1 --class %s' % (BIN, CLASS), u1),
     ocr(u2),
-    shell('while read a; do echo "$a"; done|%s --part-2' % BIN, u3),
+    shell('while read a; do echo "$a"; done|%s --part-2 --class %s' % (BIN, CLASS), u3),
 ]
 
 # A multi-step workflow does NOT chain by array order: Automator follows the
@@ -3164,6 +3200,12 @@ Try:   su - ${_uu_gui:-<the console user>} -c '$US uninstall${1:+ $1}'"
   fi
   echo "    > ,ocr.in, ,ocr.out, queues and documents are never touched"
 
+  # every class has its own folder action and its own workflow
+  for _uu_c in $OCR_CLASSES; do
+    OCR_CLASS="$_uu_c"
+    S_PATH="$(class_inpath "$_uu_c")"
+    WORKFLOW_NAME="$(class_workflow "$_uu_c")"
+    echo "  >> [$_uu_c]"
   echo "  >> Folder Action on '$S_PATH'"
   if [ -z "$_uu_go" ]; then
     echo "    > WOULD DETACH '$WORKFLOW_NAME' from '$S_PATH'"
@@ -3206,6 +3248,7 @@ _EOUN_
   else
     echo "    > no trash command -- remove '$_uu_wf' by hand (not deleting it here)"
   fi
+  done
 
   echo
   if [ -z "$_uu_go" ]; then
@@ -3296,19 +3339,40 @@ Try:   su - ${_su_gui:-<the console user>} -c '$US setup${1:+ $1}'"
     fi
   done
 
-  echo "  >> Automator workflow '$WORKFLOW_DIR/$WORKFLOW_NAME'"
-  if [ "$_su_fail" = "0" ]; then
-    setup_write_workflow || _su_fail=1
-  else
-    echo "    > SKIPPED -- fix the MISSING items above first"
-  fi
+  # One watched folder, one workflow, one export setting PER CLASS. Which
+  # folder a document is handed to is what chooses its settings, so the two
+  # workflows are identical but for the MRC flag and the --class their shell
+  # steps carry.
+  for _su_c in $OCR_CLASSES; do
+    OCR_CLASS="$_su_c"
+    S_PATH="$(class_inpath "$_su_c")"
+    WORKFLOW_NAME="$(class_workflow "$_su_c")"
 
-  echo "  >> Folder Action on '$S_PATH'"
-  if [ "$_su_fail" = "0" ]; then
-    setup_attach_workflow || _su_fail=1
-  else
-    echo "    > SKIPPED -- fix the MISSING items above first"
-  fi
+    echo "  >> [$_su_c] watched folder '$S_PATH'"
+    if [ -d "$S_PATH" ]; then
+      echo "    > exists"
+    elif [ -n "$_su_go" ] && mkdir -p "$S_PATH" 2>/dev/null; then
+      echo "    > created"
+    elif [ -z "$_su_go" ]; then
+      echo "    > WOULD CREATE it"
+    else
+      echo "    > CANNOT CREATE $S_PATH"; _su_fail=1
+    fi
+
+    echo "  >> [$_su_c] Automator workflow '$WORKFLOW_DIR/$WORKFLOW_NAME' (MRC $(class_mrc "$_su_c"))"
+    if [ "$_su_fail" = "0" ]; then
+      setup_write_workflow || _su_fail=1
+    else
+      echo "    > SKIPPED -- fix the MISSING items above first"
+    fi
+
+    echo "  >> [$_su_c] Folder Action on '$S_PATH'"
+    if [ "$_su_fail" = "0" ]; then
+      setup_attach_workflow || _su_fail=1
+    else
+      echo "    > SKIPPED -- fix the MISSING items above first"
+    fi
+  done
 
   echo
   [ "$_su_fail" = "0" ] && echo " >>> preflight OK [0]" \
@@ -3423,6 +3487,58 @@ t_staging_sweep() {
       fi ;;
     *) t_bad "sweep: one holding DOCUMENTS is left alone and points at reset" "$_o";;
   esac
+}
+
+# --- the two class workflows must differ in the export setting and NOTHING else
+t_class_workflows() {
+  if [ ! -d "$OCRAPP_PATH" ] || [ ! -x /usr/bin/plutil ]; then
+    t_ok "class workflows: skipped, no OCR app on this host"; return 0
+  fi
+  _cw="$T_TMP/classwf"; mkdir -p "$_cw"
+  for _cwc in $OCR_CLASSES; do
+    ( WORKFLOW_DIR="$_cw"; OCR_CLASS="$_cwc"; _su_go=1   # write it, not dry-run
+      S_PATH="$(class_inpath "$_cwc")"; WORKFLOW_NAME="$(class_workflow "$_cwc")"
+      setup_write_workflow >/dev/null 2>&1 )
+    _cwd="$_cw/$(class_workflow "$_cwc")/Contents/document.wflow"
+    [ -f "$_cwd" ] || { t_ok "class workflows: skipped, none was written here"; return 0; }
+    /usr/bin/plutil -p "$_cwd" >"$_cw/$_cwc.txt" 2>/dev/null
+  done
+  _mrc_s="$(grep -c "\"exportPdfUseMRC\" => true"  "$_cw/std-res.txt")"
+  _mrc_h="$(grep -c "\"exportPdfUseMRC\" => false" "$_cw/high-res.txt")"
+  if [ "$_mrc_s" -ge 1 ] && [ "$_mrc_h" -ge 1 ]; then
+    t_ok "class workflows: std-res exports with MRC on, high-res with it off"
+  else
+    t_bad "class workflows: std-res exports with MRC on, high-res with it off" \
+          "std=$_mrc_s high=$_mrc_h lines: $(grep -h exportPdfUseMRC "$_cw/std-res.txt" "$_cw/high-res.txt" | tr -s ' ' | tr '\n' '|')"
+  fi
+  _q_s="$(grep -c "\"exportPdfImageQuality\" => 2" "$_cw/std-res.txt")"
+  _q_h="$(grep -c "\"exportPdfImageQuality\" => 2" "$_cw/high-res.txt")"
+  if [ "$_q_s" -ge 1 ] && [ "$_q_h" -ge 1 ]; then
+    t_ok "class workflows: both keep image quality 2 (1 compresses harder, 3 crashes it)"
+  else
+    t_bad "class workflows: both keep image quality 2 (1 compresses harder, 3 crashes it)" "std=$_q_s high=$_q_h"
+  fi
+  _f_s="$(grep -c -- "--class std-res" "$_cw/std-res.txt")"
+  _f_h="$(grep -c -- "--class high-res" "$_cw/high-res.txt")"
+  if [ "$_f_s" -ge 2 ] && [ "$_f_h" -ge 2 ]; then
+    t_ok "class workflows: both shell steps of each workflow name their own class"
+  else
+    t_bad "class workflows: both shell steps of each workflow name their own class" "std=$_f_s high=$_f_h"
+  fi
+  # everything else must be identical: strip what may legitimately differ
+  for _cwc in $OCR_CLASSES; do
+    # every run gets fresh uuids for the steps and their connections: those
+    # are identity, not settings, so they are not a difference in the workflow
+    sed -E -e "/exportPdfUseMRC/d" -e "/COMMAND_STRING/d" -e "/AFRKeySavePath/d" \
+           -e "/[0-9a-f]{8}-[0-9a-f]{4}-/d" -e "/folderActionFolderPath/d" \
+           "$_cw/$_cwc.txt" >"$_cw/$_cwc.stripped"
+  done
+  if diff -q "$_cw/std-res.stripped" "$_cw/high-res.stripped" >/dev/null 2>&1; then
+    t_ok "class workflows: identical in every other setting"
+  else
+    t_bad "class workflows: identical in every other setting" \
+          "$(diff "$_cw/std-res.stripped" "$_cw/high-res.stripped" | head -n 6 | tr '\n' ' ')"
+  fi
 }
 
 t_open_cmd() {
@@ -4184,6 +4300,7 @@ do_run_tests() {
   t_stall_recovery
   t_reset_log_last
   t_open_cmd
+  t_class_workflows
   t_nudge
   t_staging_sweep
   t_stranded_verdict
@@ -4201,6 +4318,8 @@ WHAT=;
 CLI_LOG=""
 for arg in "$@"; do
   #echo "$$|DBG: PRELIMINARY-PARM-LOOP: arg='$arg'"
+  # this loop does not shift, so a value-taking option marks the NEXT word
+  if [ -n "$OCR_CLASS_NEXT" ]; then OCR_CLASS="$arg"; OCR_CLASS_NEXT=""; continue; fi
   case "$arg" in
     -D|--debug)  VRB=1; DBG=1;;
     -V|--verbose)  VRB=1;;
@@ -4219,10 +4338,22 @@ for arg in "$@"; do
     stamp-version) DO_STAMP=1;;
     --no-log) CLI_LOG=0;;
     --log) CLI_LOG=1;;
+    --class) OCR_CLASS_NEXT=1;;
+    --class=*) OCR_CLASS="${arg#--class=}";;
     --part-1) [ -n "$WHAT" ] && err 009 "Only one parameter possible. Got: '$WHAT' and '$arg'."; WHAT="part-1";;
     --part-2) [ -n "$WHAT" ] && err 084 "Only one parameter possible. Got: '$WHAT' and '$arg'."; WHAT="part-2";;
   esac
 done
+
+# ONE place decides which class this invocation is for, and everything that
+# depends on it is derived here -- the watched folder and the workflow. A
+# wrong name is refused: silently OCRing into the other class's folder would
+# apply the other class's export settings, which is the one thing the classes
+# exist to prevent.
+[ -n "$OCR_CLASS" ] || OCR_CLASS="$OCR_CLASS_DEFAULT"
+class_is_known "$OCR_CLASS" || err 160 "--class '$OCR_CLASS' is not one of: $OCR_CLASSES"
+S_PATH="$(class_inpath "$OCR_CLASS")"
+WORKFLOW_NAME="$(class_workflow "$OCR_CLASS")"
 
 [ -n "$RUN_TESTS" ] && { do_run_tests; exit $?; }
 # --test-mail sends one alert and touches no state, takes no lock, OCRs nothing
@@ -4268,6 +4399,8 @@ while [ $# -gt 0 ]; do
         -F|--force) continue;; # ignore here
         --move-failed-to) [ -z "$1" ] && err 133 "Argument '$arg' needs a <DIR>"
                           MOVE_FAILED_TO="$1"; shift;;
+        --class) shift; continue;;       # handled in the first loop
+        --class=*) continue;;
         -h|--help) continue;; # ignore here
         --log|--no-log) continue;; # ignore here
         --part-1) continue;; # ignore here
