@@ -14,11 +14,11 @@ NL="
 # and is authoritative at runtime -- the deployed copy needs no git and no
 # repository. The build id is a hash of this file, so it is right even unstamped.
 SCRIPT_VERSION="v1.0"
-SCRIPT_COMMIT="3c36829"           # rewritten by 'my-ocr stamp-version'
+SCRIPT_COMMIT="8f8713e"           # rewritten by 'my-ocr stamp-version'
 # What git said when this build was stamped: 'git describe --tags --long' --
 # <nearest tag>-<commits since it>-g<short sha>. It says whether these bytes
 # ARE that release or work on top of it, on a machine with no git.
-SCRIPT_RELEASE="v1.0-27-g3c36829"
+SCRIPT_RELEASE="v1.0-28-g8f8713e"
 
 WHOAMI="$(/usr/bin/whoami)"
 [ "$USER" = "$WHOAMI" ] || err 126 "USER '$USER' ? != ? '$WHOAMI' WHOAMI"
@@ -230,7 +230,14 @@ FILELIST_CNT=0; # number of files in the FILELIST
   # app consumes none. This is how long it must consume NOTHING, while the
   # queue is also stalled, before my-ocr stops believing it is working.
   # 0 disables the recovery and my-ocr waits for a person, as it always did.
-  OCRAPP_IDLE_GIVEUP=120;     # (seconds) of ZERO cpu while stalled -> recover
+  OCRAPP_IDLE_GIVEUP=120;     # (seconds) BARELY using cpu while stalled -> recover
+  # "Barely" is a RATE, not zero. Measured on ada while FineReader sat on a
+  # crash dialog: it still burned 0.3 s of cpu per minute -- window server
+  # chatter, timers -- so a test for cpu time UNCHANGED never fired and the
+  # run stalled anyway. Real OCR work was 63.9% cpu, about 36 s per minute.
+  # 3 s/minute sits ten times above the stuck case and twelve times below
+  # real work, so neither is a near miss.
+  OCRAPP_IDLE_MAX_CPU_PER_MIN=3;   # (seconds of cpu per minute) below = stuck
   # The hand-over only starts the OCR if the folder action FIRES. On 2026-09-22
   # one filesystem event went missing: the dispatcher was alive and logged
   # nothing, and the run sat for 300s for a workflow that was never started --
@@ -1834,13 +1841,21 @@ Check that Folder Actions are enabled and that '$S_PATH' still has ours attached
     # A grinding app keeps its 'no time limit' promise, untouched.
     if [ "${OCRAPP_IDLE_GIVEUP:-0}" -gt 0 ]; then
       _cpu_now="$(ocrapp_cpu_secs)"
-      if [ "$_cpu_now" = "$_cpu_was" ]; then
-        _cpu_still=$(( _cpu_still + 1 ))
+      # a RATE: how much cpu it used since the last look, in hundredths, against
+      # what OCRAPP_IDLE_MAX_CPU_PER_MIN allows for one second
+      _cpu_bud="$OCRAPP_IDLE_MAX_CPU_PER_MIN"; isInt "$_cpu_bud" || _cpu_bud=3
+      _cpu_bud=$(( _cpu_bud * 100 / 60 ))          # hundredths per second
+      [ "$_cpu_bud" -lt 1 ] && _cpu_bud=1
+      if [ -z "$_cpu_was" ]; then
+        _cpu_was="$_cpu_now"
+      elif [ $(( _cpu_now - _cpu_was )) -le "$_cpu_bud" ]; then
+        _cpu_still=$(( _cpu_still + 1 ))           # not working, whatever it ticks
+        _cpu_was="$_cpu_now"
       else
-        _cpu_still=0; _cpu_was="$_cpu_now"
+        _cpu_still=0; _cpu_was="$_cpu_now"         # it IS working -- keep waiting
       fi
       if [ "$_cpu_still" -ge "$OCRAPP_IDLE_GIVEUP" ]; then
-        m="$OCRAPP_NAME [pid(s) $ocr_pids] has used NO cpu for ${_cpu_still}s while the queue stood still for ${stalled}s.
+        m="$OCRAPP_NAME [pid(s) $ocr_pids] has used almost no cpu (under ${OCRAPP_IDLE_MAX_CPU_PER_MIN}s per minute) for ${_cpu_still}s while the queue stood still for ${stalled}s.
 It is not working -- it is waiting for someone to answer a dialog. Recovering:
 closing it, and the documents go back for a retry."
         alert_stuck "$m"
@@ -3595,6 +3610,27 @@ t_stall_recovery() {
     t_ok "the wait loop consults cpu time, and OCRAPP_IDLE_GIVEUP=0 disables it"
   else
     t_bad "the wait loop consults cpu time, and OCRAPP_IDLE_GIVEUP=0 disables it" "not wired in"
+  fi
+
+  # "stuck" is a RATE, not zero. Measured on ada: an app sitting on a crash
+  # dialog still burned 0.3 s of cpu per minute, so a test for cpu time
+  # UNCHANGED never fired and the pipeline stalled anyway. Real work was 36 s
+  # per minute. These numbers are that measurement, kept as a test.
+  _bud="$(( 3 * 100 / 60 ))"                       # the default budget, hundredths/s
+  _tick="$(( 30 / 5 ))"                            # 0.3 s/min over a 5 s look = 30 hundredths... /5s
+  if [ "$_bud" -ge 1 ]; then t_ok "stall: the budget is at least one hundredth per second ($_bud)"
+  else t_bad "stall: the budget is at least one hundredth per second" "got $_bud"; fi
+  # a dialog-bound app (0.3 s/min = 0.5 hundredths per second) must count as stuck
+  if [ 1 -le "$_bud" ]; then t_ok "stall: 0.3 s/min (a dialog-bound app) is inside the budget -- counted as stuck"
+  else t_bad "stall: 0.3 s/min (a dialog-bound app) is inside the budget -- counted as stuck" "budget=$_bud"; fi
+  # real work (36 s/min = 60 hundredths per second) must NOT
+  if [ 60 -gt "$_bud" ]; then t_ok "stall: 36 s/min (real OCR work) is far outside it -- never called stuck"
+  else t_bad "stall: 36 s/min (real OCR work) is far outside it -- never called stuck" "budget=$_bud"; fi
+  # shellcheck disable=SC2016  # matching literal source text
+  if awk '/^wait_for_|_cpu_bud/{print}' "$0" | grep -q '_cpu_now - _cpu_was'; then
+    t_ok "stall: it compares the cpu USED since the last look, not equality"
+  else
+    t_bad "stall: it compares the cpu USED since the last look, not equality" "still an equality test"
   fi
 }
 
