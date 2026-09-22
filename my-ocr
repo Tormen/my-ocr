@@ -14,11 +14,11 @@ NL="
 # and is authoritative at runtime -- the deployed copy needs no git and no
 # repository. The build id is a hash of this file, so it is right even unstamped.
 SCRIPT_VERSION="v1.0"
-SCRIPT_COMMIT="109f576"           # rewritten by 'my-ocr stamp-version'
+SCRIPT_COMMIT="75166dd"           # rewritten by 'my-ocr stamp-version'
 # What git said when this build was stamped: 'git describe --tags --long' --
 # <nearest tag>-<commits since it>-g<short sha>. It says whether these bytes
 # ARE that release or work on top of it, on a machine with no git.
-SCRIPT_RELEASE="v1.0-19-g109f576"
+SCRIPT_RELEASE="v1.0-20-g75166dd"
 
 WHOAMI="$(/usr/bin/whoami)"
 [ "$USER" = "$WHOAMI" ] || err 126 "USER '$USER' ? != ? '$WHOAMI' WHOAMI"
@@ -492,10 +492,24 @@ cleanup() { local rc=$?;
       if [ "$failed_cnt" -gt 0 ]; then
         _rtmp="$(mktemp /tmp/my-ocr.refused.XXXXXX)"
         cut -f1 "$REFUSED_FILES_LOG" >"$_rtmp" 2>/dev/null
-        printf "${PFX}\n${PFX}--> %4d/$TOTAL_FILES2OCR_CNT files *FAILED* to be OCRed:\n%s\n" "$failed_cnt" "$(cut -f1 "$QUEUED_FILE_MOVES_LOG" | grep -vFxf "$_rtmp" | sed -e 's/.*/                  "&"/')"
+        _flist="$(cut -f1 "$QUEUED_FILE_MOVES_LOG" | grep -vFxf "$_rtmp" | sed -e 's/.*/                  "&"/')"
+        if [ "$left_cnt" -gt "$TOTAL_FILES2OCR_CNT" ]; then
+          # more queued than this run handed over: "2/0 *FAILED*" would blame
+          # this run for documents it never saw.
+          printf "${PFX}\n${PFX}--> %4d file(s) still queued, from a run that is gone (not this run's):\n%s\n" "$failed_cnt" "$_flist"
+        else
+          printf "${PFX}\n${PFX}--> %4d/$TOTAL_FILES2OCR_CNT files *FAILED* to be OCRed:\n%s\n" "$failed_cnt" "$_flist"
+        fi
         rm -f "$_rtmp"
       fi
-      printf "${PFX}\n${PFX}--> %4d/$TOTAL_FILES2OCR_CNT files were SUCCESSFULLY OCRed.\n" "$(( $TOTAL_FILES2OCR_CNT - $left_cnt ))"
+      _okc="$(ocr_ok_cnt "$TOTAL_FILES2OCR_CNT" "$left_cnt")"
+      case "$_okc" in
+        MISMATCH*)
+          printf "${PFX}\n${PFX}--> COUNT MISMATCH: %d file(s) went to the OCR this run, but %d are still queued (%d refused, %d failed).\n${PFX}    '%s' holds %s line(s) that cannot be from this run -- '%s reset go' clears them.\n" \
+            "$TOTAL_FILES2OCR_CNT" "$left_cnt" "$refused_cnt" "$failed_cnt" "$QUEUED_FILE_MOVES_LOG" "${_okc#MISMATCH }" "$US" ;;
+        *)
+          printf "${PFX}\n${PFX}--> %4d/$TOTAL_FILES2OCR_CNT files were SUCCESSFULLY OCRed.\n" "$_okc" ;;
+      esac
         # Every file that completed had its line deleted, so what is left here
         # IS the failure list -- and the originals are untouched, because only
         # a successful OCR trashes them. So they can be quarantined.
@@ -1381,6 +1395,17 @@ ocrapp_no_window_restore() {  # <defaults domain>
 # here: say so and leave it. The dialog then blocks the run and the operator is
 # told why, which is the better failure -- deleting someone's pages on a guess
 # is not recoverable, a blocked run is.
+# What THIS run got OCRed. The classes must add up to what this run handed to
+# the OCR -- and they can fail to: left_cnt is read from the queue log, which
+# still holds the lines of a run that DIED, so the subtraction goes negative and
+# the summary printed "-2/0 files were SUCCESSFULLY OCRed". That is not a count,
+# it is a contradiction, and the code had both halves in hand to notice it.
+# Prints the count, or "MISMATCH <n>" with how many queued lines cannot be ours.
+ocr_ok_cnt() { # $1 = handed to the OCR this run, $2 = still queued
+  if [ "$2" -gt "$1" ]; then printf 'MISMATCH %s\n' "$(( $2 - $1 ))"
+  else printf '%s\n' "$(( $1 - $2 ))"; fi
+}
+
 # CLOSE the OCR app, do not kill it. 'pkill' sends SIGTERM, and a Cocoa app
 # does not run its quit path on a signal: macOS records an ABNORMAL exit, so
 # the user gets "FineReader quit unexpectedly", the half-built document is left
@@ -3095,6 +3120,33 @@ Try:   su - ${_su_gui:-<the console user>} -c '$US setup${1:+ $1}'"
 # --- the OCR app is CLOSED, never killed: a signal skips a Cocoa app's quit
 # path, and the abnormal exit is what leaves the crash dialog AND the document
 # that blocks the next run.
+# --- a summary may not print a number that cannot be true.
+t_counts_reconcile() {
+  # the ordinary case: 5 handed over, 2 still queued -> 3 done
+  _c="$(ocr_ok_cnt 5 2)"
+  if [ "$_c" = "3" ]; then t_ok "counts: 5 handed to the OCR, 2 queued -> 3 OCRed"
+  else t_bad "counts: 5 handed to the OCR, 2 queued -> 3 OCRed" "got '$_c'"; fi
+  # nothing handed over, nothing queued
+  _c="$(ocr_ok_cnt 0 0)"
+  if [ "$_c" = "0" ]; then t_ok "counts: an empty run reports 0, not a blank"
+  else t_bad "counts: an empty run reports 0, not a blank" "got '$_c'"; fi
+  # the real defect: a queue log holding a DEAD run's lines
+  _c="$(ocr_ok_cnt 0 2)"
+  case "$_c" in
+    "MISMATCH 2") t_ok "counts: 2 queued but 0 handed over is a MISMATCH, never '-2 SUCCESSFULLY OCRed'";;
+    -*) t_bad "counts: 2 queued but 0 handed over is a MISMATCH, never '-2 SUCCESSFULLY OCRed'" \
+              "it still prints a NEGATIVE count: '$_c'";;
+    *) t_bad "counts: 2 queued but 0 handed over is a MISMATCH, never '-2 SUCCESSFULLY OCRed'" "got '$_c'";;
+  esac
+  # ...and no arithmetic may reach the summary without going through it
+  # shellcheck disable=SC2016  # matching literal source text
+  if grep -q 'TOTAL_FILES2OCR_CNT - \$left_cnt' "$0"; then
+    t_bad "counts: the summary subtracts through ocr_ok_cnt, not inline" "a raw subtraction is still printed"
+  else
+    t_ok "counts: the summary subtracts through ocr_ok_cnt, not inline"
+  fi
+}
+
 t_ocrapp_quit() {
   # it must be a no-op, and instant, when the app is not running at all
   _q_t0=$(date +%s)
@@ -3767,6 +3819,7 @@ do_run_tests() {
   t_window_restore
   t_stale_batch
   t_ocrapp_quit
+  t_counts_reconcile
   rm -rf "$T_TMP"
   echo "  ----"
   printf '  %d passed, %d failed\n' "$T_PASS" "$T_FAIL"
