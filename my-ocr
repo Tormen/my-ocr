@@ -14,11 +14,11 @@ NL="
 # and is authoritative at runtime -- the deployed copy needs no git and no
 # repository. The build id is a hash of this file, so it is right even unstamped.
 SCRIPT_VERSION="v1.0"
-SCRIPT_COMMIT="75166dd"           # rewritten by 'my-ocr stamp-version'
+SCRIPT_COMMIT="44fac34"           # rewritten by 'my-ocr stamp-version'
 # What git said when this build was stamped: 'git describe --tags --long' --
 # <nearest tag>-<commits since it>-g<short sha>. It says whether these bytes
 # ARE that release or work on top of it, on a machine with no git.
-SCRIPT_RELEASE="v1.0-20-g75166dd"
+SCRIPT_RELEASE="v1.0-21-g44fac34"
 
 WHOAMI="$(/usr/bin/whoami)"
 [ "$USER" = "$WHOAMI" ] || err 126 "USER '$USER' ? != ? '$WHOAMI' WHOAMI"
@@ -208,6 +208,13 @@ FILELIST_CNT=0; # number of files in the FILELIST
   # decide when to ALERT.
   STALL_ALERT_AFTER=300;      # (seconds) no progress -> first alert
   STALL_REALERT_EVERY=3600;   # (seconds) keep nagging at this interval
+  # A stalled OCR app is one of two things, and they need opposite answers:
+  # grinding a huge scan (wait, however long it takes) or sitting on a dialog
+  # nobody will ever click (recover it). CPU TIME tells them apart -- a blocked
+  # app consumes none. This is how long it must consume NOTHING, while the
+  # queue is also stalled, before my-ocr stops believing it is working.
+  # 0 disables the recovery and my-ocr waits for a person, as it always did.
+  OCRAPP_IDLE_GIVEUP=120;     # (seconds) of ZERO cpu while stalled -> recover
   STUCK_MARKER_DIR="/Users/$WHOAMI/Desktop"   # where the marker file lands
 
 ##############################################################
@@ -1406,6 +1413,26 @@ ocr_ok_cnt() { # $1 = handed to the OCR this run, $2 = still queued
   else printf '%s\n' "$(( $1 - $2 ))"; fi
 }
 
+# Total CPU time the OCR app has consumed, in whole seconds, across all its
+# pids. "ps -o time" is a CUMULATIVE counter, unlike "%cpu" which on BSD is a
+# decaying average and reads 0.0 for an app that was busy moments ago -- the
+# average would call a working app idle. A counter that does not advance is
+# evidence; an average is a guess.
+# Reads "ps -o time=" lines on stdin (MM:SS.ss or HH:MM:SS) and prints the
+# total in HUNDREDTHS of a second. Hundredths, not seconds: an app doing a
+# little work every minute would hold the same whole-second value for a while
+# and look frozen, and calling a working app frozen is the expensive mistake.
+cpu_from_ps() {
+  awk -F: '{ n=NF; s=0; m=1; for (i=n; i>0; i--) { s += $i * m; m *= 60 } t += s }
+           END { printf "%d\n", (t*100)+0.5 }'
+}
+
+ocrapp_cpu_secs() {
+  _cs_p="$(pgrep -x "$OCRAPP_NAME" 2>/dev/null | tr '\n' ',' | sed 's/,$//')"
+  [ -n "$_cs_p" ] || { printf '0\n'; return 0; }
+  ps -o time= -p "$_cs_p" 2>/dev/null | cpu_from_ps
+}
+
 # CLOSE the OCR app, do not kill it. 'pkill' sends SIGTERM, and a Cocoa app
 # does not run its quit path on a signal: macOS records an ABNORMAL exit, so
 # the user gets "FineReader quit unexpectedly", the half-built document is left
@@ -1723,6 +1750,7 @@ $(ls -la "$S_PATH"|sed -e "s/^/${PFX}     | /")"
   # So the wait ends on EVIDENCE, and only one piece of evidence is
   # conclusive -- that $OCRAPP_NAME is not running at all.
   local i=0; local stalled=0; local last_q=""; local next_alert=$STALL_ALERT_AFTER
+  local _cpu_was=""; local _cpu_still=0
   while [ -s "$QUEUED_FILE_MOVES_LOG" ]; do
 
     if [ -s "$PARTx_ERRORED_FLAGFILE" ]; then
@@ -1750,8 +1778,30 @@ $(ls -la "$S_PATH"|sed -e "s/^/${PFX}     | /")"
       err 128 "$m${NL}Still queued in '$QUEUED_FILE_MOVES_LOG':${NL}$(cat "$QUEUED_FILE_MOVES_LOG")"
     fi
 
-    # UNKNOWN: alive but not progressing -- it may be grinding a huge scan.
-    # Hold the lock and keep waiting; a person decides, not a timer.
+    # Alive but not progressing. It may be grinding a huge scan -- or sitting on
+    # a dialog (a crash recovery prompt, say) that nobody will ever answer, and
+    # then waiting is waiting for ever: that is what held this pipeline for ten
+    # hours. So look at the evidence that separates the two, its CPU TIME, and
+    # only act when it has consumed NOTHING for OCRAPP_IDLE_GIVEUP seconds.
+    # A grinding app keeps its 'no time limit' promise, untouched.
+    if [ "${OCRAPP_IDLE_GIVEUP:-0}" -gt 0 ]; then
+      _cpu_now="$(ocrapp_cpu_secs)"
+      if [ "$_cpu_now" = "$_cpu_was" ]; then
+        _cpu_still=$(( _cpu_still + 1 ))
+      else
+        _cpu_still=0; _cpu_was="$_cpu_now"
+      fi
+      if [ "$_cpu_still" -ge "$OCRAPP_IDLE_GIVEUP" ]; then
+        m="$OCRAPP_NAME [pid(s) $ocr_pids] has used NO cpu for ${_cpu_still}s while the queue stood still for ${stalled}s.
+It is not working -- it is waiting for someone to answer a dialog. Recovering:
+closing it, and the documents go back for a retry."
+        alert_stuck "$m"
+        ocrapp_quit
+        err 158 "$m${NL}Still queued in '$QUEUED_FILE_MOVES_LOG':${NL}$(cat "$QUEUED_FILE_MOVES_LOG")"
+      fi
+    fi
+
+    # Hold the lock and keep waiting while it is genuinely working.
     # next_alert, not "stalled % EVERY": with the modulo the first gap would be
     # EVERY-minus-ALERT_AFTER, so the interval would not mean what it says.
     if [ $stalled -ge $next_alert ]; then
@@ -3121,6 +3171,33 @@ Try:   su - ${_su_gui:-<the console user>} -c '$US setup${1:+ $1}'"
 # path, and the abnormal exit is what leaves the crash dialog AND the document
 # that blocks the next run.
 # --- a summary may not print a number that cannot be true.
+# --- a stalled OCR app: grinding, or waiting on a dialog? CPU time decides.
+t_stall_recovery() {
+  _c="$(printf '  0:02.02\n' | cpu_from_ps)"
+  if [ "$_c" = "202" ]; then t_ok "cpu: '0:02.02' is 202 hundredths"
+  else t_bad "cpu: '0:02.02' is 202 hundredths" "got '$_c'"; fi
+  _c="$(printf ' 1:23:45\n' | cpu_from_ps)"
+  if [ "$_c" = "502500" ]; then t_ok "cpu: '1:23:45' (h:m:s) is 502500 hundredths"
+  else t_bad "cpu: '1:23:45' (h:m:s) is 502500 hundredths" "got '$_c'"; fi
+  # several pids add up -- the app is more than one process
+  _c="$(printf '  0:01.00\n  0:02.50\n' | cpu_from_ps)"
+  if [ "$_c" = "350" ]; then t_ok "cpu: several pids are summed (350)"
+  else t_bad "cpu: several pids are summed (350)" "got '$_c'"; fi
+  # a WORKING app must never be called frozen: 0.01s of work is a change
+  if [ "$(printf '  0:02.02\n' | cpu_from_ps)" != "$(printf '  0:02.03\n' | cpu_from_ps)" ]; then
+    t_ok "cpu: one hundredth of work is visible, so a busy app is never called idle"
+  else
+    t_bad "cpu: one hundredth of work is visible, so a busy app is never called idle" \
+          "whole-second rounding would freeze a working app"
+  fi
+  # the loop must consult it, and must be switchable off
+  if awk '/OCRAPP_IDLE_GIVEUP/{n++} END{exit !(n>=2)}' "$0"; then
+    t_ok "the wait loop consults cpu time, and OCRAPP_IDLE_GIVEUP=0 disables it"
+  else
+    t_bad "the wait loop consults cpu time, and OCRAPP_IDLE_GIVEUP=0 disables it" "not wired in"
+  fi
+}
+
 t_counts_reconcile() {
   # the ordinary case: 5 handed over, 2 still queued -> 3 done
   _c="$(ocr_ok_cnt 5 2)"
@@ -3820,6 +3897,7 @@ do_run_tests() {
   t_stale_batch
   t_ocrapp_quit
   t_counts_reconcile
+  t_stall_recovery
   rm -rf "$T_TMP"
   echo "  ----"
   printf '  %d passed, %d failed\n' "$T_PASS" "$T_FAIL"
