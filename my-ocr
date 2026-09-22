@@ -14,11 +14,11 @@ NL="
 # and is authoritative at runtime -- the deployed copy needs no git and no
 # repository. The build id is a hash of this file, so it is right even unstamped.
 SCRIPT_VERSION="v1.0"
-SCRIPT_COMMIT="44fac34"           # rewritten by 'my-ocr stamp-version'
+SCRIPT_COMMIT="6b339bf"           # rewritten by 'my-ocr stamp-version'
 # What git said when this build was stamped: 'git describe --tags --long' --
 # <nearest tag>-<commits since it>-g<short sha>. It says whether these bytes
 # ARE that release or work on top of it, on a machine with no git.
-SCRIPT_RELEASE="v1.0-21-g44fac34"
+SCRIPT_RELEASE="v1.0-22-g6b339bf"
 
 WHOAMI="$(/usr/bin/whoami)"
 [ "$USER" = "$WHOAMI" ] || err 126 "USER '$USER' ? != ? '$WHOAMI' WHOAMI"
@@ -2562,12 +2562,6 @@ do_reset() {
   else
     echo "    > lockfile clean"
   fi
-  if [ -s "$QUEUED_FILE_MOVES_LOG" ]; then
-    if [ -z "$_rs_go" ]; then echo "    > WOULD REMOVE the queued-moves log ($(awk 'END{print NR+0}' "$QUEUED_FILE_MOVES_LOG") entr(ies))"
-    else rm -f "$QUEUED_FILE_MOVES_LOG" && { echo "    > removed the queued-moves log"; _rs_n=$(( _rs_n + 1 )); }; fi
-  else
-    echo "    > no queued moves outstanding"
-  fi
 
   # Documents stranded mid-flight: put them somewhere they can be RETRIED.
   echo "  >> stranded documents -> retry"
@@ -2600,6 +2594,16 @@ do_reset() {
     echo "    > none in flight"
   elif [ -n "$_rs_go" ]; then
     echo "    > retry them with:  $US $_rs_dest/*"
+  fi
+
+  # The queued-moves log goes LAST: it is the only record of which document a
+  # stranded file came from, so it must still exist while those files are
+  # being dealt with -- removing it first destroyed the evidence.
+  if [ -s "$QUEUED_FILE_MOVES_LOG" ]; then
+    if [ -z "$_rs_go" ]; then echo "    > WOULD REMOVE the queued-moves log ($(awk 'END{print NR+0}' "$QUEUED_FILE_MOVES_LOG") entr(ies))"
+    else rm -f "$QUEUED_FILE_MOVES_LOG" && { echo "    > removed the queued-moves log"; _rs_n=$(( _rs_n + 1 )); }; fi
+  else
+    echo "    > no queued moves outstanding"
   fi
 
   echo
@@ -3172,6 +3176,19 @@ Try:   su - ${_su_gui:-<the console user>} -c '$US setup${1:+ $1}'"
 # that blocks the next run.
 # --- a summary may not print a number that cannot be true.
 # --- a stalled OCR app: grinding, or waiting on a dialog? CPU time decides.
+# --- reset keeps its only evidence until it has dealt with the documents
+t_reset_log_last() {
+  _rl="$(awk '/^do_reset\(\)/,/^\}/' "$0")"
+  _rl_docs="$(printf '%s\n' "$_rl" | grep -n 'retry them with' | head -n 1 | cut -d: -f1)"
+  _rl_log="$(printf '%s\n' "$_rl" | grep -n 'removed the queued-moves log' | head -n 1 | cut -d: -f1)"
+  if [ -n "$_rl_docs" ] && [ -n "$_rl_log" ] && [ "$_rl_log" -gt "$_rl_docs" ]; then
+    t_ok "reset removes the queued-moves log only AFTER the stranded documents are handled"
+  else
+    t_bad "reset removes the queued-moves log only AFTER the stranded documents are handled" \
+          "log removed at line ${_rl_log:-?}, documents handled at ${_rl_docs:-?}"
+  fi
+}
+
 t_stall_recovery() {
   _c="$(printf '  0:02.02\n' | cpu_from_ps)"
   if [ "$_c" = "202" ]; then t_ok "cpu: '0:02.02' is 202 hundredths"
@@ -3898,6 +3915,7 @@ do_run_tests() {
   t_ocrapp_quit
   t_counts_reconcile
   t_stall_recovery
+  t_reset_log_last
   rm -rf "$T_TMP"
   echo "  ----"
   printf '  %d passed, %d failed\n' "$T_PASS" "$T_FAIL"
