@@ -14,11 +14,11 @@ NL="
 # and is authoritative at runtime -- the deployed copy needs no git and no
 # repository. The build id is a hash of this file, so it is right even unstamped.
 SCRIPT_VERSION="v1.0"
-SCRIPT_COMMIT="951ca50"           # rewritten by 'my-ocr stamp-version'
+SCRIPT_COMMIT="c68b9d2"           # rewritten by 'my-ocr stamp-version'
 # What git said when this build was stamped: 'git describe --tags --long' --
 # <nearest tag>-<commits since it>-g<short sha>. It says whether these bytes
 # ARE that release or work on top of it, on a machine with no git.
-SCRIPT_RELEASE="v1.0-35-g951ca50"
+SCRIPT_RELEASE="v1.0-36-gc68b9d2"
 
 WHOAMI="$(/usr/bin/whoami)"
 [ "$USER" = "$WHOAMI" ] || err 126 "USER '$USER' ? != ? '$WHOAMI' WHOAMI"
@@ -3556,6 +3556,28 @@ t_open_cmd() {
   else t_bad "the 'open' line is valid shell as printed" "$_cmd"; fi
 }
 
+t_trap_term() {
+  # LIVE, with the script's OWN trap line: a TERMed run must reach cleanup().
+  # TERM is what kill, pkill and launchd send; without it in the list every
+  # TERMed run left its mutex, run files and a 'tail -f' behind.
+  _tt_line="$(grep -E '^for i in [0-9 ]+; do trap "cleanup' "$0" | head -n 1)"
+  if [ -z "$_tt_line" ]; then
+    t_bad "trap: a TERMed run reaches cleanup()" "the trap line was not found in the script"; return 0
+  fi
+  _tt_f="$T_TMP/trap-term.sh"
+  # shellcheck disable=SC2016  # '$2' and '$$' belong to the CHILD script, written literally
+  {
+    printf '%s\n' 'cleanup() { echo "CLEANED $2"; trap - 0; exit 0; }'
+    printf '%s\n' "$_tt_line"
+    printf '%s\n' 'kill -TERM $$' 'sleep 2' 'echo NOT-CLEANED'
+  } >"$_tt_f"
+  _tt_o="$(/bin/dash "$_tt_f" 2>&1)"
+  case "$_tt_o" in
+    *"CLEANED 15"*) t_ok "trap: a TERMed run reaches cleanup() (the script's own trap line catches 15)";;
+    *) t_bad "trap: a TERMed run reaches cleanup() (the script's own trap line catches 15)" "got: $_tt_o";;
+  esac
+}
+
 t_reset_sandbox() { # $1 = sandbox root
   US="my-ocr-sandbox"; WHOAMI="nobody-sandbox-xyzzy"; OCRAPP_NAME="no-such-process-xyzzy"
   OCRAPP_MUTEX_DIR="$1/lib/mutex"; OCRAPP_LOCKFILE="$1/lib/lock"
@@ -4518,6 +4540,7 @@ do_run_tests() {
   t_bundle_pids
   t_reset_log_last
   t_reset_stable
+  t_trap_term
   t_open_cmd
   t_nudge
   t_staging_sweep
@@ -4654,7 +4677,12 @@ COLLECT_INP_PATH="${TMP_PRE_INP_PATH_REALPATH##*/}"
 [ -z "$COLLECT_INP_PATH" ] && err 110 "TMP_PRE_INP_PATH='$TMP_PRE_INP_PATH' --> realpath=='$TMP_PRE_INP_PATH_REALPATH', last_part_of_realpath='$lCOLLECT_INP_PATH'. Should not be."
 
 # set up the trap for a clean exit:
-for i in 0 1 2 3 4 5 6 7 8 9; do trap "cleanup \"TRAP\" $i;" $i; done;
+# 15 (TERM) is the one that matters most and was missing: it is what kill,
+# pkill and launchd send, and every TERMed run died WITHOUT cleanup -- leaving
+# its mutex, its run files and an orphaned 'tail -f' behind (seven of them on
+# ada, the oldest over a day old). 9 (KILL) is not listed: it cannot be trapped,
+# and listing it claimed a cleanup that could never happen.
+for i in 0 1 2 3 4 5 6 7 8 15; do trap "cleanup \"TRAP\" $i;" $i; done;
 
 if [ -n "$LOG" ]; then
   touch "$LOG" || err 043 "Failed '$LOG' (LOG: touch, chmod :my-system, chown g-w,o-rwx)"
