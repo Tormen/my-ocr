@@ -14,11 +14,11 @@ NL="
 # and is authoritative at runtime -- the deployed copy needs no git and no
 # repository. The build id is a hash of this file, so it is right even unstamped.
 SCRIPT_VERSION="v1.0"
-SCRIPT_COMMIT="dd577de"           # rewritten by 'my-ocr stamp-version'
+SCRIPT_COMMIT="0b5d539"           # rewritten by 'my-ocr stamp-version'
 # What git said when this build was stamped: 'git describe --tags --long' --
 # <nearest tag>-<commits since it>-g<short sha>. It says whether these bytes
 # ARE that release or work on top of it, on a machine with no git.
-SCRIPT_RELEASE="v1.0-33-gdd577de"
+SCRIPT_RELEASE="v1.0-34-g0b5d539"
 
 WHOAMI="$(/usr/bin/whoami)"
 [ "$USER" = "$WHOAMI" ] || err 126 "USER '$USER' ? != ? '$WHOAMI' WHOAMI"
@@ -2812,19 +2812,39 @@ do_reset() {
   done
   if [ "$_rs_d" -eq 0 ]; then
     echo "    > none in flight"
-    for _rs_sd in "$S_PATH/$COLLECT_INP_PATH" "$TMP_PRE_INP_PATH"; do
-      [ -d "$_rs_sd" ] || continue
-      if [ -z "$_rs_go" ]; then
-        rmdir "$_rs_sd" 2>/dev/null && { mkdir -p "$_rs_sd"; echo "    > WOULD REMOVE the now-empty staging dir '$_rs_sd'"; }
-      elif rmdir "$_rs_sd" 2>/dev/null; then
-        echo "    > removed the now-empty staging dir '$_rs_sd'"; _rs_n=$(( _rs_n + 1 ))
-      fi
-    done
   else
     print_open_cmd "$_rs_look"
-    [ -n "$_rs_go" ] && echo "    > retry them with:  $US $_rs_dest/*"
+    # only a document that was actually SENT to retry wants the retry command;
+    # when every one was a duplicate and trashed, the line pointed at nothing
+    [ -n "$_rs_go" ] && [ -s "$_rs_look" ] && echo "    > retry them with:  $US $_rs_dest/*"
   fi
   rm -f "$_rs_look"
+
+  # The staging directories are machinery too, and go once nothing is left in
+  # them. This runs AFTER the documents above were handled, not only when none
+  # were found: otherwise the very run that empties a staging dir is the one
+  # that leaves it behind, and the reset after it is never empty.
+  # "Empty" is judged by LOOKING, never by trying: a dry run used to rmdir and
+  # re-create the directory to find out, which changed its owner, mode and
+  # mtime, and would have deleted it had the mkdir failed. A Finder .DS_Store
+  # is not content.
+  for _rs_sd in "$S_PATH/$COLLECT_INP_PATH" "$TMP_PRE_INP_PATH"; do
+    [ -d "$_rs_sd" ] || continue
+    _rs_e=1                          # empty until something real is found
+    for _rs_x in "$_rs_sd"/* "$_rs_sd"/.[!.]* "$_rs_sd"/..?*; do
+      [ -e "$_rs_x" ] || continue    # an unmatched glob stays literal
+      [ "${_rs_x##*/}" = ".DS_Store" ] && continue
+      _rs_e=""; break
+    done
+    [ -n "$_rs_e" ] || continue
+    if [ -z "$_rs_go" ]; then
+      echo "    > WOULD REMOVE the now-empty staging dir '$_rs_sd'"
+    elif rm -f "$_rs_sd/.DS_Store" && rmdir "$_rs_sd" 2>/dev/null; then
+      echo "    > removed the now-empty staging dir '$_rs_sd'"; _rs_n=$(( _rs_n + 1 ))
+    else
+      echo "    > FAILED to remove the empty staging dir '$_rs_sd'"
+    fi
+  done
 
   # The queued-moves log goes LAST: it is the only record of which document a
   # stranded file came from, so it must still exist while those files are
@@ -3518,6 +3538,77 @@ t_open_cmd() {
   _cmd="$(print_open_cmd "$_oc/list" | sed 's/^    > look at them:  //')"
   if printf '%s\n' "$_cmd" | /bin/dash -n 2>/dev/null; then t_ok "the 'open' line is valid shell as printed"
   else t_bad "the 'open' line is valid shell as printed" "$_cmd"; fi
+}
+
+t_reset_sandbox() { # $1 = sandbox root
+  US="my-ocr-sandbox"; WHOAMI="nobody-sandbox-xyzzy"; OCRAPP_NAME="no-such-process-xyzzy"
+  OCRAPP_MUTEX_DIR="$1/lib/mutex"; OCRAPP_LOCKFILE="$1/lib/lock"
+  PARTx_ERRORED_FLAGFILE="$1/lib/f1"; DBG_FLAGFILE="$1/lib/f2"
+  FORCE_FLAGFILE="$1/lib/f3"; INTERACTIVE_FLAGFILE="$1/lib/f4"
+  QUEUED_FILE_MOVES_LOG="$1/lib/files-2-move"; c_trash="$1/bin/trash"
+  S_PATH="$1/pub"; COLLECT_INP_PATH="stage"; TMP_PRE_INP_PATH="$1/tmp-stage"
+  T_PATH="$1/out"; RESET_RETRY_TO="$1/retry"
+}
+
+t_reset_stable() {
+  # LIVE, in a sandbox: the situation reset met on ada after a killed run -- a
+  # staged copy byte-identical to its filed document, a Finder .DS_Store, and
+  # the queue log that maps the one to the other. Three runs, in order:
+  #   dry  -- must change NOTHING (it used to rmdir + mkdir to test emptiness)
+  #   go   -- trashes the copy AND removes the staging dir it emptied
+  #   dry  -- must find NOTHING left: a reset that is not stable is not done
+  _rz="$T_TMP/reset-stable"; mkdir -p "$_rz/bin" "$_rz/pub/stage" "$_rz/filed" "$_rz/lib"
+  printf '#!/bin/dash\nshift 2>/dev/null\nrm -rf "$@"\n' >"$_rz/bin/trash"; chmod +x "$_rz/bin/trash"
+  printf 'the document\n' >"$_rz/filed/doc.pdf"
+  cp "$_rz/filed/doc.pdf" "$_rz/pub/stage/doc.#1.pdf"
+  : >"$_rz/pub/stage/.DS_Store"
+  printf '%s\t%s\t%s\t%s\n' "$_rz/orig/doc.pdf" "$_rz/pub/stage/doc.#1.pdf" \
+         "$_rz/out/doc.#1.pdf" "$_rz/filed/doc.pdf" >"$_rz/lib/files-2-move"
+  # every path reset touches, pointed into the sandbox -- called INSIDE the
+  # subshell below, which is what keeps the overrides out of the rest of the suite
+  (
+    t_reset_sandbox "$_rz"
+    _i1="$(ls -di "$_rz/pub/stage" 2>/dev/null)"
+    do_reset >"$_rz/r1" 2>&1
+    _i2="$(ls -di "$_rz/pub/stage" 2>/dev/null)"
+    [ "$_i1" = "$_i2" ] && [ -f "$_rz/pub/stage/doc.#1.pdf" ] && echo DRY-UNTOUCHED
+    do_reset go >"$_rz/r2" 2>&1
+    [ -d "$_rz/pub/stage" ] || echo STAGE-GONE
+    [ -f "$_rz/filed/doc.pdf" ] && echo DOC-KEPT
+    do_reset >"$_rz/r3" 2>&1
+    # a TRULY empty staging dir is where the old dry run did rmdir + mkdir;
+    # with a document or a .DS_Store in it, that branch never ran at all
+    mkdir -p "$_rz/pub/stage"
+    _i3="$(ls -di "$_rz/pub/stage" 2>/dev/null)"
+    do_reset >"$_rz/r4" 2>&1
+    _i4="$(ls -di "$_rz/pub/stage" 2>/dev/null)"
+    [ "$_i3" = "$_i4" ] && grep -q "WOULD REMOVE the now-empty staging dir" "$_rz/r4" && echo EMPTY-DRY-UNTOUCHED
+  ) >"$_rz/out.txt" 2>&1
+  _rz_o="$(cat "$_rz/out.txt")"
+  case "$_rz_o" in
+    *DRY-UNTOUCHED*) t_ok "reset: a DRY run leaves the staging dir untouched (same inode, copy still there)";;
+    *) t_bad "reset: a DRY run leaves the staging dir untouched" "$(cat "$_rz/r1")";;
+  esac
+  case "$_rz_o" in
+    *STAGE-GONE*DOC-KEPT*) t_ok "reset go: the duplicate is trashed, the staging dir it emptied goes too, the document stays";;
+    *) t_bad "reset go: the duplicate is trashed, the staging dir it emptied goes too, the document stays" \
+             "$_rz_o // $(grep -E 'staging|TRASH' "$_rz/r2")";;
+  esac
+  if grep -q 'retry them with' "$_rz/r2"; then
+    t_bad "reset go: no 'retry them with' when nothing went to retry" "$(grep 'retry them with' "$_rz/r2")"
+  else
+    t_ok "reset go: no 'retry them with' when nothing went to retry"
+  fi
+  case "$_rz_o" in
+    *EMPTY-DRY-UNTOUCHED*) t_ok "reset: a DRY run reports an EMPTY staging dir without touching it (same inode)";;
+    *) t_bad "reset: a DRY run reports an EMPTY staging dir without touching it (same inode)" \
+             "inode changed or not reported: $(grep staging "$_rz/r4")";;
+  esac
+  if grep -qE 'WOULD|kept' "$_rz/r3"; then
+    t_bad "reset: a second reset right after 'go' finds NOTHING" "$(grep -E 'WOULD|kept' "$_rz/r3")"
+  else
+    t_ok "reset: a second reset right after 'go' finds NOTHING"
+  fi
 }
 
 t_reset_log_last() {
@@ -4392,6 +4483,7 @@ do_run_tests() {
   t_stall_recovery
   t_bundle_pids
   t_reset_log_last
+  t_reset_stable
   t_open_cmd
   t_nudge
   t_staging_sweep
