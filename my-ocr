@@ -14,11 +14,11 @@ NL="
 # and is authoritative at runtime -- the deployed copy needs no git and no
 # repository. The build id is a hash of this file, so it is right even unstamped.
 SCRIPT_VERSION="v1.0"
-SCRIPT_COMMIT="99a7020"           # rewritten by 'my-ocr stamp-version'
+SCRIPT_COMMIT="d50afbe"           # rewritten by 'my-ocr stamp-version'
 # What git said when this build was stamped: 'git describe --tags --long' --
 # <nearest tag>-<commits since it>-g<short sha>. It says whether these bytes
 # ARE that release or work on top of it, on a machine with no git.
-SCRIPT_RELEASE="v1.0-30-g99a7020"
+SCRIPT_RELEASE="v1.0-31-gd50afbe"
 
 WHOAMI="$(/usr/bin/whoami)"
 [ "$USER" = "$WHOAMI" ] || err 126 "USER '$USER' ? != ? '$WHOAMI' WHOAMI"
@@ -1536,29 +1536,43 @@ ocrapp_clear_stale_batch() { # $1 = staging prefix (nothing outside it is ours)
     # "nothing maps this to us" -- the cleaner would refuse for ever and look
     # like it was working. Every ABSOLUTE path counts, not just /Users/ ones:
     # the staging prefix decides what is ours, so nothing else may be assumed.
+    #
+    # The parse also yields FRAGMENTS -- '/', '/Users', '/5K', '/g\',
+    # '/me/Public/,ocr.i' -- because a path stored behind a length byte is seen
+    # from its inner slashes too. Requiring EVERY extracted string to be under
+    # staging therefore refuses for ever, and that is not hypothetical: a
+    # leftover blocked two consecutive runs while this cleaner reported nothing
+    # amiss. So ask the question of the strings that can answer it. A reference
+    # to a document of YOURS exists as a FILE; a fragment exists as nothing, and
+    # '/' and '/Users' are directories. Hence: at least one path under staging
+    # (it is ours), and no existing FILE outside it (nothing of yours is in it).
     _sb_paths="$(LC_ALL=C tr -c '[:print:]' '\n' <"$_sb_pac" | sed -n 's|^[^/]*\(/.*\)$|\1|p' | sort -u)"
     if [ -z "$_sb_paths" ]; then
       echo "$$| >>> [trigger-OCR] $OCRAPP_NAME: leftover '$_sb_d' names no source at all -- LEFT ALONE (nothing maps it to this tool)"
       continue
     fi
-    _sb_foreign=""; _sb_n=0
+    _sb_foreign=""; _sb_n=0; _sb_mine=0
     while IFS= read -r _sb_p; do
       [ -n "$_sb_p" ] || continue
       _sb_n=$(( _sb_n + 1 ))
       case "$_sb_p" in
-        "$_sb_stage"/*) ;;
-        *) _sb_foreign="$_sb_p"; break ;;
+        "$_sb_stage"/*) _sb_mine=$(( _sb_mine + 1 )); continue ;;
       esac
+      [ -f "$_sb_p" ] && { _sb_foreign="$_sb_p"; break; }
     done <<_EOSB_
 $_sb_paths
 _EOSB_
     if [ -n "$_sb_foreign" ]; then
-      echo "$$| >>> [trigger-OCR] $OCRAPP_NAME: leftover '$_sb_d' references '$_sb_foreign', which is not my-ocr's staging -- LEFT ALONE"
+      echo "$$| >>> [trigger-OCR] $OCRAPP_NAME: leftover '$_sb_d' holds '$_sb_foreign', a file outside my-ocr's staging -- LEFT ALONE (it is a document of yours)"
+      continue
+    fi
+    if [ "$_sb_mine" -eq 0 ]; then
+      echo "$$| >>> [trigger-OCR] $OCRAPP_NAME: leftover '$_sb_d' names no path under '$_sb_stage' -- LEFT ALONE (nothing maps it to this tool) [$_sb_n path(s)]"
       continue
     fi
     if [ -n "$c_trash" ] && [ -x "$c_trash" ]; then
       if "$c_trash" -- "$_sb_d" >/dev/null 2>&1; then
-        echo "$$| >>> [trigger-OCR] $OCRAPP_NAME: cleared leftover document ($_sb_n source(s), all from staging) -- trashed '$_sb_d'"
+        echo "$$| >>> [trigger-OCR] $OCRAPP_NAME: cleared leftover document [$_sb_mine of $_sb_n path(s) from staging, 0 file(s) of yours] -- trashed '$_sb_d'"
       else
         echo "$$| >>> [trigger-OCR] $OCRAPP_NAME: WARNING could not trash leftover '$_sb_d' -- its recovery dialog may block the run"
       fi
@@ -3679,11 +3693,32 @@ t_stale_batch() {
     _o="$(ocrapp_clear_stale_batch "$_sb_stage" 2>&1)"
     if [ ! -d "$_mine" ]; then echo "OK1 $_o"; else echo "BAD1 $_o"; fi
 
+    # A document of YOURS is a path that EXISTS AS A FILE. It has to be a real
+    # one: a made-up path that exists nowhere references nothing, and using one
+    # here would let this case pass without testing the rule.
+    mkdir -p "$_sb_t/yours"; printf 'a document of yours\n' >"$_sb_t/yours/their-thesis.pdf"
     _mixed="$_sb_t/store/com.test.app12.00/Untitled.FR12.0"
-    _mk "$_mixed" "$_sb_stage/a.#1.pdf" "/Users/someone/Documents/their-thesis.pdf"
+    _mk "$_mixed" "$_sb_stage/a.#1.pdf" "$_sb_t/yours/their-thesis.pdf"
     _o="$(ocrapp_clear_stale_batch "$_sb_stage" 2>&1)"
     if [ -d "$_mixed" ]; then echo "OK2 $_o"; else echo "BAD2 $_o"; fi
     rm -rf "$_mixed"
+
+    # The corpus a REAL batch file yields: full staging paths beside fragments
+    # of them, because the format stores a length byte in front of each path.
+    # Demanding that every one be under staging refused for ever, and a
+    # leftover blocked two consecutive runs on ada while nothing looked wrong.
+    _frag="$_sb_t/store/com.test.app12.00/Untitled.FR12.0"
+    _mk "$_frag" "$_sb_stage/2026-09-23_1023.11___scan.#1.pdf" \
+        "/" "/Users" "/Users/" "/5K" "/g\\" "/me/Public/,ocr.i" "/2026-09-23_1023.11"
+    _o="$(ocrapp_clear_stale_batch "$_sb_stage" 2>&1)"
+    if [ ! -d "$_frag" ]; then echo "OK4 $_o"; else echo "BAD4 $_o"; fi
+
+    # ...but fragments ALONE map it to nothing, so there is no claim on it
+    _none="$_sb_t/store/com.test.app12.00/Untitled.FR12.0"
+    _mk "$_none" "/" "/Users" "/5K"
+    _o="$(ocrapp_clear_stale_batch "$_sb_stage" 2>&1)"
+    if [ -d "$_none" ]; then echo "OK5 $_o"; else echo "BAD5 $_o"; fi
+    rm -rf "$_none"
 
     _nopac="$_sb_t/store/com.test.app12.00/Untitled.FR12.0"
     mkdir -p "$_nopac/0001/Image"
@@ -3692,12 +3727,22 @@ t_stale_batch() {
   ) >"$_sb_t/out" 2>&1
   _r="$(cat "$_sb_t/out")"
   case "$_r" in
-    *"OK1"*"cleared leftover document (2 source(s)"*) t_ok "a leftover whose pages all came from staging is cleared";;
+    *"OK1"*"cleared leftover document [2 of 2 path(s) from staging"*) t_ok "a leftover whose pages all came from staging is cleared";;
     *) t_bad "a leftover whose pages all came from staging is cleared" "out='$_r'";;
   esac
   case "$_r" in
-    *"OK2"*"their-thesis.pdf"*"LEFT ALONE"*) t_ok "one foreign source and the whole document is LEFT ALONE, named in the output";;
-    *) t_bad "one foreign source and the whole document is LEFT ALONE, named in the output" "out='$_r'";;
+    *"OK2"*"their-thesis.pdf"*"LEFT ALONE"*) t_ok "one file of yours and the whole document is LEFT ALONE, named in the output";;
+    *) t_bad "one file of yours and the whole document is LEFT ALONE, named in the output" "out='$_r'";;
+  esac
+  case "$_r" in
+    *"OK4"*"cleared leftover document [1 of 8 path(s) from staging"*)
+      t_ok "the fragments a real batch file yields do not block the clearing";;
+    *) t_bad "the fragments a real batch file yields do not block the clearing" "out='$_r'";;
+  esac
+  case "$_r" in
+    *"OK5"*"names no path under"*"LEFT ALONE"*)
+      t_ok "fragments alone map a leftover to nothing -- LEFT ALONE";;
+    *) t_bad "fragments alone map a leftover to nothing -- LEFT ALONE" "out='$_r'";;
   esac
   case "$_r" in
     *"OK3"*"no readable batch file"*"LEFT ALONE"*) t_ok "no batch file to read means no decision -- LEFT ALONE, and it says why";;
