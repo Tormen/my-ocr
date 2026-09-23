@@ -14,11 +14,11 @@ NL="
 # and is authoritative at runtime -- the deployed copy needs no git and no
 # repository. The build id is a hash of this file, so it is right even unstamped.
 SCRIPT_VERSION="v1.0"
-SCRIPT_COMMIT="0b5d539"           # rewritten by 'my-ocr stamp-version'
+SCRIPT_COMMIT="951ca50"           # rewritten by 'my-ocr stamp-version'
 # What git said when this build was stamped: 'git describe --tags --long' --
 # <nearest tag>-<commits since it>-g<short sha>. It says whether these bytes
 # ARE that release or work on top of it, on a machine with no git.
-SCRIPT_RELEASE="v1.0-34-g0b5d539"
+SCRIPT_RELEASE="v1.0-35-g951ca50"
 
 WHOAMI="$(/usr/bin/whoami)"
 [ "$USER" = "$WHOAMI" ] || err 126 "USER '$USER' ? != ? '$WHOAMI' WHOAMI"
@@ -1822,7 +1822,7 @@ $(ls -la "$S_PATH"|sed -e "s/^/${PFX}     | /")"
   # So the wait ends on EVIDENCE, and only one piece of evidence is
   # conclusive -- that $OCRAPP_NAME is not running at all.
   local i=0; local stalled=0; local last_q=""; local next_alert=$STALL_ALERT_AFTER
-  local _cpu_was=""; local _cpu_still=0
+  local _cpu_was=""; local _cpu_still=0; local _cpu_busy=""
   local _fr_seen=""; local _nudged=""; local _tw=0
   while [ -s "$QUEUED_FILE_MOVES_LOG" ]; do
 
@@ -1891,13 +1891,18 @@ Check that Folder Actions are enabled and that '$S_PATH' still has ours attached
       case "$_cpu_bud" in ''|*[!0-9]*) _cpu_bud=3 ;; esac
       _cpu_bud=$(( _cpu_bud * 100 / 60 ))          # hundredths per second
       [ "$_cpu_bud" -lt 1 ] && _cpu_bud=1
+      # The FIRST look has nothing to compare with, and the first alert fires
+      # on exactly that look -- so take a second sample a second later, and
+      # the verdict "working or not" exists the moment it is needed.
       if [ -z "$_cpu_was" ]; then
-        _cpu_was="$_cpu_now"
-      elif [ $(( _cpu_now - _cpu_was )) -le "$_cpu_bud" ]; then
+        _cpu_was="$_cpu_now"; sleep 1; _cpu_now="$(ocrapp_cpu_secs)"
+      fi
+      if [ $(( _cpu_now - _cpu_was )) -le "$_cpu_bud" ]; then
         _cpu_still=$(( _cpu_still + 1 ))           # not working, whatever it ticks
-        _cpu_was="$_cpu_now"
+        _cpu_was="$_cpu_now"; _cpu_busy=""
       else
         _cpu_still=0; _cpu_was="$_cpu_now"         # it IS working -- keep waiting
+        _cpu_busy=1
       fi
       if [ "$_cpu_still" -ge "$OCRAPP_IDLE_GIVEUP" ]; then
         m="$OCRAPP_NAME [pid(s) $ocr_pids] has used almost no cpu (under ${OCRAPP_IDLE_MAX_CPU_PER_MIN}s per minute) for ${_cpu_still}s while the queue stood still for ${stalled}s [cpu ${_cpu_now}/100s total over $(ocrapp_all_pids | awk 'END{print NR+0}') process(es)].
@@ -1912,8 +1917,19 @@ closing it, and the documents go back for a retry."
     # Hold the lock and keep waiting while it is genuinely working.
     # next_alert, not "stalled % EVERY": with the modulo the first gap would be
     # EVERY-minus-ALERT_AFTER, so the interval would not mean what it says.
+    # A queue that has not moved is NOT an alarm while the app is measurably
+    # working: a 10-page batch at high quality takes longer than the first
+    # alert interval, and every such batch mailed "STUCK" and left a marker on
+    # the Desktop -- eight of them for one evening of healthy runs. So it is
+    # logged, with the evidence; the mail is kept for an app that is NOT
+    # working, or for when the cpu check is off and nothing can be told.
     if [ $stalled -ge $next_alert ]; then
-      alert_stuck "$OCRAPP_NAME [pid(s) $ocr_pids] is running but the queue has not moved for ${stalled}s. Still waiting; NOT releasing the lock."
+      _as_msg="$OCRAPP_NAME [pid(s) $ocr_pids] is running but the queue has not moved for ${stalled}s. Still waiting; NOT releasing the lock."
+      if [ -n "$_cpu_busy" ]; then
+        echo "$$| >>> [trigger-OCR] $_as_msg -- it IS working [cpu ${_cpu_now}/100s total over $(ocrapp_all_pids | awk 'END{print NR+0}') process(es)], so no alert"
+      else
+        alert_stuck "$_as_msg"
+      fi
       next_alert=$(( $stalled + $STALL_REALERT_EVERY ))
     fi
   done
@@ -3662,6 +3678,24 @@ t_stall_recovery() {
   # real work (36 s/min = 60 hundredths per second) must NOT
   if [ 60 -gt "$_bud" ]; then t_ok "stall: 36 s/min (real OCR work) is far outside it -- never called stuck"
   else t_bad "stall: 36 s/min (real OCR work) is far outside it -- never called stuck" "budget=$_bud"; fi
+  # The periodic "queue has not moved" notice mailed STUCK for every healthy
+  # batch that outlasted the first interval. It may alert only when the cpu
+  # evidence says the app is NOT working -- and that evidence must exist on the
+  # FIRST look, which is the one the first alert fires on.
+  # shellcheck disable=SC2016  # matching literal source text
+  _cs_blk="$(awk '/if \[ \$stalled -ge \$next_alert \]; then/,/next_alert=\$\(\( \$stalled/' "$0")"
+  if printf '%s\n' "$_cs_blk" | awk '/_cpu_busy/{b=NR} /alert_stuck/{a=NR} END{exit !(b && a && b < a)}'; then
+    t_ok "stall: the periodic notice alerts only when the cpu says the app is NOT working"
+  else
+    t_bad "stall: the periodic notice alerts only when the cpu says the app is NOT working" \
+          "alert_stuck is not guarded by _cpu_busy in the notice block"
+  fi
+  # shellcheck disable=SC2016  # matching literal source text
+  if grep -q '_cpu_was="\$_cpu_now"; sleep 1; _cpu_now="\$(ocrapp_cpu_secs)"' "$0"; then
+    t_ok "stall: the first look takes two samples, so the first alert has evidence"
+  else
+    t_bad "stall: the first look takes two samples, so the first alert has evidence" "single sample on the first look"
+  fi
   # A helper this script does not define is a call that fails on EVERY look.
   # 'isInt' is my-scan's, and my-ocr called it once: the budget guard printed
   # 'isInt: not found' on every pass of the wait loop for as long as it existed.
