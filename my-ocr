@@ -14,11 +14,11 @@ NL="
 # and is authoritative at runtime -- the deployed copy needs no git and no
 # repository. The build id is a hash of this file, so it is right even unstamped.
 SCRIPT_VERSION="v1.0"
-SCRIPT_COMMIT="f1cb801"           # rewritten by 'my-ocr stamp-version'
+SCRIPT_COMMIT="99a7020"           # rewritten by 'my-ocr stamp-version'
 # What git said when this build was stamped: 'git describe --tags --long' --
 # <nearest tag>-<commits since it>-g<short sha>. It says whether these bytes
 # ARE that release or work on top of it, on a machine with no git.
-SCRIPT_RELEASE="v1.0-29-gf1cb801"
+SCRIPT_RELEASE="v1.0-30-g99a7020"
 
 WHOAMI="$(/usr/bin/whoami)"
 [ "$USER" = "$WHOAMI" ] || err 126 "USER '$USER' ? != ? '$WHOAMI' WHOAMI"
@@ -1441,8 +1441,19 @@ cpu_from_ps() {
            END { printf "%d\n", (t*100)+0.5 }'
 }
 
+# EVERY process of the OCR app, not only the one that carries its name: the
+# recognition itself runs in separate helper processes inside the same bundle
+# ('FineExec'), and while those grind at 100% the named process sits idle. The
+# match is anchored at the bundle path so a command line that merely MENTIONS
+# it -- a grep, an ssh, this script's own diagnostics -- is not counted.
+ocrapp_all_pids() {
+  { pgrep -x "$OCRAPP_NAME" 2>/dev/null
+    [ -n "$OCRAPP_PATH" ] && pgrep -f "^$OCRAPP_PATH/" 2>/dev/null
+  } | sort -un
+}
+
 ocrapp_cpu_secs() {
-  _cs_p="$(pgrep -x "$OCRAPP_NAME" 2>/dev/null | tr '\n' ',' | sed 's/,$//')"
+  _cs_p="$(ocrapp_all_pids | tr '\n' ',' | sed 's/,$//')"
   [ -n "$_cs_p" ] || { printf '0\n'; return 0; }
   ps -o time= -p "$_cs_p" 2>/dev/null | cpu_from_ps
 }
@@ -1476,11 +1487,34 @@ _EOQUIT_
   pkill -x "$OCRAPP_NAME" 2>/dev/null
   _q_w=0
   while [ "$_q_w" -lt 10 ]; do
-    pgrep -x "$OCRAPP_NAME" >/dev/null 2>&1 || { echo "$$| >>> [$WHAT] $OCRAPP_NAME ended on TERM"; return 0; }
+    pgrep -x "$OCRAPP_NAME" >/dev/null 2>&1 || {
+      echo "$$| >>> [$WHAT] $OCRAPP_NAME ended on TERM"; ocrapp_reap_helpers; return 0; }
     sleep 1; _q_w=$(( _q_w + 1 ))
   done
   echo "$$| >>> [$WHAT] WARNING :: $OCRAPP_NAME (pid(s) $_q_p) survived TERM -- sending KILL"
   pkill -9 -x "$OCRAPP_NAME" 2>/dev/null
+  ocrapp_reap_helpers
+  return 0
+}
+
+# The bundle's helper processes do NOT go away with their parent: two 'FineExec'
+# processes outlived a TERMed app by 20 minutes at 100% cpu each, re-parented to
+# launchd, with nothing left to hand their result to. They are only reaped once
+# the named process is gone, so a running app's helpers are never touched.
+ocrapp_reap_helpers() {
+  pgrep -x "$OCRAPP_NAME" >/dev/null 2>&1 && return 0
+  _rh_p="$(ocrapp_all_pids | xargs echo)"
+  [ -n "$_rh_p" ] || return 0
+  echo "$$| >>> [$WHAT] $OCRAPP_NAME is gone but its helper(s) $_rh_p are still running -- ending them"
+  for _rh_i in $_rh_p; do kill "$_rh_i" 2>/dev/null; done
+  _rh_w=0
+  while [ "$_rh_w" -lt 10 ]; do
+    [ -z "$(ocrapp_all_pids)" ] && { echo "$$| >>> [$WHAT] helper(s) ended after ${_rh_w}s"; return 0; }
+    sleep 1; _rh_w=$(( _rh_w + 1 ))
+  done
+  _rh_p="$(ocrapp_all_pids | xargs echo)"
+  echo "$$| >>> [$WHAT] WARNING :: helper(s) $_rh_p survived TERM -- sending KILL"
+  for _rh_i in $_rh_p; do kill -9 "$_rh_i" 2>/dev/null; done
   return 0
 }
 
@@ -1809,7 +1843,7 @@ Check that Folder Actions are enabled and that '$S_PATH' still has ours attached
 
     [ $stalled -lt $STALL_ALERT_AFTER ] && continue
 
-    ocr_pids="$(pgrep -x "$OCRAPP_NAME" 2>/dev/null | xargs echo)"
+    ocr_pids="$(ocrapp_all_pids | xargs echo)"
     if [ -z "$ocr_pids" ]; then
       # CONCLUSIVE: nothing is running, so nothing can collide -> safe to end.
       m="$OCRAPP_NAME is NOT running and the queue has not moved for ${stalled}s -- the OCR cannot finish."
@@ -1839,7 +1873,7 @@ Check that Folder Actions are enabled and that '$S_PATH' still has ours attached
         _cpu_still=0; _cpu_was="$_cpu_now"         # it IS working -- keep waiting
       fi
       if [ "$_cpu_still" -ge "$OCRAPP_IDLE_GIVEUP" ]; then
-        m="$OCRAPP_NAME [pid(s) $ocr_pids] has used almost no cpu (under ${OCRAPP_IDLE_MAX_CPU_PER_MIN}s per minute) for ${_cpu_still}s while the queue stood still for ${stalled}s.
+        m="$OCRAPP_NAME [pid(s) $ocr_pids] has used almost no cpu (under ${OCRAPP_IDLE_MAX_CPU_PER_MIN}s per minute) for ${_cpu_still}s while the queue stood still for ${stalled}s [cpu ${_cpu_now}/100s total over $(ocrapp_all_pids | awk 'END{print NR+0}') process(es)].
 It is not working -- it is waiting for someone to answer a dialog. Recovering:
 closing it, and the documents go back for a retry."
         alert_stuck "$m"
@@ -3518,6 +3552,58 @@ t_stall_recovery() {
   fi
 }
 
+t_bundle_pids() {
+  # LIVE: the recognition does not run in the process that carries the app's
+  # name -- it runs in helper processes inside the same bundle. Counting only
+  # the named one made a 25-page batch that was genuinely working look frozen,
+  # and it was TERMed mid-OCR. So: a busy helper must be SEEN, and a process
+  # that merely mentions the bundle path must not be.
+  _bp="$(mktemp -d /tmp/my-ocr.bundle.XXXXXX)" || { t_bad "bundle pids: no tmpdir" "mktemp failed"; return 1; }
+  mkdir -p "$_bp/Contents"
+  # A SYMLINK to a real binary, not a script: an interpreted file is listed as
+  # '/bin/dash <path>', so its command line starts with the INTERPRETER and a
+  # helper built that way would not exercise the anchored match at all.
+  ln -s /usr/bin/yes "$_bp/Contents/Helper"
+
+  _bp_was_name="$OCRAPP_NAME"; _bp_was_path="$OCRAPP_PATH"
+  OCRAPP_NAME="my-ocr-no-such-app"      # the NAMED process is deliberately absent
+  OCRAPP_PATH="$_bp"
+  "$_bp/Contents/Helper" >/dev/null 2>&1 & _bp_h=$!
+  # MENTIONS the path without belonging to the bundle. The trailing ':' keeps a
+  # shell alive: with a single command dash EXECS it and the mention disappears
+  # from the command line, so the case would pass while testing nothing.
+  /bin/dash -c "sleep 20; : '$_bp/Contents/Helper'" & _bp_m=$!
+  sleep 1
+  if kill -0 "$_bp_h" 2>/dev/null && kill -0 "$_bp_m" 2>/dev/null; then
+    t_ok "bundle pids: both probe processes are alive ($_bp_h, $_bp_m)"
+  else
+    t_bad "bundle pids: both probe processes are alive" \
+          "helper=$_bp_h mention=$_bp_m -- one died, so the cases below prove nothing"
+  fi
+
+  if ocrapp_all_pids | grep -qx "$_bp_h"; then
+    t_ok "bundle pids: a busy helper of the bundle is counted ($_bp_h)"
+  else
+    t_bad "bundle pids: a busy helper of the bundle is counted" "found only: $(ocrapp_all_pids | xargs echo)"
+  fi
+  if ocrapp_all_pids | grep -qx "$_bp_m"; then
+    t_bad "bundle pids: a process that only NAMES the bundle is not counted" "matched pid $_bp_m"
+  else
+    t_ok "bundle pids: a process that only NAMES the bundle is not counted"
+  fi
+  # and the cpu it burns must be VISIBLE -- that is what keeps the app alive
+  _bp_c1="$(ocrapp_cpu_secs)"; sleep 2; _bp_c2="$(ocrapp_cpu_secs)"
+  if [ "$_bp_c2" -gt "$_bp_c1" ]; then
+    t_ok "bundle pids: helper cpu advances, so a working app is never called idle ($_bp_c1 -> $_bp_c2)"
+  else
+    t_bad "bundle pids: helper cpu advances, so a working app is never called idle" "$_bp_c1 -> $_bp_c2"
+  fi
+
+  kill "$_bp_h" "$_bp_m" 2>/dev/null; wait "$_bp_h" "$_bp_m" 2>/dev/null
+  OCRAPP_NAME="$_bp_was_name"; OCRAPP_PATH="$_bp_was_path"
+  rm -rf "$_bp"
+}
+
 t_counts_reconcile() {
   # the ordinary case: 5 handed over, 2 still queued -> 3 done
   _c="$(ocr_ok_cnt 5 2)"
@@ -4218,6 +4304,7 @@ do_run_tests() {
   t_ocrapp_quit
   t_counts_reconcile
   t_stall_recovery
+  t_bundle_pids
   t_reset_log_last
   t_open_cmd
   t_nudge
