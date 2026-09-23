@@ -14,11 +14,11 @@ NL="
 # and is authoritative at runtime -- the deployed copy needs no git and no
 # repository. The build id is a hash of this file, so it is right even unstamped.
 SCRIPT_VERSION="v1.0"
-SCRIPT_COMMIT="2f2f248"           # rewritten by 'my-ocr stamp-version'
+SCRIPT_COMMIT="dd577de"           # rewritten by 'my-ocr stamp-version'
 # What git said when this build was stamped: 'git describe --tags --long' --
 # <nearest tag>-<commits since it>-g<short sha>. It says whether these bytes
 # ARE that release or work on top of it, on a machine with no git.
-SCRIPT_RELEASE="v1.0-32-g2f2f248"
+SCRIPT_RELEASE="v1.0-33-gdd577de"
 
 WHOAMI="$(/usr/bin/whoami)"
 [ "$USER" = "$WHOAMI" ] || err 126 "USER '$USER' ? != ? '$WHOAMI' WHOAMI"
@@ -1885,7 +1885,10 @@ Check that Folder Actions are enabled and that '$S_PATH' still has ours attached
       _cpu_now="$(ocrapp_cpu_secs)"
       # a RATE: how much cpu it used since the last look, in hundredths, against
       # what OCRAPP_IDLE_MAX_CPU_PER_MIN allows for one second
-      _cpu_bud="$OCRAPP_IDLE_MAX_CPU_PER_MIN"; isInt "$_cpu_bud" || _cpu_bud=3
+      # 'isInt' is my-scan's helper and does not exist here, so this guard was
+      # printing 'isInt: not found' on every look and falling back regardless.
+      _cpu_bud="$OCRAPP_IDLE_MAX_CPU_PER_MIN"
+      case "$_cpu_bud" in ''|*[!0-9]*) _cpu_bud=3 ;; esac
       _cpu_bud=$(( _cpu_bud * 100 / 60 ))          # hundredths per second
       [ "$_cpu_bud" -lt 1 ] && _cpu_bud=1
       if [ -z "$_cpu_was" ]; then
@@ -3568,6 +3571,23 @@ t_stall_recovery() {
   # real work (36 s/min = 60 hundredths per second) must NOT
   if [ 60 -gt "$_bud" ]; then t_ok "stall: 36 s/min (real OCR work) is far outside it -- never called stuck"
   else t_bad "stall: 36 s/min (real OCR work) is far outside it -- never called stuck" "budget=$_bud"; fi
+  # A helper this script does not define is a call that fails on EVERY look.
+  # 'isInt' is my-scan's, and my-ocr called it once: the budget guard printed
+  # 'isInt: not found' on every pass of the wait loop for as long as it existed.
+  # Lines of this check are skipped by the '_cs_' filter: the names have to be
+  # written out here, and a test that matched its own pattern would report them
+  # for ever.
+  _cs_undef=""
+  for _cs_f in isInt isNum pe det msg quiet_out; do
+    grep -q "^$_cs_f()" "$0" && continue                    # defined here: fine
+    grep -v '_cs_' "$0" | grep -qE "(^|[;&|}]|&&|\|\|)[[:space:]]*${_cs_f}[[:space:]]+[^=]" \
+      && _cs_undef="$_cs_undef $_cs_f"
+  done
+  if [ -z "$_cs_undef" ]; then
+    t_ok "stall: every helper the script calls is one it defines"
+  else
+    t_bad "stall: every helper the script calls is one it defines" "undefined here:$_cs_undef"
+  fi
   # shellcheck disable=SC2016  # matching literal source text
   if awk '/^wait_for_|_cpu_bud/{print}' "$0" | grep -q '_cpu_now - _cpu_was'; then
     t_ok "stall: it compares the cpu USED since the last look, not equality"
