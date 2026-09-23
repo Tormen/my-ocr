@@ -14,11 +14,11 @@ NL="
 # and is authoritative at runtime -- the deployed copy needs no git and no
 # repository. The build id is a hash of this file, so it is right even unstamped.
 SCRIPT_VERSION="v1.0"
-SCRIPT_COMMIT="d50afbe"           # rewritten by 'my-ocr stamp-version'
+SCRIPT_COMMIT="2f2f248"           # rewritten by 'my-ocr stamp-version'
 # What git said when this build was stamped: 'git describe --tags --long' --
 # <nearest tag>-<commits since it>-g<short sha>. It says whether these bytes
 # ARE that release or work on top of it, on a machine with no git.
-SCRIPT_RELEASE="v1.0-31-gd50afbe"
+SCRIPT_RELEASE="v1.0-32-g2f2f248"
 
 WHOAMI="$(/usr/bin/whoami)"
 [ "$USER" = "$WHOAMI" ] || err 126 "USER '$USER' ? != ? '$WHOAMI' WHOAMI"
@@ -1446,9 +1446,14 @@ cpu_from_ps() {
 # ('FineExec'), and while those grind at 100% the named process sits idle. The
 # match is anchored at the bundle path so a command line that merely MENTIONS
 # it -- a grep, an ssh, this script's own diagnostics -- is not counted.
+#
+# The optional quote is not cosmetic: FineReader launches its helpers with an
+# argv[0] that BEGINS with a literal '"', so a match anchored at the bare path
+# finds none of them. That shipped once, because the test spawned its helper
+# through a symlink and so never reproduced the quoting the real app uses.
 ocrapp_all_pids() {
   { pgrep -x "$OCRAPP_NAME" 2>/dev/null
-    [ -n "$OCRAPP_PATH" ] && pgrep -f "^$OCRAPP_PATH/" 2>/dev/null
+    [ -n "$OCRAPP_PATH" ] && pgrep -f "^[\"']?$OCRAPP_PATH/" 2>/dev/null
   } | sort -un
 }
 
@@ -1680,6 +1685,11 @@ Should not be."
   [ $DBG ] && echo "$$|  ~~ [trigger-OCR] (1) Wrote found PID(s) to OCRAPP_STATEFILE '$OCRAPP_STATEFILE' (will be removed in step 6 in part-2)."
   echo "$$| >>> [trigger-OCR] ${x}Created '$OCRAPP_STATEFILE' [pids of '$OCRAPP_NAME': '$ocrapp_pids']"
   ocrapp_no_window_restore "$OCRAPP_BUNDLE_ID"
+  # Helpers of a PREVIOUS run that outlived their app: they hold no document
+  # and answer to nobody, but they do take the cpu this run is about to need
+  # (two of them sat at 100% for twenty minutes). Reaping only on the quit path
+  # never reaches them, because the app that owned them is already gone.
+  ocrapp_reap_helpers
   ocrapp_clear_stale_batch "$S_PATH"
 
   [ -t 0 ] && [ $FILELIST_CNT -eq 0 -a $PROVIDED_FILES_CNT -eq 0 ] && err 127 "No <FILES-TO-OCR> provided. Neither as parameters, nor on stdin. Please call with --help for how to use this script.";
@@ -3587,12 +3597,23 @@ t_bundle_pids() {
   # shell alive: with a single command dash EXECS it and the mention disappears
   # from the command line, so the case would pass while testing nothing.
   /bin/dash -c "sleep 20; : '$_bp/Contents/Helper'" & _bp_m=$!
+  # ...and one launched the way the real app launches its helpers: argv[0]
+  # BEGINS with a literal double quote. Without this case the suite passed
+  # while every helper of a live run went uncounted.
+  /usr/bin/perl -e 'exec {"/usr/bin/yes"} "\"$ARGV[0]\"" or exit 1' \
+                 "$_bp/Contents/Helper" >/dev/null 2>&1 & _bp_q=$!
   sleep 1
-  if kill -0 "$_bp_h" 2>/dev/null && kill -0 "$_bp_m" 2>/dev/null; then
-    t_ok "bundle pids: both probe processes are alive ($_bp_h, $_bp_m)"
+  if kill -0 "$_bp_h" 2>/dev/null && kill -0 "$_bp_m" 2>/dev/null && kill -0 "$_bp_q" 2>/dev/null; then
+    t_ok "bundle pids: all three probe processes are alive ($_bp_h, $_bp_m, $_bp_q)"
   else
-    t_bad "bundle pids: both probe processes are alive" \
-          "helper=$_bp_h mention=$_bp_m -- one died, so the cases below prove nothing"
+    t_bad "bundle pids: all three probe processes are alive" \
+          "helper=$_bp_h mention=$_bp_m quoted=$_bp_q -- one died, so the cases below prove nothing"
+  fi
+  if ocrapp_all_pids | grep -qx "$_bp_q"; then
+    t_ok "bundle pids: a helper whose argv[0] starts with a quote is counted ($_bp_q)"
+  else
+    t_bad "bundle pids: a helper whose argv[0] starts with a quote is counted" \
+          "found only: $(ocrapp_all_pids | xargs echo) -- this is how every live helper went uncounted"
   fi
 
   if ocrapp_all_pids | grep -qx "$_bp_h"; then
@@ -3613,7 +3634,7 @@ t_bundle_pids() {
     t_bad "bundle pids: helper cpu advances, so a working app is never called idle" "$_bp_c1 -> $_bp_c2"
   fi
 
-  kill "$_bp_h" "$_bp_m" 2>/dev/null; wait "$_bp_h" "$_bp_m" 2>/dev/null
+  kill "$_bp_h" "$_bp_m" "$_bp_q" 2>/dev/null; wait "$_bp_h" "$_bp_m" "$_bp_q" 2>/dev/null
   OCRAPP_NAME="$_bp_was_name"; OCRAPP_PATH="$_bp_was_path"
   rm -rf "$_bp"
 }
