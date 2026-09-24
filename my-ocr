@@ -14,11 +14,11 @@ NL="
 # and is authoritative at runtime -- the deployed copy needs no git and no
 # repository. The build id is a hash of this file, so it is right even unstamped.
 SCRIPT_VERSION="v1.0"
-SCRIPT_COMMIT="862ad9b"           # rewritten by 'my-ocr stamp-version'
+SCRIPT_COMMIT="aa6c2af"           # rewritten by 'my-ocr stamp-version'
 # What git said when this build was stamped: 'git describe --tags --long' --
 # <nearest tag>-<commits since it>-g<short sha>. It says whether these bytes
 # ARE that release or work on top of it, on a machine with no git.
-SCRIPT_RELEASE="v1.0-45-g862ad9b"
+SCRIPT_RELEASE="v1.0-46-gaa6c2af"
 
 WHOAMI="$(/usr/bin/whoami)"
 [ "$USER" = "$WHOAMI" ] || err 126 "USER '$USER' ? != ? '$WHOAMI' WHOAMI"
@@ -1867,6 +1867,9 @@ Should not be."
 
   # Make sure no old PARTx_ERRORED_FLAGFILE is left:
   [ -e "$PARTx_ERRORED_FLAGFILE" ] && { rm "$PARTx_ERRORED_FLAGFILE" || err 083 "Failed to 'rm \"$PARTx_ERRORED_FLAGFILE\"'"; }
+  # Ours from here on, so it goes down with us -- every successful run left it
+  # behind, empty, and 'reset' found it after each one.
+  schedule_for_cleanup "$PARTx_ERRORED_FLAGFILE"
   touch "$PARTx_ERRORED_FLAGFILE" || err 027
 
   touch "$QUEUED_FILE_MOVES_LOG" || err 042 "Failed [$?] to create QUEUED_FILE_MOVES_LOG '$QUEUED_FILE_MOVES_LOG' (touch, chmod :my-system, chown g-w,o-rwx)"
@@ -4417,6 +4420,20 @@ t_preflight_repair() {
   fi
 }
 
+# A run removes what it creates: the errored flag was scheduled for cleanup only
+# when a part had written an error into it, so every SUCCESSFUL run left it
+# behind, empty -- and 'reset' right after any normal run was never empty.
+t_errflag_cleanup() {
+  # shellcheck disable=SC2016  # matching literal source text
+  if awk '/^do_trigger_ocr\(\) \{/,/^\}/' "$0" \
+     | awk '/^  schedule_for_cleanup "\$PARTx_ERRORED_FLAGFILE"$/{s=NR} /^  touch "\$PARTx_ERRORED_FLAGFILE"/{t=NR}
+            END{exit !(s && t && s < t)}'; then
+    t_ok "errored flag: the run that creates it schedules its removal (a clean run leaves nothing)"
+  else
+    t_bad "errored flag: the run that creates it schedules its removal (a clean run leaves nothing)" "only removed after an error"
+  fi
+}
+
 t_reset_log_last() {
   # the documents part of reset lives in reset_stranded(), shared with the
   # pre-flight repair -- the order has to hold there
@@ -5312,6 +5329,7 @@ do_run_tests() {
   t_reset_log_last
   t_reset_stable
   t_preflight_repair
+  t_errflag_cleanup
   t_trap_term
   t_fa_restart
   t_workflow_export
