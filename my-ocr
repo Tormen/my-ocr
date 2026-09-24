@@ -14,11 +14,11 @@ NL="
 # and is authoritative at runtime -- the deployed copy needs no git and no
 # repository. The build id is a hash of this file, so it is right even unstamped.
 SCRIPT_VERSION="v1.0"
-SCRIPT_COMMIT="0f9677b"           # rewritten by 'my-ocr stamp-version'
+SCRIPT_COMMIT="862ad9b"           # rewritten by 'my-ocr stamp-version'
 # What git said when this build was stamped: 'git describe --tags --long' --
 # <nearest tag>-<commits since it>-g<short sha>. It says whether these bytes
 # ARE that release or work on top of it, on a machine with no git.
-SCRIPT_RELEASE="v1.0-44-g0f9677b"
+SCRIPT_RELEASE="v1.0-45-g862ad9b"
 
 WHOAMI="$(/usr/bin/whoami)"
 [ "$USER" = "$WHOAMI" ] || err 126 "USER '$USER' ? != ? '$WHOAMI' WHOAMI"
@@ -587,14 +587,7 @@ cleanup() { local rc=$?;
   fi
 
   if [ "$WHAT" = "trigger-OCR" ]; then
-    # The mutex is a DIRECTORY, so it cannot go through schedule_for_cleanup,
-    # whose remover is 'rm -f'.
-    if [ $WE_HOLD_OCRAPP_MUTEX ]; then
-      close_ocrapp_if_ours
-      rm -f "$OCRAPP_MUTEX_DIR/owner"; rmdir "$OCRAPP_MUTEX_DIR" 2>/dev/null \
-        && { [ $DBG ] && echo "$$|      - '$OCRAPP_MUTEX_DIR' - Mutex released."; :; } \
-        || echo "$$|      - '$OCRAPP_MUTEX_DIR' - FAILED to release the mutex!"
-    fi
+    [ -n "$WE_HOLD_OCRAPP_MUTEX" ] && close_ocrapp_if_ours
 
     # Only clean those up if we are the MAIN process (WHAT == 'trigger-OCR'):
     for a in "$TMP_PRE_INP_PATH" "$S_PATH/$COLLECT_INP_PATH"; do
@@ -733,6 +726,16 @@ _EOMF_
       printf "\n${PFX}Found the following $ENCRYPTED_CNT ENCRYPTED file(s). Please decrypt manually and come back:\n\n'$ENCRYPTED_PDFS_FILELIST'\n";
       cat "$ENCRYPTED_PDFS_FILELIST"|sed -e 's/.*/   "&"/' || echo "ERROR: FAILED [$?] to 'cat \"$ENCRYPTED_PDFS_FILELIST\"'. Should not be."
       printf "\nENCRYPTED files will be ignored by this script if they end with ___encrypted.[pP][dD][fF].\n'pdf-decrypt' creates those for you (and the file without the ___encrypted gets decrypted).\nThen you can decide if you leave them or if you want to remove them.\n"
+    fi
+
+    # The mutex goes LAST. Everything above works on files every run shares --
+    # the staging directories, the queue log -- and released first, the next
+    # run took its turn, created its own, and this cleanup deleted them.
+    # A DIRECTORY, so it cannot go through schedule_for_cleanup ('rm -f').
+    if [ $WE_HOLD_OCRAPP_MUTEX ]; then
+      rm -f "$OCRAPP_MUTEX_DIR/owner"; rmdir "$OCRAPP_MUTEX_DIR" 2>/dev/null \
+        && { [ $DBG ] && echo "$$|      - '$OCRAPP_MUTEX_DIR' - Mutex released."; :; } \
+        || echo "$$|      - '$OCRAPP_MUTEX_DIR' - FAILED to release the mutex!"
     fi
   fi
 
@@ -3020,7 +3023,25 @@ preflight_dead_queue() {
     sleep 5; _pf_w=$(( _pf_w + 5 ))
   done
   [ "$_pf_w" -gt 0 ] && echo "$$| >>> [trigger-OCR] its work ended after ${_pf_w}s"
-  [ -s "$QUEUED_FILE_MOVES_LOG" ] || return 0
+  if [ ! -s "$QUEUED_FILE_MOVES_LOG" ]; then
+    # Its part-2 is done with every document it was handed: each staged file is
+    # a COPY whose queue entry was written before it was copied, and the queue
+    # is empty. What is left in staging is what the dead run's own cleanup would
+    # have removed -- a kill -9 just never let it -- and the next hand-over
+    # collides with it (err 108, the third kill -9 test on ada). Finish that
+    # cleanup, to the Trash.
+    for _pf_d in "$TMP_PRE_INP_PATH" "$S_PATH/$COLLECT_INP_PATH"; do
+      [ -d "$_pf_d" ] || continue
+      is_watched_folder "$_pf_d" && continue
+      rm -f "$_pf_d/.DS_Store"; rmdir "$_pf_d" 2>/dev/null && continue
+      if [ -n "$c_trash" ] && [ -x "$c_trash" ] && "$c_trash" -- "$_pf_d" >/dev/null 2>&1; then
+        echo "$$| >>> [trigger-OCR] the run that is gone left its staged copies in '$_pf_d' -- its part-2 is done with them: TRASHED them, as its own cleanup would have"
+      else
+        echo "$$| >>> [trigger-OCR] the run that is gone left its staged copies in '$_pf_d', and they could NOT be trashed -- '$US reset' shows them"
+      fi
+    done
+    return 0
+  fi
   echo "$$| >>> [trigger-OCR] a run that is gone left its queue, and nothing of it is at work any more -- repairing it the way 'reset go' does:"
   _rs_go=1; _rs_n=0
   reset_stranded 2>&1 | sed "s/^/$$|  /"
@@ -4246,6 +4267,7 @@ t_reset_stable() {
 t_pf_app() { # the stand-in OCR app and the wait -- called INSIDE a subshell only
   OCRAPP_NAME="$1"; OCRAPP_TIMEOUT="$2"
 }
+t_pf_coll() { COLLECT_INP_PATH="$1"; } # as trigger-OCR has it -- INSIDE a subshell only
 
 t_preflight_repair() {
   # What a KILLed run leaves: its queue log and a staged copy of a document
@@ -4333,6 +4355,25 @@ t_preflight_repair() {
     *) t_bad "preflight: with the queue gone, it still waits for the dead run's part-2 to end" "$_pr_o // $(cat "$_pr/part.out")";;
   esac
 
+  # THE THIRD ada CASE: nothing at work, the queue empty -- its part-2 did
+  # every document -- but the dead run's staged COPIES are still there, because
+  # its cleanup never ran. The next hand-over collided with them (err 108).
+  # They go (to the Trash); the watched folder and what else is in it stay.
+  _pr_world; rm -f "$_pr/lib/files-2-move"
+  mkdir -p "$_pr/tmp/my-ocr.pre_,ocr.in_TMP-path"; cp "$_pr/filed/doc.pdf" "$_pr/tmp/my-ocr.pre_,ocr.in_TMP-path/doc2.#1.pdf"
+  printf 'not ours\n' >"$_pr/pub/someone-elses.pdf"
+  _pr_o="$(
+    t_reset_sandbox "$_pr"; t_pf_coll "my-ocr.pre_,ocr.in_TMP-path"
+    preflight_dead_queue >"$_pr/copies.out" 2>&1; echo "PF-RC=$?"
+    [ -e "$_pr/pub/my-ocr.pre_,ocr.in_TMP-path" ] || echo "HANDED-OVER-COPIES-GONE"
+    [ -e "$_pr/tmp/my-ocr.pre_,ocr.in_TMP-path" ] || echo "TMP-COPIES-GONE"
+    [ -f "$_pr/pub/someone-elses.pdf" ] && echo "WATCHED-FOLDER-KEPT"
+  )"
+  case "$_pr_o" in
+    *"PF-RC=0"*HANDED-OVER-COPIES-GONE*TMP-COPIES-GONE*WATCHED-FOLDER-KEPT*) t_ok "preflight: a dead run's staged copies, which its part-2 is done with, are trashed -- the watched folder is kept";;
+    *) t_bad "preflight: a dead run's staged copies, which its part-2 is done with, are trashed" "$_pr_o // $(cat "$_pr/copies.out")";;
+  esac
+
   # ...and 'reset' is no different: a dead trigger with a live part-2 is a
   # live run (it said "never interrupts real work" and did)
   _pr_world; rm -rf "$_pr/lib/mutex"; rm -f "$_pr/part-ended"
@@ -4361,6 +4402,18 @@ t_preflight_repair() {
     t_ok "preflight: trigger-OCR runs it right after the mutex, before any shared state and before refusing"
   else
     t_bad "preflight: trigger-OCR runs it right after the mutex, before any shared state and before refusing" "order broken in do_trigger_ocr"
+  fi
+
+  # ...and the other end of a run: its cleanup releases the mutex LAST. Released
+  # first, the next run took its turn and then lost its staging and its queue
+  # log to this cleanup's rm -Rf / rm -f.
+  # shellcheck disable=SC2016  # matching literal source text
+  if awk '/^cleanup\(\) \{/,/^\}/' "$0" \
+     | awk '/rm -Rf "\$a\/"/{s=NR} /rm -f "\$QUEUED_FILE_MOVES_LOG"/{q=NR} /rmdir "\$OCRAPP_MUTEX_DIR"/{m=NR; c++}
+            END{exit !(s && q && m && c == 1 && s < m && q < m)}'; then
+    t_ok "cleanup: the mutex is released only after the shared staging and queue log are gone"
+  else
+    t_bad "cleanup: the mutex is released only after the shared staging and queue log are gone" "order broken in cleanup()"
   fi
 }
 
