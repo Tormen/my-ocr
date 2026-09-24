@@ -1,6 +1,6 @@
 #!/bin/dash
 
-# 167 == highest used errCode
+# 176 == highest used errCode
 
 US="${0##*/}";   # get filename without path
 
@@ -14,11 +14,11 @@ NL="
 # and is authoritative at runtime -- the deployed copy needs no git and no
 # repository. The build id is a hash of this file, so it is right even unstamped.
 SCRIPT_VERSION="v1.0"
-SCRIPT_COMMIT="f8ebde3"           # rewritten by 'my-ocr stamp-version'
+SCRIPT_COMMIT="8077c4d"           # rewritten by 'my-ocr stamp-version'
 # What git said when this build was stamped: 'git describe --tags --long' --
 # <nearest tag>-<commits since it>-g<short sha>. It says whether these bytes
 # ARE that release or work on top of it, on a machine with no git.
-SCRIPT_RELEASE="v1.0-42-gf8ebde3"
+SCRIPT_RELEASE="v1.0-43-g8077c4d"
 
 WHOAMI="$(/usr/bin/whoami)"
 [ "$USER" = "$WHOAMI" ] || err 126 "USER '$USER' ? != ? '$WHOAMI' WHOAMI"
@@ -311,9 +311,9 @@ _EOCONF_
 export_config_check() {
   _ec_src="config: ${CONFIG_FILE:-none, built-in default}"
   case "$OCRAPP_MRC" in 0|1) ;; *) err 160 "OCRAPP_MRC='$OCRAPP_MRC' -- must be 0 or 1 ($_ec_src)" ;; esac
-  case "$OCRAPP_SPLIT_FACING_PAGES" in 0|1) ;; *) err 160 "OCRAPP_SPLIT_FACING_PAGES='$OCRAPP_SPLIT_FACING_PAGES' -- must be 0 or 1 ($_ec_src)" ;; esac
+  case "$OCRAPP_SPLIT_FACING_PAGES" in 0|1) ;; *) err 172 "OCRAPP_SPLIT_FACING_PAGES='$OCRAPP_SPLIT_FACING_PAGES' -- must be 0 or 1 ($_ec_src)" ;; esac
   case "$OCRAPP_IMAGE_QUALITY_MRC" in 0|1|2) ;; *) err 161 "OCRAPP_IMAGE_QUALITY_MRC='$OCRAPP_IMAGE_QUALITY_MRC' -- must be 0 (Low), 1 (Balanced) or 2 (High); 3 makes FineReader abort ($_ec_src)" ;; esac
-  case "$OCRAPP_IMAGE_QUALITY_NO_MRC" in 0|1|2) ;; *) err 161 "OCRAPP_IMAGE_QUALITY_NO_MRC='$OCRAPP_IMAGE_QUALITY_NO_MRC' -- must be 0 (Low), 1 (Balanced) or 2 (High); 3 makes FineReader abort ($_ec_src)" ;; esac
+  case "$OCRAPP_IMAGE_QUALITY_NO_MRC" in 0|1|2) ;; *) err 173 "OCRAPP_IMAGE_QUALITY_NO_MRC='$OCRAPP_IMAGE_QUALITY_NO_MRC' -- must be 0 (Low), 1 (Balanced) or 2 (High); 3 makes FineReader abort ($_ec_src)" ;; esac
 }
 
 # The quality in force, and which key it came from -- printed side by side, so
@@ -1096,7 +1096,7 @@ $(cat "$OCRAPP_LOCKFILE"|sed -e "s/.*/${PFX}   > '&'/")"
       t="/tmp/${US}.$$.OCRAPP_LOCKFILE"; cp "$OCRAPP_LOCKFILE" "$t";
       err 088 "Failed [$?] to find the file /we/ in $WHAT got from stdin in the OCRAPP_LOCKFILE:${NL}${NL}      sed -n \"\\|	_OK_	$fp\$|p\" \"$t\"${NL}Should not happen.${NL}${NL}We copied the OCRAPP_LOCKFILE to \"$t\" for you to investigate.${NL}"
     fi
-    #awk -v XX="$fp" 'BEGIN{FS="\t";FOUND=0;}{if ($3 == XX) { FOUND=1; exit 0;};}END{if (FOUND) exit 0; else exit 1;}' "$OCRAPP_LOCKFILE" || err 0088 "Failed [$?] to find the file /we/ in $WHAT got from stdin in the OCRAPP_LOCKFILE:${NL}${NL}      awk -v XX=\"$fp\" 'BEGIN{FS=\"\\t\";FOUND=0;}{if (\$3 == XX) { FOUND=1; exit 0;};}END{if (FOUND) exit 0; else exit 1;}' OCRAPP_LOCKFILE${NL}Should not happen.${NL}${NL}OCRAPP_LOCKFILE='$OCRAPP_LOCKFILE'${NL}$(cat "$OCRAPP_LOCKFILE")${NL}"
+    #awk -v XX="$fp" 'BEGIN{FS="\t";FOUND=0;}{if ($3 == XX) { FOUND=1; exit 0;};}END{if (FOUND) exit 0; else exit 1;}' "$OCRAPP_LOCKFILE" || err 174 "Failed [$?] to find the file /we/ in $WHAT got from stdin in the OCRAPP_LOCKFILE:${NL}${NL}      awk -v XX=\"$fp\" 'BEGIN{FS=\"\\t\";FOUND=0;}{if (\$3 == XX) { FOUND=1; exit 0;};}END{if (FOUND) exit 0; else exit 1;}' OCRAPP_LOCKFILE${NL}Should not happen.${NL}${NL}OCRAPP_LOCKFILE='$OCRAPP_LOCKFILE'${NL}$(cat "$OCRAPP_LOCKFILE")${NL}"
     sed -i "" -e "\|	_OK_	$fp$|d" "$OCRAPP_LOCKFILE" || err 013 "Failed [$?] to run remove line ending with fp '$fp' (file /we/ in $WHAT got from stdin) from OCRAPP_LOCKFILE:${NL}${NL}     sed -i \"\" -e \"\\|	_OK_	$fp$|d\" \"$OCRAPP_LOCKFILE\"${NL}Should not happen.${NL}${NL}OCRAPP_LOCKFILE='$OCRAPP_LOCKFILE'${NL}$(cat "$OCRAPP_LOCKFILE")${NL}"
   done <<_EOF_
 $(cat "$PROVIDED_FILES_FILELIST")
@@ -1260,7 +1260,7 @@ looked at, and probably scanned again." >/dev/null 2>&1
       if [ "$orig_fp" = "$result_fp" ]; then # ... we trash BEFORE we move (in order to make place for the move)!
         # TRASH does NOT work on NETWORK SHARES !
         #[ $DBG ] && echo "${PFX}   --> \"$c_trash\" -- \"$orig_fp\"(==orig_fp)"
-        #"$c_trash" -- "$orig_fp" || err 033 "FAILED to \"$c_trash\" -- \"$orig_fp\""
+        #"$c_trash" -- "$orig_fp" || err 175 "FAILED to \"$c_trash\" -- \"$orig_fp\""
 
         [ $DBG ] && echo "${PFX}   --> \"/bin/mv\" -- \"$orig_fp\"(==orig_fp) $TRASH_DIR/"
         trash_by_mv "$orig_fp" || err 033 "FAILED to move \"$orig_fp\" into the Trash: $_tm_err"
@@ -1279,7 +1279,7 @@ looked at, and probably scanned again." >/dev/null 2>&1
 
       if [ "$orig_fp" != "$result_fp" ]; then # ... if they did NOT match, then we trash NOW as we already did move the OCRed file in place!
         #[ $DBG ] && echo "${PFX}   --> \"$c_trash\" -- \"$orig_fp\"(==orig_fp)"
-        #"$c_trash" -- "$orig_fp" || err 079 "FAILED to \"$c_trash\" -- \"$orig_fp\""
+        #"$c_trash" -- "$orig_fp" || err 176 "FAILED to \"$c_trash\" -- \"$orig_fp\""
 
         [ $DBG ] && echo "${PFX}   --> \"/bin/mv\" -- \"$orig_fp\"(==orig_fp) ~/.Trash/"
         "/bin/mv" -- "$orig_fp" ~/.Trash/ || err 079 "FAILED to \"/bin/mv\" -- \"$orig_fp\" ~/.Trash/"
@@ -1337,7 +1337,7 @@ $(cat "$PROVIDED_FILES_FILELIST"|sed -e "s/.*/${PFX}   > '&'/")"
     always) open -R "$last_file" || err 028 "Failed to reveal '$last_file' in Finder"
             echo "$$| >>> [part-2] ${x}Revealed '$last_file' in Finder.";;
     *)      if [ -e "$INTERACTIVE_FLAGFILE" ]; then
-              open -R "$last_file" || err 028 "Failed to reveal '$last_file' in Finder"
+              open -R "$last_file" || err 168 "Failed to reveal '$last_file' in Finder"
               echo "$$| >>> [part-2] ${x}Revealed '$last_file' in Finder."
             else
               echo "$$| >>> [part-2] ${x}Not revealing '$last_file': no terminal started this run."
@@ -2167,6 +2167,22 @@ t_shebang() {
 t_dash_syntax() {
   if /bin/dash -n "$0" 2>/dev/null; then t_ok "parses as dash (dash -n)"
   else t_bad "parses as dash (dash -n)" "$(/bin/dash -n "$0" 2>&1 | head -1)"; fi
+}
+
+# The code of an error names ONE source line: grep it, land on it. Two lines
+# sharing a code (028, 106, 138, 160 and 161 did) send the reader to the wrong
+# one. Commented-out calls count too, so a revived line collides with nothing.
+t_err_codes_unique() {
+  grep -noE '\berr 0*[0-9]{3,5}( "|$)' "$0" | awk -F: '
+    { split($2, a, " "); c = a[2] + 0; n[c]++; l[c] = l[c] " " $1; if (c > max) max = c }
+    END { for (c in n) if (n[c] > 1) print "SHARED " c " at lines" l[c]; print "MAX " max }' > "$T_TMP/errcodes"
+  _eu_hdr="$(sed -n 's/^# \([0-9]*\) == highest used errCode$/\1/p' "$0")"
+  _eu_max="$(sed -n 's/^MAX //p' "$T_TMP/errcodes")"
+  if grep -q '^SHARED ' "$T_TMP/errcodes"; then
+    t_bad "error codes: each names one source line" "$(grep '^SHARED ' "$T_TMP/errcodes")"
+  else t_ok "error codes: each names one source line"; fi
+  if [ "$_eu_hdr" = "$_eu_max" ]; then t_ok "error codes: the header names the highest one ($_eu_max)"
+  else t_bad "error codes: the header names the highest one" "header '$_eu_hdr', highest '$_eu_max'"; fi
 }
 
 # --- REGRESSION: '--file' used $(( )) (arithmetic) instead of $( ), which is a
@@ -3430,7 +3446,7 @@ _EOPY_
     || { err 138 "'$_sw_doc' is not a valid plist."; return 1; }
   _sw_n="$(/usr/bin/plutil -extract actions raw -o - "$_sw_doc" 2>/dev/null)"
   if [ "$_sw_n" != "3" ]; then
-    err 138 "'$_sw_doc' has $_sw_n step(s), expected 3."
+    err 171 "'$_sw_doc' has $_sw_n step(s), expected 3."
     return 1
   fi
   echo "    > wrote a ${_sw_n}-step workflow, plist lints clean [0]"
@@ -5147,6 +5163,7 @@ do_run_tests() {
   echo "$US --run-tests   ($(head -1 "$0"))"
   T_TMP="$(mktemp -d /tmp/my-ocr.tests.XXXXXX)" || { echo "mktemp failed"; return 1; }
   t_shebang
+  t_err_codes_unique
   t_dash_syntax
   t_file_option
   t_cleanup_pattern_interpreter_agnostic
@@ -5344,8 +5361,8 @@ esac
 
 [ $DBG ] && { t="$DBG_GOTTEN_FILES_FILELIST$WHAT"; if [ -s "$t" ]; then printf "">"$t" || err 101 "FAILED [$?] to empty file '$t' (USER='$WHOAMI')"; fi; }
 
-#[ -d "$TMP_PRE_INP_PATH" ] && err 107 "TMP_PATH '$TMP_PRE_INP_PATH' (TMP_PRE_INP_PATH) already exists. Should not be." # why not.. ? ;)
-mkdir -p "$TMP_PRE_INP_PATH" || err 106 "FAILED [$?] creating TMP_PRE_INP_PATH '$TMP_PRE_INP_PATH' (mkdir -p). Should not be."
+#[ -d "$TMP_PRE_INP_PATH" ] && err 170 "TMP_PATH '$TMP_PRE_INP_PATH' (TMP_PRE_INP_PATH) already exists. Should not be." # why not.. ? ;)
+mkdir -p "$TMP_PRE_INP_PATH" || err 169 "FAILED [$?] creating TMP_PRE_INP_PATH '$TMP_PRE_INP_PATH' (mkdir -p). Should not be."
 TMP_PRE_INP_PATH_REALPATH=$("$c_realpath" "$TMP_PRE_INP_PATH") || err 109
 COLLECT_INP_PATH="${TMP_PRE_INP_PATH_REALPATH##*/}"
 [ -z "$COLLECT_INP_PATH" ] && err 110 "TMP_PRE_INP_PATH='$TMP_PRE_INP_PATH' --> realpath=='$TMP_PRE_INP_PATH_REALPATH', last_part_of_realpath='$lCOLLECT_INP_PATH'. Should not be."
