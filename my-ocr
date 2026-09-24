@@ -14,11 +14,11 @@ NL="
 # and is authoritative at runtime -- the deployed copy needs no git and no
 # repository. The build id is a hash of this file, so it is right even unstamped.
 SCRIPT_VERSION="v1.0"
-SCRIPT_COMMIT="c68b9d2"           # rewritten by 'my-ocr stamp-version'
+SCRIPT_COMMIT="650f30b"           # rewritten by 'my-ocr stamp-version'
 # What git said when this build was stamped: 'git describe --tags --long' --
 # <nearest tag>-<commits since it>-g<short sha>. It says whether these bytes
 # ARE that release or work on top of it, on a machine with no git.
-SCRIPT_RELEASE="v1.0-36-gc68b9d2"
+SCRIPT_RELEASE="v1.0-37-g650f30b"
 
 WHOAMI="$(/usr/bin/whoami)"
 [ "$USER" = "$WHOAMI" ] || err 126 "USER '$USER' ? != ? '$WHOAMI' WHOAMI"
@@ -72,6 +72,11 @@ FILELIST_CNT=0; # number of files in the FILELIST
   # OCR app that is not installed: the failure would otherwise only surface on
   # the first real scan, long after setup said it was fine.
   OCRAPP_PATH="/Applications/$OCRAPP_NAME.app"
+  # The macOS process that turns "a file appeared in the watched folder" into a
+  # workflow run, and how long to wait for launchd to bring up a new one after
+  # it had to be restarted.
+  FA_DISPATCHER_NAME="FolderActionsDispatcher"
+  FA_RESTART_WAIT=10
   # Its preferences domain: trigger-OCR turns window restore off there, so a
   # crash cannot leave a "reopen its windows?" dialog blocking the next run.
   OCRAPP_BUNDLE_ID="com.abbyy.FineReaderPro"
@@ -1523,6 +1528,36 @@ ocrapp_reap_helpers() {
   return 0
 }
 
+# The Folder Actions dispatcher can WEDGE: alive, every attachment intact and
+# enabled, and launching nothing -- which no check of the attachments can see.
+# launchd starts a new one on demand, so ending it IS the restart. TERM first,
+# KILL only if it ignores that (the Automator runners on ada ignored TERM).
+# Leaves what it saw in _fa_ev, so the caller can print the evidence.
+fa_dispatcher_restart() {
+  _fa_old="$(pgrep -x "$FA_DISPATCHER_NAME" 2>/dev/null | head -n 1)"
+  if [ -z "$_fa_old" ]; then
+    _fa_ev="no $FA_DISPATCHER_NAME was running"
+  else
+    _fa_age="$(ps -o etime= -p "$_fa_old" 2>/dev/null | tr -d ' ')"
+    kill "$_fa_old" 2>/dev/null
+    _fa_w=0
+    while [ "$_fa_w" -lt 5 ] && kill -0 "$_fa_old" 2>/dev/null; do sleep 1; _fa_w=$(( _fa_w + 1 )); done
+    kill -0 "$_fa_old" 2>/dev/null && kill -9 "$_fa_old" 2>/dev/null
+    _fa_ev="pid $_fa_old, up ${_fa_age:-?}, ended"
+  fi
+  _fa_w=0; _fa_new=""
+  while [ "$_fa_w" -lt "${FA_RESTART_WAIT:-10}" ]; do
+    _fa_new="$(pgrep -x "$FA_DISPATCHER_NAME" 2>/dev/null | head -n 1)"
+    [ -n "$_fa_new" ] && [ "$_fa_new" != "$_fa_old" ] && break
+    _fa_new=""; sleep 1; _fa_w=$(( _fa_w + 1 ))
+  done
+  if [ -n "$_fa_new" ]; then
+    _fa_ev="$_fa_ev -> new pid $_fa_new"; return 0
+  fi
+  _fa_ev="$_fa_ev -> no new one came up in ${FA_RESTART_WAIT:-10}s"
+  return 1
+}
+
 ocrapp_clear_stale_batch() { # $1 = staging prefix (nothing outside it is ours)
   _sb_stage="$1"
   # never touch a document while the app that owns it is running
@@ -1823,7 +1858,7 @@ $(ls -la "$S_PATH"|sed -e "s/^/${PFX}     | /")"
   # conclusive -- that $OCRAPP_NAME is not running at all.
   local i=0; local stalled=0; local last_q=""; local next_alert=$STALL_ALERT_AFTER
   local _cpu_was=""; local _cpu_still=0; local _cpu_busy=""
-  local _fr_seen=""; local _nudged=""; local _tw=0
+  local _fr_seen=""; local _nudged=""; local _tw=0; local _fa_restarted=""; _fa_ev=""
   while [ -s "$QUEUED_FILE_MOVES_LOG" ]; do
 
     if [ -s "$PARTx_ERRORED_FLAGFILE" ]; then
@@ -1850,8 +1885,23 @@ $(ls -la "$S_PATH"|sed -e "s/^/${PFX}     | /")"
           else
             echo "$$| >>> [trigger-OCR] WARNING :: could not re-make the hand-over -- the documents are still in '$S_PATH/$COLLECT_INP_PATH' or '$TMP_PRE_INP_PATH'"
           fi
-        elif [ "$_tw" -ge "$OCRAPP_TRIGGER_WAIT" ] && [ -n "$_nudged" ]; then
-          m="$OCRAPP_NAME never started -- the hand-over was made twice and the folder action did not fire either time.
+        elif [ "$_tw" -ge "$OCRAPP_TRIGGER_WAIT" ] && [ -n "$_nudged" ] && [ -z "$_fa_restarted" ] \
+             && ! pgrep -f "$US --part-[12]" >/dev/null 2>&1; then
+          # Two hand-overs and nothing fired: the dispatcher itself may be
+          # WEDGED -- alive, attachments intact and enabled, launching nothing.
+          # That held ada for nine hours, and every check said healthy. Restart
+          # it ONCE (a running workflow lives in its own runner and is not
+          # touched) and hand over again.
+          _fa_restarted=1; _tw=0
+          if fa_dispatcher_restart; then
+            echo "$$| >>> [trigger-OCR] nothing fired after two hand-overs -- restarted the Folder Actions dispatcher [$_fa_ev]"
+          else
+            echo "$$| >>> [trigger-OCR] WARNING :: could not restart the Folder Actions dispatcher [$_fa_ev]"
+          fi
+          nudge_handover "$S_PATH/$COLLECT_INP_PATH" "$TMP_PRE_INP_PATH" \
+            || echo "$$| >>> [trigger-OCR] WARNING :: could not re-make the hand-over after the restart"
+        elif [ "$_tw" -ge "$OCRAPP_TRIGGER_WAIT" ] && [ -n "$_fa_restarted" ]; then
+          m="$OCRAPP_NAME never started -- two hand-overs, then a dispatcher restart and a third, and the folder action fired none of them [${_fa_ev:-no restart evidence}].
 Check that Folder Actions are enabled and that '$S_PATH' still has ours attached:  $US setup"
           alert_stuck "$m"
           err 159 "$m${NL}Still queued in '$QUEUED_FILE_MOVES_LOG':${NL}$(cat "$QUEUED_FILE_MOVES_LOG")"
@@ -3556,6 +3606,54 @@ t_open_cmd() {
   else t_bad "the 'open' line is valid shell as printed" "$_cmd"; fi
 }
 
+t_fa_restart() {
+  # LIVE, with a stand-in for the dispatcher: a renamed 'sleep'. The real one
+  # is never touched by the suite.
+  _fr_d="$T_TMP/fa-restart"; mkdir -p "$_fr_d"
+  _fr_n="mofad$$"; ln -s /bin/sleep "$_fr_d/$_fr_n"
+  # shellcheck disable=SC2030,SC2031  # deliberate: the subshell keeps the
+  # overrides out of the rest of the suite
+  (
+    FA_DISPATCHER_NAME="$_fr_n"; FA_RESTART_WAIT=3
+    # 1. launchd's part, played by a loop: whatever ends it, a new one comes up
+    ( while [ ! -e "$_fr_d/stop" ]; do "$_fr_d/$_fr_n" 30; done ) & _fr_sup=$!
+    sleep 1; _fr_p1="$(pgrep -x "$_fr_n" | head -n 1)"
+    if fa_dispatcher_restart; then echo "RC0 $_fa_ev"; else echo "RC1 $_fa_ev"; fi
+    _fr_p2="$(pgrep -x "$_fr_n" | head -n 1)"
+    [ -n "$_fr_p1" ] && [ -n "$_fr_p2" ] && [ "$_fr_p1" != "$_fr_p2" ] && echo "REPLACED $_fr_p1->$_fr_p2"
+    : >"$_fr_d/stop"; pkill -x "$_fr_n"; wait "$_fr_sup" 2>/dev/null
+    # 2. nobody brings it back: the restart must SAY so, not claim success
+    "$_fr_d/$_fr_n" 30 & _fr_lone=$!
+    sleep 1
+    if fa_dispatcher_restart; then echo "LONE-RC0 $_fa_ev"; else echo "LONE-RC1 $_fa_ev"; fi
+    kill -0 "$_fr_lone" 2>/dev/null && { echo "LONE-SURVIVED"; kill -9 "$_fr_lone"; }
+  ) >"$_fr_d/out" 2>&1
+  _fr_o="$(cat "$_fr_d/out")"
+  case "$_fr_o" in
+    *"RC0 pid "*"ended -> new pid"*"REPLACED "*)
+      t_ok "dispatcher restart: the wedged one is ended and a NEW one is confirmed, with both pids";;
+    *) t_bad "dispatcher restart: the wedged one is ended and a NEW one is confirmed, with both pids" "$_fr_o";;
+  esac
+  case "$_fr_o" in
+    *"LONE-RC1 pid "*"no new one came up"*)
+      case "$_fr_o" in
+        *LONE-SURVIVED*) t_bad "dispatcher restart: when nothing comes back it says so" "the old one was not ended";;
+        *) t_ok "dispatcher restart: when nothing comes back it says so, and fails";;
+      esac;;
+    *) t_bad "dispatcher restart: when nothing comes back it says so, and fails" "$_fr_o";;
+  esac
+  # and the wait loop gives up only AFTER that restart was tried. Scoped to
+  # do_trigger_ocr(): searched file-wide, the pattern matched THIS line too and
+  # the check passed with the restart removed.
+  # shellcheck disable=SC2016  # matching literal source text
+  if awk '/^do_trigger_ocr\(\) \{/,/^\}/' "$0" \
+     | awk '/fa_dispatcher_restart; then/{r=NR} /err 159 /{e=NR} END{exit !(r && e && r < e)}'; then
+    t_ok "never-started: the dispatcher is restarted before the run gives up"
+  else
+    t_bad "never-started: the dispatcher is restarted before the run gives up" "err 159 is reachable without a restart"
+  fi
+}
+
 t_trap_term() {
   # LIVE, with the script's OWN trap line: a TERMed run must reach cleanup().
   # TERM is what kill, pkill and launchd send; without it in the list every
@@ -4541,6 +4639,7 @@ do_run_tests() {
   t_reset_log_last
   t_reset_stable
   t_trap_term
+  t_fa_restart
   t_open_cmd
   t_nudge
   t_staging_sweep
