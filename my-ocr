@@ -14,11 +14,11 @@ NL="
 # and is authoritative at runtime -- the deployed copy needs no git and no
 # repository. The build id is a hash of this file, so it is right even unstamped.
 SCRIPT_VERSION="v1.0"
-SCRIPT_COMMIT="650f30b"           # rewritten by 'my-ocr stamp-version'
+SCRIPT_COMMIT="0c91797"           # rewritten by 'my-ocr stamp-version'
 # What git said when this build was stamped: 'git describe --tags --long' --
 # <nearest tag>-<commits since it>-g<short sha>. It says whether these bytes
 # ARE that release or work on top of it, on a machine with no git.
-SCRIPT_RELEASE="v1.0-37-g650f30b"
+SCRIPT_RELEASE="v1.0-38-g0c91797"
 
 WHOAMI="$(/usr/bin/whoami)"
 [ "$USER" = "$WHOAMI" ] || err 126 "USER '$USER' ? != ? '$WHOAMI' WHOAMI"
@@ -466,6 +466,8 @@ cleanup() { local rc=$?;
     # Only clean those up if we are the MAIN process (WHAT == 'trigger-OCR'):
     for a in "$TMP_PRE_INP_PATH" "$S_PATH/$COLLECT_INP_PATH"; do
       [ -d "$a" ] || continue
+      # never the watched folder itself: an rm -Rf there takes documents with it
+      is_watched_folder "$a" && { echo "$$|      - '$a' is the WATCHED folder -- refused to remove it"; continue; }
       rm -Rf "$a/" && { [ $DBG ] && echo "$$|      - '$a' - Removed."; :; } \
                    || echo "$$|      - '$a/' - FAILED [$?] to 'rm -Rf'!" #  <<<   [ ! $DBG ]
     done
@@ -2737,6 +2739,15 @@ close_ocrapp_if_ours() {
   return 0
 }
 
+# The watched folder itself is NEVER staging, whatever a variable says. With
+# COLLECT_INP_PATH empty -- as it is in 'reset', which runs before it is set --
+# "$S_PATH/$COLLECT_INP_PATH" IS the watched folder, and reset rmdir'ed it: the
+# Folder Action was left attached to a folder that no longer existed. Every
+# removal of a staging directory asks this first.
+is_watched_folder() { # $1 = a directory about to be removed
+  [ "${1%/}" = "${S_PATH%/}" ]
+}
+
 # Drop what a crashed run left behind, before it can poison this one. Only
 # provably dead owners. Runs at the start of every trigger-OCR.
 self_heal() {
@@ -2746,7 +2757,7 @@ self_heal() {
   # Holding files, it is DOCUMENTS: never removed here, and never merged into --
   # the next hand-over would fail on it (err 108). 'reset' puts those files
   # where they can be retried, and only then is the directory empty.
-  if [ -d "$S_PATH/$COLLECT_INP_PATH" ]; then
+  if [ -d "$S_PATH/$COLLECT_INP_PATH" ] && ! is_watched_folder "$S_PATH/$COLLECT_INP_PATH"; then
     if rmdir "$S_PATH/$COLLECT_INP_PATH" 2>/dev/null; then
       _sh_n=$(( _sh_n + 1 ))
     else
@@ -2894,8 +2905,14 @@ do_reset() {
   # re-create the directory to find out, which changed its owner, mode and
   # mtime, and would have deleted it had the mkdir failed. A Finder .DS_Store
   # is not content.
-  for _rs_sd in "$S_PATH/$COLLECT_INP_PATH" "$TMP_PRE_INP_PATH"; do
+  # reset runs BEFORE COLLECT_INP_PATH is set, so the staging name is derived
+  # here the way the main path derives it: from TMP_PRE_INP_PATH's basename.
+  # And the watched folder itself is refused outright -- with the name empty,
+  # this loop rmdir'ed ~/Public/,ocr.in and left the Folder Action on nothing.
+  _rs_coll="${COLLECT_INP_PATH:-${TMP_PRE_INP_PATH##*/}}"
+  for _rs_sd in "$S_PATH/$_rs_coll" "$TMP_PRE_INP_PATH"; do
     [ -d "$_rs_sd" ] || continue
+    is_watched_folder "$_rs_sd" && continue
     _rs_e=1                          # empty until something real is found
     for _rs_x in "$_rs_sd"/* "$_rs_sd"/.[!.]* "$_rs_sd"/..?*; do
       [ -e "$_rs_x" ] || continue    # an unmatched glob stays literal
@@ -3682,7 +3699,7 @@ t_reset_sandbox() { # $1 = sandbox root
   PARTx_ERRORED_FLAGFILE="$1/lib/f1"; DBG_FLAGFILE="$1/lib/f2"
   FORCE_FLAGFILE="$1/lib/f3"; INTERACTIVE_FLAGFILE="$1/lib/f4"
   QUEUED_FILE_MOVES_LOG="$1/lib/files-2-move"; c_trash="$1/bin/trash"
-  S_PATH="$1/pub"; COLLECT_INP_PATH="stage"; TMP_PRE_INP_PATH="$1/tmp-stage"
+  S_PATH="$1/pub"; COLLECT_INP_PATH=""; TMP_PRE_INP_PATH="$1/tmp/my-ocr.pre_,ocr.in_TMP-path"
   T_PATH="$1/out"; RESET_RETRY_TO="$1/retry"
 }
 
@@ -3693,32 +3710,40 @@ t_reset_stable() {
   #   dry  -- must change NOTHING (it used to rmdir + mkdir to test emptiness)
   #   go   -- trashes the copy AND removes the staging dir it emptied
   #   dry  -- must find NOTHING left: a reset that is not stable is not done
-  _rz="$T_TMP/reset-stable"; mkdir -p "$_rz/bin" "$_rz/pub/stage" "$_rz/filed" "$_rz/lib"
+  _rz="$T_TMP/reset-stable"; mkdir -p "$_rz/bin" "$_rz/pub/my-ocr.pre_,ocr.in_TMP-path" "$_rz/filed" "$_rz/lib"
   printf '#!/bin/dash\nshift 2>/dev/null\nrm -rf "$@"\n' >"$_rz/bin/trash"; chmod +x "$_rz/bin/trash"
   printf 'the document\n' >"$_rz/filed/doc.pdf"
-  cp "$_rz/filed/doc.pdf" "$_rz/pub/stage/doc.#1.pdf"
-  : >"$_rz/pub/stage/.DS_Store"
-  printf '%s\t%s\t%s\t%s\n' "$_rz/orig/doc.pdf" "$_rz/pub/stage/doc.#1.pdf" \
+  cp "$_rz/filed/doc.pdf" "$_rz/pub/my-ocr.pre_,ocr.in_TMP-path/doc.#1.pdf"
+  : >"$_rz/pub/my-ocr.pre_,ocr.in_TMP-path/.DS_Store"
+  printf '%s\t%s\t%s\t%s\n' "$_rz/orig/doc.pdf" "$_rz/pub/my-ocr.pre_,ocr.in_TMP-path/doc.#1.pdf" \
          "$_rz/out/doc.#1.pdf" "$_rz/filed/doc.pdf" >"$_rz/lib/files-2-move"
   # every path reset touches, pointed into the sandbox -- called INSIDE the
   # subshell below, which is what keeps the overrides out of the rest of the suite
   (
     t_reset_sandbox "$_rz"
-    _i1="$(ls -di "$_rz/pub/stage" 2>/dev/null)"
+    _i1="$(ls -di "$_rz/pub/my-ocr.pre_,ocr.in_TMP-path" 2>/dev/null)"
     do_reset >"$_rz/r1" 2>&1
-    _i2="$(ls -di "$_rz/pub/stage" 2>/dev/null)"
-    [ "$_i1" = "$_i2" ] && [ -f "$_rz/pub/stage/doc.#1.pdf" ] && echo DRY-UNTOUCHED
+    _i2="$(ls -di "$_rz/pub/my-ocr.pre_,ocr.in_TMP-path" 2>/dev/null)"
+    [ "$_i1" = "$_i2" ] && [ -f "$_rz/pub/my-ocr.pre_,ocr.in_TMP-path/doc.#1.pdf" ] && echo DRY-UNTOUCHED
     do_reset go >"$_rz/r2" 2>&1
-    [ -d "$_rz/pub/stage" ] || echo STAGE-GONE
+    [ -d "$_rz/pub/my-ocr.pre_,ocr.in_TMP-path" ] || echo STAGE-GONE
     [ -f "$_rz/filed/doc.pdf" ] && echo DOC-KEPT
     do_reset >"$_rz/r3" 2>&1
     # a TRULY empty staging dir is where the old dry run did rmdir + mkdir;
     # with a document or a .DS_Store in it, that branch never ran at all
-    mkdir -p "$_rz/pub/stage"
-    _i3="$(ls -di "$_rz/pub/stage" 2>/dev/null)"
+    mkdir -p "$_rz/pub/my-ocr.pre_,ocr.in_TMP-path"
+    _i3="$(ls -di "$_rz/pub/my-ocr.pre_,ocr.in_TMP-path" 2>/dev/null)"
     do_reset >"$_rz/r4" 2>&1
-    _i4="$(ls -di "$_rz/pub/stage" 2>/dev/null)"
+    _i4="$(ls -di "$_rz/pub/my-ocr.pre_,ocr.in_TMP-path" 2>/dev/null)"
     [ "$_i3" = "$_i4" ] && grep -q "WOULD REMOVE the now-empty staging dir" "$_rz/r4" && echo EMPTY-DRY-UNTOUCHED
+    # THE ada CASE: the watched folder EMPTY, and COLLECT_INP_PATH empty as it
+    # really is in reset -- 'reset go' rmdir'ed the watched folder itself here
+    rm -rf "$_rz/pub/my-ocr.pre_,ocr.in_TMP-path"
+    do_reset go >"$_rz/r5" 2>&1
+    [ -d "$_rz/pub" ] && echo WATCHED-KEPT
+    # and self_heal, which runs at every trigger-OCR, with the same empty name
+    self_heal >/dev/null 2>&1
+    [ -d "$_rz/pub" ] && echo WATCHED-KEPT-BY-SELF-HEAL
   ) >"$_rz/out.txt" 2>&1
   _rz_o="$(cat "$_rz/out.txt")"
   case "$_rz_o" in
@@ -3735,6 +3760,15 @@ t_reset_stable() {
   else
     t_ok "reset go: no 'retry them with' when nothing went to retry"
   fi
+  case "$_rz_o" in
+    *WATCHED-KEPT*) t_ok "reset go: the WATCHED folder itself is never removed, even empty, even with COLLECT_INP_PATH empty";;
+    *) t_bad "reset go: the WATCHED folder itself is never removed, even empty, even with COLLECT_INP_PATH empty" \
+             "$(grep -i staging "$_rz/r5")";;
+  esac
+  case "$_rz_o" in
+    *WATCHED-KEPT-BY-SELF-HEAL*) t_ok "self_heal: the WATCHED folder itself is never removed";;
+    *) t_bad "self_heal: the WATCHED folder itself is never removed" "the watched folder is gone";;
+  esac
   case "$_rz_o" in
     *EMPTY-DRY-UNTOUCHED*) t_ok "reset: a DRY run reports an EMPTY staging dir without touching it (same inode)";;
     *) t_bad "reset: a DRY run reports an EMPTY staging dir without touching it (same inode)" \
