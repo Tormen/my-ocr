@@ -62,6 +62,37 @@ my-ocr --test-mail          one test alert (notification + mail) the STUCK way
 document: anything stranded mid-flight is *moved* to `RESET_RETRY_TO` and the
 command to retry it is printed. It refuses while a run is live.
 
+## Configuration
+
+`my-ocr --create-config` prints the default config; `--create-config <FILE>`
+writes it (never over an existing file). The first found of `$MY_OCR_CONFIG`,
+`--config <FILE>`, `/LINKS/default/my-ocr.conf`, `/LINKS/default/my-ocr`,
+`~/.my-ocr.conf`, `/etc/my-ocr.conf`, `/usr/local/etc/my-ocr.conf` is read. For
+now the file is optional: whatever it does not set keeps the built-in default.
+
+| key | default | meaning |
+|---|---|---|
+| `OCRAPP_MRC` | `0` | "Compress images using MRC" |
+| `OCRAPP_IMAGE_QUALITY_MRC` | `2` | image quality when MRC is on: 0 Low, 1 Balanced, 2 High |
+| `OCRAPP_IMAGE_QUALITY_NO_MRC` | `1` | image quality when MRC is off |
+| `OCRAPP_SPLIT_FACING_PAGES` | `0` | the OCR application's "Split facing pages" |
+
+The first three are the two export controls of the Automator step; the quality
+follows the MRC switch, so each mode carries its own. They are written into the
+workflow by `setup go` -- nothing changes them at run time -- and `status` reads
+them back out of the installed workflow and reports a MISMATCH when the config
+has changed since. A quality other than 0, 1 or 2 is refused: the Automator step
+offers only those three, and 3 makes the OCR application abort.
+
+MRC is off by default because, measured on ten real scans, it redrew the text as
+a 1-bit mask (visibly fuzzier), erased a QR code, and made the files larger; the
+recognised text is the same either way.
+
+"Split facing pages" is off because a document feeder delivers single sheets, so
+every split is a false positive. It is an application preference, so it is set
+at the start of every run (while the application is not running) and reported
+when it had to be changed.
+
 ## Checking the result before it replaces the original
 
 The result replaces the original in place, and the original goes to the Trash a
@@ -69,8 +100,9 @@ moment earlier -- so an unchecked bad result is a lost document. Before that
 happens my-ocr requires all of:
 
 - it parses as a PDF
-- its page count is **not lower** than the input's. More is fine: the OCR
-  application splits a sheet it believes holds several pages.
+- its page count is **not lower** than the input's. More is fine: with
+  "Split facing pages" on, the OCR application cuts a sheet it believes holds
+  two pages in two.
 - its Producer names the OCR application -- proof the result is really its
   output and not a passthrough or a stale file from an earlier run
 - `qpdf --check` passes. qpdf walks every object and stream; `pdfinfo` reads
@@ -103,9 +135,10 @@ anything you set.
 If the input was a JPEG, PNG or TIFF there is no PDF original to tag, so the
 OCR application's PDF is kept instead, as it always was.
 
-Deliberately NOT checked: file size, because MRC compression is on and a much
-smaller result is the healthy outcome; and image counts, because MRC splits one
-scan image into mask/foreground/background layers.
+Deliberately NOT checked: file size, which legitimately moves either way with
+the export settings (with MRC a much smaller result is the healthy outcome); and
+image counts, because MRC splits one scan image into mask/foreground/background
+layers.
 
 **A refusal is a clean rollback:** the bad result is trashed, the ORIGINAL is
 kept and moved to `--move-failed-to`, and you are notified with the reason and

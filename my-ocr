@@ -1,6 +1,6 @@
 #!/bin/dash
 
-# 157 == highest used errCode
+# 167 == highest used errCode
 
 US="${0##*/}";   # get filename without path
 
@@ -14,11 +14,11 @@ NL="
 # and is authoritative at runtime -- the deployed copy needs no git and no
 # repository. The build id is a hash of this file, so it is right even unstamped.
 SCRIPT_VERSION="v1.0"
-SCRIPT_COMMIT="0c91797"           # rewritten by 'my-ocr stamp-version'
+SCRIPT_COMMIT="e2cc8d6"           # rewritten by 'my-ocr stamp-version'
 # What git said when this build was stamped: 'git describe --tags --long' --
 # <nearest tag>-<commits since it>-g<short sha>. It says whether these bytes
 # ARE that release or work on top of it, on a machine with no git.
-SCRIPT_RELEASE="v1.0-38-g0c91797"
+SCRIPT_RELEASE="v1.0-39-ge2cc8d6"
 
 WHOAMI="$(/usr/bin/whoami)"
 [ "$USER" = "$WHOAMI" ] || err 126 "USER '$USER' ? != ? '$WHOAMI' WHOAMI"
@@ -236,7 +236,107 @@ FILELIST_CNT=0; # number of files in the FILELIST
   OCRAPP_TRIGGER_WAIT=60;     # (seconds) no OCR app after hand-over -> re-trigger
   STUCK_MARKER_DIR="/Users/$WHOAMI/Desktop"   # where the marker file lands
 
+  # How FineReader EXPORTS the PDF -- the two controls of the Automator step,
+  # "Compress images using MRC" and "Image quality". Written into the workflow
+  # by 'setup go'; nothing changes them at run time. The quality follows the
+  # MRC switch, so each mode carries the quality that suits it. Defaults and
+  # the reasons are in default_config_content(); the values below MUST equal
+  # it, and the suite checks that they do.
+  OCRAPP_MRC=0
+  OCRAPP_IMAGE_QUALITY_MRC=2
+  OCRAPP_IMAGE_QUALITY_NO_MRC=1
+  # FineReader's own "Split facing pages" -- enforced at every run
+  OCRAPP_SPLIT_FACING_PAGES=0
+
 ##############################################################
+
+##############################################################
+#### CONFIG FILE
+#
+# Step one of two: the file is OPTIONAL and holds only what has been moved into
+# it so far; everything else still has its default in the block above, and a
+# config may override any of those too. It becomes required once every default
+# lives in default_config_content() -- until then, a host with no config (ada
+# had none) keeps working exactly as before.
+
+# The ONE list the search walks and every message about the search names, so the
+# two cannot drift apart. $<NAME>_CONFIG and --config come before it.
+config_search_paths() {
+  printf '%s\n' "${LINKS:-/LINKS}/default/${US%.*}.conf" "${LINKS:-/LINKS}/default/${US%.*}" \
+                "$HOME/.${US%.*}.conf" "/etc/${US%.*}.conf" "/usr/local/etc/${US%.*}.conf"
+}
+
+default_config_content() {
+  cat <<'_EOCONF_'
+# my-ocr configuration -- plain shell, sourced at start-up.
+#
+# Searched in this order, first found wins:
+#   $MY_OCR_CONFIG, --config <FILE>, /LINKS/default/my-ocr.conf,
+#   /LINKS/default/my-ocr, ~/.my-ocr.conf, /etc/my-ocr.conf,
+#   /usr/local/etc/my-ocr.conf
+# Anything not set here keeps the default built into my-ocr.
+
+# ---- how FineReader EXPORTS the PDF --------------------------------------
+# The two controls of the Automator step "Convert to PDF Document":
+# "Compress images using MRC" and "Image quality". 'my-ocr setup go' writes
+# them into the workflow; nothing changes them at run time, so after editing
+# these, run 'my-ocr setup go' again ('my-ocr status' says when it is due).
+#
+# Measured on ten real scans: MRC redraws the text as a 1-bit mask -- visibly
+# fuzzier -- erased a QR code outright, and made the files ~10% LARGER. The
+# recognised text is the same either way. So MRC is off by default.
+#   0 = off, 1 = on
+OCRAPP_MRC=0
+
+# Image quality, per MRC mode -- the quality follows the switch, so each mode
+# carries the one that suits it. 0 = Low, 1 = Balanced, 2 = High.
+# There is no 3: the Automator step offers only these three, and 3 makes
+# FineReader abort. setup refuses anything else, naming the key.
+OCRAPP_IMAGE_QUALITY_MRC=2        # with MRC, Low and Balanced looked worse still
+OCRAPP_IMAGE_QUALITY_NO_MRC=1     # Balanced kept the scan's own resolution
+
+# ---- FineReader's own preferences, enforced at every run ------------------
+# "Split facing pages": FineReader cuts what it takes for a two-page spread in
+# two. The scanner feeds single sheets, so every split is a false positive --
+# 3 of 10 test documents came back with extra half-pages.
+#   0 = off, 1 = on
+OCRAPP_SPLIT_FACING_PAGES=0
+_EOCONF_
+}
+
+# Refuse a value FineReader cannot take BEFORE it is written into a workflow:
+# a quality of 3 does not merely look wrong, it aborts the app. Both quality
+# keys are checked whichever mode is on, so a bad one cannot sit there waiting
+# for the day someone flips the switch.
+export_config_check() {
+  _ec_src="config: ${CONFIG_FILE:-none, built-in default}"
+  case "$OCRAPP_MRC" in 0|1) ;; *) err 160 "OCRAPP_MRC='$OCRAPP_MRC' -- must be 0 or 1 ($_ec_src)" ;; esac
+  case "$OCRAPP_SPLIT_FACING_PAGES" in 0|1) ;; *) err 160 "OCRAPP_SPLIT_FACING_PAGES='$OCRAPP_SPLIT_FACING_PAGES' -- must be 0 or 1 ($_ec_src)" ;; esac
+  case "$OCRAPP_IMAGE_QUALITY_MRC" in 0|1|2) ;; *) err 161 "OCRAPP_IMAGE_QUALITY_MRC='$OCRAPP_IMAGE_QUALITY_MRC' -- must be 0 (Low), 1 (Balanced) or 2 (High); 3 makes FineReader abort ($_ec_src)" ;; esac
+  case "$OCRAPP_IMAGE_QUALITY_NO_MRC" in 0|1|2) ;; *) err 161 "OCRAPP_IMAGE_QUALITY_NO_MRC='$OCRAPP_IMAGE_QUALITY_NO_MRC' -- must be 0 (Low), 1 (Balanced) or 2 (High); 3 makes FineReader abort ($_ec_src)" ;; esac
+}
+
+# The quality in force, and which key it came from -- printed side by side, so
+# 'quality 1' can always be traced to the line that asked for it.
+export_quality() { # sets EXPORT_Q (the value) and EXPORT_QK (the key it came from)
+  if [ "$OCRAPP_MRC" = "1" ]; then EXPORT_Q="$OCRAPP_IMAGE_QUALITY_MRC"; EXPORT_QK="OCRAPP_IMAGE_QUALITY_MRC"
+  else EXPORT_Q="$OCRAPP_IMAGE_QUALITY_NO_MRC"; EXPORT_QK="OCRAPP_IMAGE_QUALITY_NO_MRC"; fi
+}
+
+quality_name() { case "$1" in 0) echo Low;; 1) echo Balanced;; 2) echo High;; *) echo "?";; esac; }
+
+# What an installed workflow actually tells FineReader: "<mrc> <quality>", or
+# nothing. MRC is a BOOLEAN when setup wrote it and an INTEGER in the hand-built
+# workflow it replaced; plutil prints them as true/false and 1/0, and reading
+# digits only made a freshly set-up workflow look like no workflow at all.
+# Only a VALUE counts: each key also appears once more in the action's list of
+# parameter properties, as '=> {}', and matching that wiped the value it follows.
+workflow_export_values() { # $1 = document.wflow
+  /usr/bin/plutil -p "$1" 2>/dev/null | awk '
+    /"exportPdfUseMRC" => (true|false|0|1)$/ { m = ($3 == "true" || $3 == "1") ? 1 : 0 }
+    /"exportPdfImageQuality" => [0-9]+$/     { q = $3 }
+    END { if (m != "" && q != "") print m, q }'
+}
 
 usage() {
   echo "usage: $0 [<FLAGS>] [--part-1|--part-2] [--] [FILES-TO-OCR]
@@ -263,6 +363,17 @@ a file called '--part-1' ;))
 --move-failed-to <DIR>
                  Quarantine files that could NOT be OCRed into <DIR>.
                  Default (\$MOVE_FAILED_TO empty): leave them where they are.
+--config <FILE>  Use this config. Otherwise the first found of: \$MY_OCR_CONFIG,
+                 $(config_search_paths | tr '\n' ' ')
+                 None found: the built-in defaults (the file is optional for now).
+--create-config [<FILE>]
+                 Print the default config, or write it to <FILE> (never over an
+                 existing one). It holds, among others:
+                   OCRAPP_MRC                   0/1  \"Compress images using MRC\"  (default 0)
+                   OCRAPP_IMAGE_QUALITY_MRC     0 Low, 1 Balanced, 2 High, with MRC (2)
+                   OCRAPP_IMAGE_QUALITY_NO_MRC  the same, without MRC            (1)
+                   OCRAPP_SPLIT_FACING_PAGES    0/1  FineReader's \"Split facing pages\" (0)
+                 The first three take effect with 'setup go'; the last at every run.
 --version        Print version, the commit this file came from, and a build id
                  taken from the file's own bytes -- so two copies that differ
                  can never report the same string.
@@ -1409,6 +1520,26 @@ ocrapp_no_window_restore() {  # <defaults domain>
   echo "$$| >>> [trigger-OCR] $OCRAPP_NAME: window restore off (was: $_nw_was)"
 }
 
+# FineReader's "Split facing pages" (ImportSplitFacingPages), set to what the
+# config says -- the Automator step has no control for it and inherits the
+# app's preference. Enforced at EVERY run, so a change made in FineReader's own
+# preferences is put back, and said so. Only while FineReader is NOT running: a
+# running app writes its own value back when it quits, and reads it at launch.
+ocrapp_split_facing_pages() {  # <defaults domain>
+  case "$OCRAPP_SPLIT_FACING_PAGES" in 0) _sf_want=0;; 1) _sf_want=1;; *) export_config_check;; esac
+  _sf_was="$(/usr/bin/defaults read "$1" ImportSplitFacingPages 2>/dev/null)" || _sf_was="unset"
+  [ "$_sf_was" = "$_sf_want" ] && return 0
+  if pgrep -x "$OCRAPP_NAME" >/dev/null 2>&1; then
+    echo "$$| >>> [trigger-OCR] $OCRAPP_NAME is running -- split facing pages stays '$_sf_was' this run (config wants $_sf_want)"
+    return 0
+  fi
+  [ "$_sf_want" = "1" ] && _sf_b=YES || _sf_b=NO
+  /usr/bin/defaults write "$1" ImportSplitFacingPages -bool "$_sf_b" \
+    || err 167 "defaults write '$1' ImportSplitFacingPages -bool $_sf_b"
+  [ "$_sf_want" = "1" ] && _sf_s=on || _sf_s=off
+  echo "$$| >>> [trigger-OCR] $OCRAPP_NAME: split facing pages $_sf_s (was: $_sf_was) [OCRAPP_SPLIT_FACING_PAGES=$_sf_want]"
+}
+
 # The OTHER dialog. ocrapp_no_window_restore silences macOS's "reopen windows?";
 # this clears what makes FineReader ask its own "recover the Untitled document?".
 # Both block an unattended run for ever, and a kill -- including my-ocr's own
@@ -1722,6 +1853,7 @@ Should not be."
   [ $DBG ] && echo "$$|  ~~ [trigger-OCR] (1) Wrote found PID(s) to OCRAPP_STATEFILE '$OCRAPP_STATEFILE' (will be removed in step 6 in part-2)."
   echo "$$| >>> [trigger-OCR] ${x}Created '$OCRAPP_STATEFILE' [pids of '$OCRAPP_NAME': '$ocrapp_pids']"
   ocrapp_no_window_restore "$OCRAPP_BUNDLE_ID"
+  ocrapp_split_facing_pages "$OCRAPP_BUNDLE_ID"
   # Helpers of a PREVIOUS run that outlived their app: they hold no document
   # and answer to nobody, but they do take the cpu this run is about to need
   # (two of them sat at 100% for twenty minutes). Reaping only on the quit path
@@ -2296,6 +2428,32 @@ do_status() {
   else
     echo "${_st_pfx}QUEUE     empty"
   fi
+
+  # What FineReader will ACTUALLY be told, read back out of the installed
+  # workflow -- beside what the config asks for, so a config edited without a
+  # 'setup go' after it shows up here instead of being believed.
+  export_quality; _st_cq="$EXPORT_Q"; _st_ck="$EXPORT_QK"
+  _st_wf="$WORKFLOW_DIR/$WORKFLOW_NAME/Contents/document.wflow"
+  _st_iv="$(workflow_export_values "$_st_wf")"
+  if [ -z "$_st_iv" ]; then
+    echo "${_st_pfx}EXPORT    no installed workflow to read -- config wants OCRAPP_MRC=$OCRAPP_MRC $_st_ck=$_st_cq -- '$US setup go'"
+  else
+    _st_im="${_st_iv% *}"; _st_iq="${_st_iv#* }"   # "<mrc> <quality>"
+    if [ "$_st_iv" = "$OCRAPP_MRC $_st_cq" ]; then
+      echo "${_st_pfx}EXPORT    MRC $( [ "$_st_im" = 1 ] && echo on || echo off ), quality $_st_iq ($(quality_name "$_st_iq"))   [workflow = config: OCRAPP_MRC=$OCRAPP_MRC, $_st_ck=$_st_cq]"
+    else
+      echo "${_st_pfx}EXPORT    MISMATCH -- workflow has MRC=$_st_im quality=$_st_iq, config wants OCRAPP_MRC=$OCRAPP_MRC $_st_ck=$_st_cq -- run '$US setup go'"
+    fi
+  fi
+  _st_sp="$(/usr/bin/defaults read "$OCRAPP_BUNDLE_ID" ImportSplitFacingPages 2>/dev/null)" || _st_sp="unset"
+  if [ "$_st_sp" = "$OCRAPP_SPLIT_FACING_PAGES" ]; then
+    echo "${_st_pfx}SPLIT     facing pages $( [ "$_st_sp" = 1 ] && echo on || echo off )   [$OCRAPP_NAME = config: $_st_sp]"
+  else
+    echo "${_st_pfx}SPLIT     facing pages: $OCRAPP_NAME has '$_st_sp', config wants $OCRAPP_SPLIT_FACING_PAGES -- the next run sets it"
+  fi
+  _st_cf="$CONFIG_FILE"
+  [ -n "$_st_cf" ] || _st_cf="none found -- built-in defaults ($US --create-config prints them)"
+  echo "${_st_pfx}CONFIG    $_st_cf"
 
   [ "$VRB" = "1" ] || return 0
   echo "${_st_pfx}          in  $S_PATH"
@@ -3000,6 +3158,10 @@ osa_can_prompt() {
 # nothing recreated it and my-ocr simply would not work on a new machine.
 setup_write_workflow() {
   _sw_wf="$WORKFLOW_DIR/$WORKFLOW_NAME"
+  export_config_check
+  export_quality; _sw_q="$EXPORT_Q"; _sw_qk="$EXPORT_QK"
+  [ "$OCRAPP_MRC" = "1" ] && _sw_m="on" || _sw_m="off"
+  _sw_ex="MRC $_sw_m, image quality $_sw_q ($(quality_name "$_sw_q")) [OCRAPP_MRC=$OCRAPP_MRC -> $_sw_qk=$_sw_q]"
 
   # Automator runs a workflow whose shell it does not offer by doing nothing at
   # all -- silently. Refuse to write one rather than ship a dead Folder Action.
@@ -3022,6 +3184,7 @@ setup_write_workflow() {
     echo "        1. $WORKFLOW_MY_OCR --part-1"
     echo "        2. $OCRAPP_NAME 'Convert to PDF Document'  -> $T_PATH"
     echo "           languages: $OCR_LANGUAGES"
+    echo "           export: $_sw_ex"
     echo "        3. $WORKFLOW_MY_OCR --part-2"
     return 0
   fi
@@ -3054,6 +3217,8 @@ _EOIP_
   OCR_SAVE="$T_PATH" \
   OCR_LANGS="$OCR_LANGUAGES" \
   OCR_INPATH="$S_PATH" \
+  OCR_EXPORT_MRC="$OCRAPP_MRC" \
+  OCR_EXPORT_QUALITY="$_sw_q" \
   /usr/bin/python3 - "$_sw_doc" 2>"$_sw_err" <<'_EOPY_'
 import os, plistlib, sys, uuid
 
@@ -3064,6 +3229,9 @@ APP    = os.environ["OCR_APPNAME"]
 SAVE   = os.environ["OCR_SAVE"]
 LANGS  = os.environ["OCR_LANGS"]
 INPATH = os.environ["OCR_INPATH"]
+# checked by export_config_check before this runs: MRC 0/1, quality 0/1/2
+MRC    = os.environ["OCR_EXPORT_MRC"] == "1"
+QUAL   = int(os.environ["OCR_EXPORT_QUALITY"])
 
 def shell(cmd, uid):
     return {"action": {
@@ -3134,14 +3302,17 @@ def ocr(uid):
             "exportPdfEmbedFonts": True,
             "exportPdfEnabledTaggedPDF": True,
             "exportPdfExportMode": 2,
-            "exportPdfImageQuality": 2,
+            # both from the config (OCRAPP_MRC + the quality key that goes
+            # with it); the reasons for the defaults are in
+            # default_config_content()
+            "exportPdfImageQuality": QUAL,
             "exportPdfKeepPageNumbersHeadersAndFooters": True,
             "exportPdfKeepPictures": True,
             "exportPdfKeepTextAndBackgroundColor": True,
             "exportPdfMakePdfACompliant": False,
             "exportPdfPaperMargins": "1.180555, 0.7881944, 0,59027777, 0.7881944",
             "exportPdfPaperSize": "0,0",
-            "exportPdfUseMRC": True,
+            "exportPdfUseMRC": MRC,
             "exportSaveOption": 3,
             "preferencesRecognitionLanguages": LANGS},
         "BundleIdentifier": "com.abbyy.ExportToPdf",
@@ -3203,6 +3374,7 @@ _EOPY_
     return 1
   fi
   echo "    > wrote a ${_sw_n}-step workflow, plist lints clean [0]"
+  echo "    > export: $_sw_ex"
   return 0
 }
 
@@ -3621,6 +3793,150 @@ t_open_cmd() {
   _cmd="$(print_open_cmd "$_oc/list" | sed 's/^    > look at them:  //')"
   if printf '%s\n' "$_cmd" | /bin/dash -n 2>/dev/null; then t_ok "the 'open' line is valid shell as printed"
   else t_bad "the 'open' line is valid shell as printed" "$_cmd"; fi
+}
+
+# Generate the workflow for real, into a sandbox, with the given export
+# settings, and print what the PLIST says -- not what this script meant to write.
+t_wf_set() { # the sandbox's settings -- called INSIDE t_wf_gen's subshell only
+  WORKFLOW_DIR="$1"; _su_go=1; OCRAPP_MRC="$2"
+  OCRAPP_IMAGE_QUALITY_MRC="$3"; OCRAPP_IMAGE_QUALITY_NO_MRC="$4"
+}
+
+t_wf_gen() { # $1 dir, $2 OCRAPP_MRC, $3 QUALITY_MRC, $4 QUALITY_NO_MRC -> "mrc=M quality=Q" or "REFUSED ..."
+  rm -rf "$1"; mkdir -p "$1"
+  # the subshell keeps the overrides out of the rest of the suite
+  ( t_wf_set "$@"; setup_write_workflow ) >"$1/out" 2>&1
+  _wg_p="$1/$WORKFLOW_NAME/Contents/document.wflow"
+  if [ ! -f "$_wg_p" ]; then printf 'REFUSED %s\n' "$(grep -E 'ERROR|must be' "$1/out" | head -n 1)"; return 0; fi
+  _wg_v="$(workflow_export_values "$_wg_p")"
+  printf 'mrc=%s quality=%s\n' "${_wg_v% *}" "${_wg_v#* }"
+}
+
+t_workflow_export() {
+  _we_d="$T_TMP/wf-export"
+  # the defaults: no MRC, and the no-MRC quality (Balanced)
+  _we_v="$(t_wf_gen "$_we_d" "$OCRAPP_MRC" "$OCRAPP_IMAGE_QUALITY_MRC" "$OCRAPP_IMAGE_QUALITY_NO_MRC")"
+  if [ "$_we_v" = "mrc=0 quality=1" ]; then t_ok "setup: by default the workflow exports without MRC, at quality 1 [$_we_v]"
+  else t_bad "setup: by default the workflow exports without MRC, at quality 1" "got [$_we_v]"; fi
+  # the switch brings ITS quality along
+  _we_v="$(t_wf_gen "$_we_d" 1 2 1)"
+  if [ "$_we_v" = "mrc=1 quality=2" ]; then t_ok "setup: OCRAPP_MRC=1 writes MRC on, with OCRAPP_IMAGE_QUALITY_MRC [$_we_v]"
+  else t_bad "setup: OCRAPP_MRC=1 writes MRC on, with OCRAPP_IMAGE_QUALITY_MRC" "got [$_we_v]"; fi
+  # a changed quality for the ACTIVE mode really lands in the plist
+  _we_v="$(t_wf_gen "$_we_d" 0 2 2)"
+  if [ "$_we_v" = "mrc=0 quality=2" ]; then t_ok "setup: OCRAPP_IMAGE_QUALITY_NO_MRC=2 lands in the workflow [$_we_v]"
+  else t_bad "setup: OCRAPP_IMAGE_QUALITY_NO_MRC=2 lands in the workflow" "got [$_we_v]"; fi
+  # 3 aborts FineReader: refused, and the key is named -- also for the INACTIVE mode
+  _we_v="$(t_wf_gen "$_we_d" 0 3 1)"
+  case "$_we_v" in
+    "REFUSED "*OCRAPP_IMAGE_QUALITY_MRC*) t_ok "setup: a quality of 3 is refused, naming the key, even for the mode that is off";;
+    *) t_bad "setup: a quality of 3 is refused, naming the key, even for the mode that is off" "got [$_we_v]";;
+  esac
+  _we_v="$(t_wf_gen "$_we_d" yes 2 1)"
+  case "$_we_v" in
+    "REFUSED "*OCRAPP_MRC*) t_ok "setup: OCRAPP_MRC must be 0 or 1 -- 'yes' is refused, naming the key";;
+    *) t_bad "setup: OCRAPP_MRC must be 0 or 1 -- 'yes' is refused, naming the key" "got [$_we_v]";;
+  esac
+  # END TO END: status reads what setup WROTE (a plist BOOLEAN for MRC -- the
+  # first reader took digits only and called a fresh workflow 'none'), via a
+  # real config file pointing WORKFLOW_DIR at the sandbox
+  t_wf_gen "$_we_d" 0 2 1 >/dev/null
+  printf 'WORKFLOW_DIR="%s"\n' "$_we_d" >"$_we_d.conf"
+  _we_o="$(MY_OCR_CONFIG="$_we_d.conf" "$0" status 2>&1 | grep EXPORT)"
+  case "$_we_o" in
+    *"EXPORT    MRC off, quality 1 (Balanced)"*"workflow = config"*) t_ok "status: reads back the workflow setup wrote, and it agrees with the config";;
+    *) t_bad "status: reads back the workflow setup wrote, and it agrees with the config" "$_we_o";;
+  esac
+  # ...and a config changed AFTER setup is caught, not believed
+  printf 'WORKFLOW_DIR="%s"\nOCRAPP_MRC=1\n' "$_we_d" >"$_we_d.conf"
+  _we_o="$(MY_OCR_CONFIG="$_we_d.conf" "$0" status 2>&1 | grep EXPORT)"
+  case "$_we_o" in
+    *"MISMATCH"*"MRC=0 quality=1"*"OCRAPP_MRC=1"*"setup go"*) t_ok "status: a config changed after setup is reported as a MISMATCH, with both sides";;
+    *) t_bad "status: a config changed after setup is reported as a MISMATCH, with both sides" "$_we_o";;
+  esac
+}
+
+t_config_file() {
+  _tc_d="$T_TMP/config"; mkdir -p "$_tc_d"
+  # the defaults in the script and the ones --create-config prints must agree
+  "$0" --create-config >"$_tc_d/default" 2>&1
+  _tc_bad=""
+  for _tc_k in OCRAPP_MRC OCRAPP_IMAGE_QUALITY_MRC OCRAPP_IMAGE_QUALITY_NO_MRC OCRAPP_SPLIT_FACING_PAGES; do
+    _tc_c="$(sed -n "s/^$_tc_k=\([0-9]*\).*/\1/p" "$_tc_d/default")"
+    case "$_tc_k" in
+      OCRAPP_MRC) _tc_s="$OCRAPP_MRC" ;;
+      OCRAPP_IMAGE_QUALITY_MRC) _tc_s="$OCRAPP_IMAGE_QUALITY_MRC" ;;
+      OCRAPP_IMAGE_QUALITY_NO_MRC) _tc_s="$OCRAPP_IMAGE_QUALITY_NO_MRC" ;;
+      OCRAPP_SPLIT_FACING_PAGES) _tc_s="$OCRAPP_SPLIT_FACING_PAGES" ;;
+    esac
+    [ "$_tc_c" = "$_tc_s" ] || _tc_bad="$_tc_bad $_tc_k(config $_tc_c, script $_tc_s)"
+  done
+  if [ -z "$_tc_bad" ]; then t_ok "config: --create-config prints exactly the built-in defaults"
+  else t_bad "config: --create-config prints exactly the built-in defaults" "differ:$_tc_bad"; fi
+  # a config really takes effect -- by the env var, and by --config
+  printf 'OCRAPP_MRC=1\n' >"$_tc_d/mrc.conf"
+  _tc_o="$(MY_OCR_CONFIG="$_tc_d/mrc.conf" "$0" status 2>&1)"
+  case "$_tc_o" in
+    *"CONFIG    $_tc_d/mrc.conf"*"OCRAPP_MRC=1"*|*"OCRAPP_MRC=1"*"CONFIG    $_tc_d/mrc.conf"*)
+      t_ok "config: \$MY_OCR_CONFIG is read, and its value is used";;
+    *) t_bad "config: \$MY_OCR_CONFIG is read, and its value is used" "$(printf '%s' "$_tc_o" | grep -E 'EXPORT|CONFIG')";;
+  esac
+  _tc_o="$("$0" --config "$_tc_d/mrc.conf" status 2>&1)"
+  case "$_tc_o" in
+    *"CONFIG    $_tc_d/mrc.conf"*) t_ok "config: --config <FILE> is read, and its value is not taken for a document";;
+    *) t_bad "config: --config <FILE> is read, and its value is not taken for a document" "$(printf '%s' "$_tc_o" | tail -n 2)";;
+  esac
+  # --create-config FILE never overwrites
+  printf 'mine\n' >"$_tc_d/exists.conf"
+  "$0" --create-config "$_tc_d/exists.conf" >/dev/null 2>&1
+  if [ "$(cat "$_tc_d/exists.conf")" = "mine" ]; then t_ok "config: --create-config <FILE> refuses to overwrite"
+  else t_bad "config: --create-config <FILE> refuses to overwrite" "the file was replaced"; fi
+  "$0" --create-config="$_tc_d/new.conf" >/dev/null 2>&1
+  if grep -q '^OCRAPP_MRC=0' "$_tc_d/new.conf" 2>/dev/null; then t_ok "config: --create-config=<FILE> writes a new one"
+  else t_bad "config: --create-config=<FILE> writes a new one" "not written"; fi
+}
+
+t_split_pref() {
+  # LIVE, against a THROW-AWAY preferences domain -- never FineReader's own
+  _ts_dom="my-ocr.suite.$$"
+  _ts_o="$(
+    OCRAPP_NAME="my-ocr-no-such-app-xyzzy"
+    /usr/bin/defaults write "$_ts_dom" ImportSplitFacingPages -bool YES
+    OCRAPP_SPLIT_FACING_PAGES=0; ocrapp_split_facing_pages "$_ts_dom"
+    echo "NOW=$(/usr/bin/defaults read "$_ts_dom" ImportSplitFacingPages)"
+    echo "---"; ocrapp_split_facing_pages "$_ts_dom"; echo "---"
+    OCRAPP_SPLIT_FACING_PAGES=1; ocrapp_split_facing_pages "$_ts_dom"
+    echo "NOW2=$(/usr/bin/defaults read "$_ts_dom" ImportSplitFacingPages)"
+  )"
+  /usr/bin/defaults delete "$_ts_dom" >/dev/null 2>&1
+  case "$_ts_o" in
+    *"split facing pages off (was: 1)"*"NOW=0"*) t_ok "split: on in the app, off in the config -- set off, and said so with the old value";;
+    *) t_bad "split: on in the app, off in the config -- set off, and said so with the old value" "$_ts_o";;
+  esac
+  case "$_ts_o" in
+    *"---${NL}---"*) t_ok "split: already as configured -- nothing done, nothing printed";;
+    *) t_bad "split: already as configured -- nothing done, nothing printed" "$_ts_o";;
+  esac
+  case "$_ts_o" in
+    *"split facing pages on (was: 0)"*"NOW2=1"*) t_ok "split: OCRAPP_SPLIT_FACING_PAGES=1 turns it on";;
+    *) t_bad "split: OCRAPP_SPLIT_FACING_PAGES=1 turns it on" "$_ts_o";;
+  esac
+  # while the app runs, it is left alone -- a running app writes its own value back
+  _ts_d="$T_TMP/split"; mkdir -p "$_ts_d"; _ts_n="mosp$$"; ln -s /bin/sleep "$_ts_d/$_ts_n"
+  "$_ts_d/$_ts_n" 20 & _ts_p=$!
+  sleep 1
+  _ts_o="$(
+    OCRAPP_NAME="$_ts_n"
+    /usr/bin/defaults write "$_ts_dom" ImportSplitFacingPages -bool YES
+    OCRAPP_SPLIT_FACING_PAGES=0; ocrapp_split_facing_pages "$_ts_dom"
+    echo "NOW=$(/usr/bin/defaults read "$_ts_dom" ImportSplitFacingPages)"
+  )"
+  kill "$_ts_p" 2>/dev/null; wait "$_ts_p" 2>/dev/null
+  /usr/bin/defaults delete "$_ts_dom" >/dev/null 2>&1
+  case "$_ts_o" in
+    *"is running"*"NOW=1"*) t_ok "split: while the app runs, the preference is left alone, and it says so";;
+    *) t_bad "split: while the app runs, the preference is left alone, and it says so" "$_ts_o";;
+  esac
 }
 
 t_fa_restart() {
@@ -4674,6 +4990,9 @@ do_run_tests() {
   t_reset_stable
   t_trap_term
   t_fa_restart
+  t_workflow_export
+  t_config_file
+  t_split_pref
   t_open_cmd
   t_nudge
   t_staging_sweep
@@ -4685,6 +5004,41 @@ do_run_tests() {
 }
 
 #######################################################
+
+# ---- config: --create-config acts and exits; otherwise find one and source it
+CONFIG_FILE=""; _cf_create=""; _cf_to=""; _cf_prev=""
+for arg in "$@"; do
+  case "$_cf_prev" in
+    --config) CONFIG_FILE="$arg" ;;
+    --create-config) case "$arg" in -*) ;; *) _cf_to="$arg" ;; esac ;;
+  esac
+  case "$arg" in
+    --config=*)        CONFIG_FILE="${arg#--config=}" ;;
+    --create-config)   _cf_create=1 ;;
+    --create-config=*) _cf_create=1; _cf_to="${arg#--create-config=}" ;;
+  esac
+  _cf_prev="$arg"
+done
+[ "$_cf_prev" = "--config" ] && err 162 "--config needs a <FILE>"
+if [ -n "$_cf_create" ]; then
+  [ -z "$_cf_to" ] && { default_config_content; exit 0; }
+  [ -e "$_cf_to" ] && err 163 "'$_cf_to' exists -- refusing to overwrite it. Compare instead:  $US --create-config | diff - '$_cf_to'"
+  default_config_content >"$_cf_to" || err 164 "could not write '$_cf_to'"
+  echo " >>> wrote the default config to '$_cf_to'"
+  exit 0
+fi
+[ -n "$MY_OCR_CONFIG" ] && CONFIG_FILE="$MY_OCR_CONFIG"
+if [ -n "$CONFIG_FILE" ]; then
+  [ -r "$CONFIG_FILE" ] || err 165 "config '$CONFIG_FILE' is not a readable file"
+else
+  while IFS= read -r _cf_p; do
+    [ -f "$_cf_p" ] && [ -r "$_cf_p" ] && { CONFIG_FILE="$_cf_p"; break; }
+  done <<_EOCF_
+$(config_search_paths)
+_EOCF_
+fi
+# shellcheck disable=SC1090  # the path is only known at run time
+[ -n "$CONFIG_FILE" ] && { . "$CONFIG_FILE" || err 166 "sourcing config '$CONFIG_FILE' failed"; }
 
 [ $# -eq 0 -a -t 0 ] && usage
 
@@ -4761,6 +5115,8 @@ while [ $# -gt 0 ]; do
                           MOVE_FAILED_TO="$1"; shift;;
         -h|--help) continue;; # ignore here
         --log|--no-log) continue;; # ignore here
+        --config) shift; continue;; # value consumed at start-up, never a file to OCR
+        --config=*) continue;;
         --part-1) continue;; # ignore here
         --part-2) continue;; # ignore here
         -f|--file)  [ -z "$1" ] && err 093 "Argument '$arg' needs parameter";
