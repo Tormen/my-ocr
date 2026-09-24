@@ -1,6 +1,6 @@
 #!/bin/dash
 
-# 176 == highest used errCode
+# 177 == highest used errCode
 
 US="${0##*/}";   # get filename without path
 
@@ -14,11 +14,11 @@ NL="
 # and is authoritative at runtime -- the deployed copy needs no git and no
 # repository. The build id is a hash of this file, so it is right even unstamped.
 SCRIPT_VERSION="v1.0"
-SCRIPT_COMMIT="8077c4d"           # rewritten by 'my-ocr stamp-version'
+SCRIPT_COMMIT="0f9677b"           # rewritten by 'my-ocr stamp-version'
 # What git said when this build was stamped: 'git describe --tags --long' --
 # <nearest tag>-<commits since it>-g<short sha>. It says whether these bytes
 # ARE that release or work on top of it, on a machine with no git.
-SCRIPT_RELEASE="v1.0-43-g8077c4d"
+SCRIPT_RELEASE="v1.0-44-g0f9677b"
 
 WHOAMI="$(/usr/bin/whoami)"
 [ "$USER" = "$WHOAMI" ] || err 126 "USER '$USER' ? != ? '$WHOAMI' WHOAMI"
@@ -1814,6 +1814,15 @@ session, so AUTOMATOR will never run. Use:  su - ${_t_gui:-<console user>} -c '$
   printf 'pid=%s at=%s\n' "$$" "$(date -u +%FT%TZ)" > "$OCRAPP_MUTEX_DIR/owner"
   [ $DBG ] && echo "${PFX}Took the OCR mutex '$OCRAPP_MUTEX_DIR' after ${_mi}s."
 
+  # The run before us may be gone while its work is not. Wait for that work
+  # and repair what it left, before we create a single file of our own.
+  preflight_dead_queue || err 047 "The run before this one is gone, but its work is still going after ${OCRAPP_TIMEOUT}s -- nothing touched. Check it with '$US status'."
+  [ -s "$QUEUED_FILE_MOVES_LOG" ] && err 177 "Found QUEUED_FILE_MOVES_LOG '$QUEUED_FILE_MOVES_LOG' and could not repair it:
+
+$(cat "$QUEUED_FILE_MOVES_LOG"|sed -e "s/.*/${PFX}        | '&'/")
+
+Should not be."
+
   # Only now that the turn is OURS do we create working state. Anything set up
   # while still queueing is state a running instance can trip over -- and its
   # cleanup can delete.
@@ -1857,12 +1866,6 @@ session, so AUTOMATOR will never run. Use:  su - ${_t_gui:-<console user>} -c '$
   [ -e "$PARTx_ERRORED_FLAGFILE" ] && { rm "$PARTx_ERRORED_FLAGFILE" || err 083 "Failed to 'rm \"$PARTx_ERRORED_FLAGFILE\"'"; }
   touch "$PARTx_ERRORED_FLAGFILE" || err 027
 
-  preflight_dead_queue
-  [ -s "$QUEUED_FILE_MOVES_LOG" ] && err 047 "Found QUEUED_FILE_MOVES_LOG '$QUEUED_FILE_MOVES_LOG' and could not repair it:
-
-$(cat "$QUEUED_FILE_MOVES_LOG"|sed -e "s/.*/${PFX}        | '&'/")
-
-Should not be."
   touch "$QUEUED_FILE_MOVES_LOG" || err 042 "Failed [$?] to create QUEUED_FILE_MOVES_LOG '$QUEUED_FILE_MOVES_LOG' (touch, chmod :my-system, chown g-w,o-rwx)"
   [ $DBG ] && echo "${PFX}Created QUEUED_FILE_MOVES_LOG '$QUEUED_FILE_MOVES_LOG'."
 
@@ -2654,6 +2657,23 @@ do_stamp_version() {
 # not "dead", and a long OCR is not a crashed one.
 run_is_alive() { [ -n "$1" ] && kill -0 "$1" 2>/dev/null; }
 
+# A run is more than its trigger's pid: Automator runs its part-1 and part-2,
+# and between them the OCR app works on the batch. When the trigger is killed
+# all of that carries on. Prints the pids of the parts still running, if any.
+run_parts_alive() { pgrep -f "$US --part-[12]" 2>/dev/null | xargs echo; }
+
+# What of a run is still at work, if anything, printed; 0 when something is.
+# The OCR app counts only while the queue says a batch was handed over -- a
+# FineReader a person opened is nobody's run.
+run_work_alive() {
+  _rw="$(run_parts_alive)"
+  [ -n "$_rw" ] && { echo "its part-1/part-2 (pid(s) $_rw)"; return 0; }
+  [ -s "$QUEUED_FILE_MOVES_LOG" ] || return 1
+  _rw="$(pgrep -x "$OCRAPP_NAME" 2>/dev/null | xargs echo)"
+  [ -n "$_rw" ] && { echo "$OCRAPP_NAME on its batch (pid(s) $_rw)"; return 0; }
+  return 1
+}
+
 # Every per-run file whose owning pid is gone, one per line.
 stale_run_files() {
   for _sf in /var/lib/mine/"$WHOAMI"/"${US%.*}".[0-9]*.filelist \
@@ -2984,19 +3004,22 @@ self_heal() {
 # may still be inside the OCR app, and its part-2 may still be waiting to file
 # it. Repairing then pulled a staged copy out from under a working OCR and took
 # the queue from a part-2 that still needed it (seen on ada, in a kill -9 test).
-# So: wait while any of that run's work is alive -- its own part-2 usually
-# finishes and removes the queue, leaving nothing to repair -- and repair only
-# once none is. Still busy after OCRAPP_TIMEOUT: leave it, the caller refuses.
+# So: wait while any of that run's work is alive, and repair only once none is.
+# "Its queue is gone" is NOT "it is done": its part-2 empties the queue and
+# THEN removes its staging directory -- the next run's hand-over failed on that
+# directory (err 108, the second kill -9 test on ada). It runs right after the
+# mutex is taken, before this run creates ANY shared state, so the two runs
+# never write the same files. Still busy after OCRAPP_TIMEOUT: returns 1, the
+# caller refuses and nothing has been touched.
 preflight_dead_queue() {
-  [ -s "$QUEUED_FILE_MOVES_LOG" ] || return 0
   _pf_w=0
-  while pgrep -x "$OCRAPP_NAME" >/dev/null 2>&1 || pgrep -f "$US --part-[12]" >/dev/null 2>&1; do
-    [ -s "$QUEUED_FILE_MOVES_LOG" ] || return 0           # its part-2 finished the job
-    [ "$_pf_w" -eq 0 ] && echo "$$| >>> [trigger-OCR] a run that is gone left its queue, and its batch is still at work ($OCRAPP_NAME or its part-2) -- waiting for it to finish"
+  while _pf_what="$(run_work_alive)"; do
+    [ "$_pf_w" -eq 0 ] && echo "$$| >>> [trigger-OCR] the run before this one is gone, but its work is not: $_pf_what -- waiting for it to finish"
     [ "$_pf_w" -ge "${OCRAPP_TIMEOUT:-1800}" ] && {
       echo "$$| >>> [trigger-OCR] still at work after ${_pf_w}s -- not touching it"; return 1; }
     sleep 5; _pf_w=$(( _pf_w + 5 ))
   done
+  [ "$_pf_w" -gt 0 ] && echo "$$| >>> [trigger-OCR] its work ended after ${_pf_w}s"
   [ -s "$QUEUED_FILE_MOVES_LOG" ] || return 0
   echo "$$| >>> [trigger-OCR] a run that is gone left its queue, and nothing of it is at work any more -- repairing it the way 'reset go' does:"
   _rs_go=1; _rs_n=0
@@ -3118,6 +3141,13 @@ do_reset() {
       echo "     Wait for it, or stop it first. reset never interrupts real work."
       return 1
     fi
+  fi
+  # ...and a run whose trigger is gone may still have its parts at work.
+  _rs_pa="$(run_parts_alive)"
+  if [ -n "$_rs_pa" ]; then
+    echo "  >> a my-ocr run's part-1/part-2 is still at work (pid(s) $_rs_pa) -- nothing reset."
+    echo "     Wait for it, or stop it first. reset never interrupts real work."
+    return 1
   fi
 
   echo "  >> OCR mutex"
@@ -4284,13 +4314,53 @@ t_preflight_repair() {
     *) t_bad "preflight: when the old run finishes its own queue while we wait, nothing is repaired" "$_pr_o // $(cat "$_pr/done.out")";;
   esac
 
-  # and trigger-OCR goes through it before it would refuse (err 047)
+  # THE SECOND ada CASE: the queue is already gone, but the dead run's part-2
+  # is not -- it still has to remove its staging directory. Returning then let
+  # the next hand-over collide with that directory (err 108). The stand-in
+  # part-2 marks when it ends; the pre-flight must return only after that.
+  _pr_world; rm -f "$_pr/lib/files-2-move"
+  /bin/sh -c 'sleep 4; touch "$1"' "my-ocr-sandbox --part-2" "$_pr/part-ended" & _pr_part=$!
+  sleep 1
+  _pr_o="$(
+    t_reset_sandbox "$_pr"; t_pf_app "no-such-app-xyzzy" 20
+    preflight_dead_queue >"$_pr/part.out" 2>&1; echo "PF-RC=$?"
+    [ -e "$_pr/part-ended" ] && echo "PART-ENDED-FIRST"
+    [ -e "$_pr/pub/my-ocr.pre_,ocr.in_TMP-path/doc.#1.pdf" ] && echo "COPY-UNTOUCHED"
+  )"
+  wait "$_pr_part" 2>/dev/null
+  case "$_pr_o" in
+    *"PF-RC=0"*PART-ENDED-FIRST*COPY-UNTOUCHED*) t_ok "preflight: with the queue gone, it still waits for the dead run's part-2 to end";;
+    *) t_bad "preflight: with the queue gone, it still waits for the dead run's part-2 to end" "$_pr_o // $(cat "$_pr/part.out")";;
+  esac
+
+  # ...and 'reset' is no different: a dead trigger with a live part-2 is a
+  # live run (it said "never interrupts real work" and did)
+  _pr_world; rm -rf "$_pr/lib/mutex"; rm -f "$_pr/part-ended"
+  /bin/sh -c 'sleep 4; touch "$1"' "my-ocr-sandbox --part-2" "$_pr/part-ended" & _pr_part=$!
+  sleep 1
+  _pr_o="$(
+    t_reset_sandbox "$_pr"
+    do_reset go >"$_pr/reset2.out" 2>&1; echo "RESET-RC=$?"
+    [ -s "$QUEUED_FILE_MOVES_LOG" ] && echo "QUEUE-KEPT"
+    [ -e "$_pr/pub/my-ocr.pre_,ocr.in_TMP-path/doc.#1.pdf" ] && echo "COPY-KEPT"
+  )"
+  wait "$_pr_part" 2>/dev/null
+  case "$_pr_o" in
+    *"RESET-RC=1"*QUEUE-KEPT*COPY-KEPT*) t_ok "reset: refuses while a dead run's part-1/part-2 is still at work";;
+    *) t_bad "reset: refuses while a dead run's part-1/part-2 is still at work" "$_pr_o // $(cat "$_pr/reset2.out")";;
+  esac
+
+  # trigger-OCR runs it right after taking the mutex: before self-heal and
+  # before it creates any shared file (both runs wrote the same flagfile), and
+  # before it would refuse
   # shellcheck disable=SC2016  # matching literal source text
   if awk '/^do_trigger_ocr\(\) \{/,/^\}/' "$0" \
-     | awk '/^  preflight_dead_queue$/{r=NR} /err 047 /{e=NR} END{exit !(r && e && r < e)}'; then
-    t_ok "preflight: trigger-OCR runs it before it would refuse (err 047)"
+     | awk '/^  WE_HOLD_OCRAPP_MUTEX=1$/{m=NR} /^  preflight_dead_queue \|\| err /{r=NR}
+            /^  self_heal$/{s=NR} /touch "\$PARTx_ERRORED_FLAGFILE"/{f=NR} /err 177 /{e=NR}
+            END{exit !(m && r && s && f && e && m < r && r < s && r < f && r < e)}'; then
+    t_ok "preflight: trigger-OCR runs it right after the mutex, before any shared state and before refusing"
   else
-    t_bad "preflight: trigger-OCR runs it before it would refuse (err 047)" "err 047 is reachable without it"
+    t_bad "preflight: trigger-OCR runs it right after the mutex, before any shared state and before refusing" "order broken in do_trigger_ocr"
   fi
 }
 
