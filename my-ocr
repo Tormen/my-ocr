@@ -14,11 +14,11 @@ NL="
 # and is authoritative at runtime -- the deployed copy needs no git and no
 # repository. The build id is a hash of this file, so it is right even unstamped.
 SCRIPT_VERSION="v1.0"
-SCRIPT_COMMIT="aa6c2af"           # rewritten by 'my-ocr stamp-version'
+SCRIPT_COMMIT="9775b60"           # rewritten by 'my-ocr stamp-version'
 # What git said when this build was stamped: 'git describe --tags --long' --
 # <nearest tag>-<commits since it>-g<short sha>. It says whether these bytes
 # ARE that release or work on top of it, on a machine with no git.
-SCRIPT_RELEASE="v1.0-46-gaa6c2af"
+SCRIPT_RELEASE="v1.0-47-g9775b60"
 
 WHOAMI="$(/usr/bin/whoami)"
 [ "$USER" = "$WHOAMI" ] || err 126 "USER '$USER' ? != ? '$WHOAMI' WHOAMI"
@@ -68,15 +68,13 @@ FILELIST_CNT=0; # number of files in the FILELIST
   fi
 
   OCRAPP_NAME="FineReader"
+  # The macOS process that turns "a file appeared in the watched folder" into a
+  # workflow run.
+  FA_DISPATCHER_NAME="FolderActionsDispatcher"
   # Where the application lives. setup refuses to wire a Folder Action to an
   # OCR app that is not installed: the failure would otherwise only surface on
   # the first real scan, long after setup said it was fine.
   OCRAPP_PATH="/Applications/$OCRAPP_NAME.app"
-  # The macOS process that turns "a file appeared in the watched folder" into a
-  # workflow run, and how long to wait for launchd to bring up a new one after
-  # it had to be restarted.
-  FA_DISPATCHER_NAME="FolderActionsDispatcher"
-  FA_RESTART_WAIT=10
   # Its preferences domain: trigger-OCR turns window restore off there, so a
   # crash cannot leave a "reopen its windows?" dialog blocking the next run.
   OCRAPP_BUNDLE_ID="com.abbyy.FineReaderPro"
@@ -122,7 +120,6 @@ FILELIST_CNT=0; # number of files in the FILELIST
   # the 'placing-files' barrier AND the data file that part-1 fills and part-2
   # rewrites. mkdir is the POSIX test-and-set; "[ -e ] && touch" is a race.
   OCRAPP_MUTEX_DIR="/var/lib/mine/${WHOAMI}/${US%.*}.$OCRAPP_NAME.mutex"
-  OCRAPP_MUTEX_TIMEOUT=1800; # (seconds) how long a caller queues for its turn
   WE_HOLD_OCRAPP_MUTEX=""    # <<< used by cleanup()
   PARTx_ERRORED_FLAGFILE="/var/lib/mine/${US%.*}.PARTx-ERRORED.flagfile" # used by do_trigger_ocr_mode() to see if the partx errored out and we have to abort!
   DBG_FLAGFILE="/var/lib/mine/${US%.*}.DBG.flagfile" # will be set, if called with --debug / -D in trigger-OCR do_trigger_ocr mode!
@@ -132,24 +129,13 @@ FILELIST_CNT=0; # number of files in the FILELIST
   # interactive run from a Folder Action, so trigger-OCR has to tell them.
   INTERACTIVE_FLAGFILE="/var/lib/mine/${US%.*}.INTERACTIVE.flagfile"
 
-  # Reveal the finished file in the Finder?
-  #   auto   = only when the run was started from a terminal (default)
-  #   always = also for Folder Action / LaunchDaemon runs
-  #   never  = not at all
-  REVEAL_IN_FINDER="auto"
-
-  # Filenames matching any of these shell patterns are NOT OCRed: they are
-  # skipped and left exactly where they are. "" = no marker, OCR everything.
-  NO_OCR_FILENAME_PATTERNS="no-ocr-scan*"
   OCRAPP_STATEFILE="/var/lib/mine/${US%.*}.$OCRAPP_NAME.pids" # == contains "" or the PID(s) of the OCRAPP already running, when --part-1 was called
-  OCRAPP_TIMEOUT=1800; # (seconds)
 
   # for do_health_check()
   du_params="" #="-k"
   du_unit_str="1/2 KB"
 
 # for do_part_1 / --part-1:
-  S_PATH="/Users/${WHOAMI}/Public/,ocr.in" # == INP_PATH, we'll exptect files to be here
   # for do_health_check()
   S_EXPECTED_FILE_TYPE___REGEX="JPEG \|PDF \|PNG \|TIFF " # <<< matches the BEGINNING of 'file --brief ...'
   S_HEALTH_CHECK___MAX_REPEAT="1"
@@ -157,7 +143,6 @@ FILELIST_CNT=0; # number of files in the FILELIST
 # for do_part_2 / --part-2:
 
   # for do_health_check()
-  T_PATH="/Users/${WHOAMI}/Public/,ocr.out" # == OUT_PATH, we'll expect OCRAPP to place files here
   T_HEALTH_CHECK___MAX_REPEAT="1"
   T_EXPECTED_FILE_TYPE___REGEX="PDF " # <<< matches the BEGINNING of 'file --brief ...'
 
@@ -176,22 +161,6 @@ FILELIST_CNT=0; # number of files in the FILELIST
   # /bin/tcsh /bin/zsh /usr/bin/perl /usr/bin/ruby /usr/local/bin/python[3].
   WORKFLOW_SHELL="/bin/zsh"
 
-  # Where 'reset' puts documents it finds stranded mid-flight. They are MOVED,
-  # never deleted, so a reset is always undoable by looking in one folder.
-  RESET_RETRY_TO="/Users/${WHOAMI}/Public/,ocr.retry"
-
-  # Recognition languages for the OCR step, spelled as $OCRAPP_NAME names them.
-  OCR_LANGUAGES="German,English,French,GermanLuxembourg"
-  # osascript has no timeout of its own, and the first System Events call from
-  # a new caller raises the Automation consent dialog ON THE CONSOLE -- over
-  # ssh nobody can answer it, so bound the wait instead of hanging for ever.
-  OSASCRIPT_TIMEOUT=180
-
-  # "" = leave failed originals exactly where they are == CURRENT BEHAVIOUR.
-  # Point it at a directory and my-ocr quarantines whatever it could not OCR,
-  # so a caller does not have to work out which files those were.
-  MOVE_FAILED_TO=""
-
   QUEUED_FILE_MOVES_LOG="/var/lib/mine/${US%.*}.$OCRAPP_NAME.files-2-move" # <<<< contains 2 TAB separated columns: {source}\t{target}
   # A REFUSAL is not a FAILURE. The OCR ran; the verification gate judged the
   # result unusable and rolled back. part-2 records those here (2 TAB separated
@@ -206,58 +175,19 @@ FILELIST_CNT=0; # number of files in the FILELIST
   NOTEXT_FILES_LOG="/var/lib/mine/${US%.*}.$OCRAPP_NAME.notext"
   # All files we got (via stdin and/or via command-line) that are not yet OCR-ed will have an entry in this file!
 
-# for do_trigger_ocr / trigger-OCR
-  # NOT an abort. We never stop waiting while FineReader might still be
-  # running: giving up would release the lock and let a SECOND FineReader
-  # start, which is the exact state the mutex exists to prevent. These only
-  # decide when to ALERT.
-  STALL_ALERT_AFTER=300;      # (seconds) no progress -> first alert
-  STALL_REALERT_EVERY=3600;   # (seconds) keep nagging at this interval
-  # A stalled OCR app is one of two things, and they need opposite answers:
-  # grinding a huge scan (wait, however long it takes) or sitting on a dialog
-  # nobody will ever click (recover it). CPU TIME tells them apart -- a blocked
-  # app consumes none. This is how long it must consume NOTHING, while the
-  # queue is also stalled, before my-ocr stops believing it is working.
-  # 0 disables the recovery and my-ocr waits for a person, as it always did.
-  OCRAPP_IDLE_GIVEUP=120;     # (seconds) BARELY using cpu while stalled -> recover
-  # "Barely" is a RATE, not zero. Measured on ada while FineReader sat on a
-  # crash dialog: it still burned 0.3 s of cpu per minute -- window server
-  # chatter, timers -- so a test for cpu time UNCHANGED never fired and the
-  # run stalled anyway. Real OCR work was 63.9% cpu, about 36 s per minute.
-  # 3 s/minute sits ten times above the stuck case and twelve times below
-  # real work, so neither is a near miss.
-  OCRAPP_IDLE_MAX_CPU_PER_MIN=3;   # (seconds of cpu per minute) below = stuck
-  # The hand-over only starts the OCR if the folder action FIRES. On 2026-09-22
-  # one filesystem event went missing: the dispatcher was alive and logged
-  # nothing, and the run sat for 300s for a workflow that was never started --
-  # then the identical hand-over worked twice, in 14s and 6s. So: if the OCR app
-  # has not come up this many seconds after the hand-over, make the hand-over
-  # again ONCE. 0 disables the nudge and my-ocr waits as it always did.
-  OCRAPP_TRIGGER_WAIT=60;     # (seconds) no OCR app after hand-over -> re-trigger
-  STUCK_MARKER_DIR="/Users/$WHOAMI/Desktop"   # where the marker file lands
-
-  # How FineReader EXPORTS the PDF -- the two controls of the Automator step,
-  # "Compress images using MRC" and "Image quality". Written into the workflow
-  # by 'setup go'; nothing changes them at run time. The quality follows the
-  # MRC switch, so each mode carries the quality that suits it. Defaults and
-  # the reasons are in default_config_content(); the values below MUST equal
-  # it, and the suite checks that they do.
-  OCRAPP_MRC=0
-  OCRAPP_IMAGE_QUALITY_MRC=2
-  OCRAPP_IMAGE_QUALITY_NO_MRC=1
-  # FineReader's own "Split facing pages" -- enforced at every run
-  OCRAPP_SPLIT_FACING_PAGES=0
+# Every SETTING -- folders, languages, timeouts, the export -- has its one
+# default in default_config_content() below. What stays here is machinery: the
+# facts about FineReader and macOS the code depends on, and per-run state.
 
 ##############################################################
 
 ##############################################################
 #### CONFIG FILE
 #
-# Step one of two: the file is OPTIONAL and holds only what has been moved into
-# it so far; everything else still has its default in the block above, and a
-# config may override any of those too. It becomes required once every default
-# lives in default_config_content() -- until then, a host with no config (ada
-# had none) keeps working exactly as before.
+# Every setting's default is written ONCE, in default_config_content(): the
+# script loads that text at start-up, and main sources a config file on top.
+# So the file is OPTIONAL -- a host with none runs on the defaults -- and a file
+# holding only the lines it changes is complete.
 
 # The ONE list the search walks and every message about the search names, so the
 # two cannot drift apart. $<NAME>_CONFIG and --config come before it.
@@ -274,7 +204,35 @@ default_config_content() {
 #   $MY_OCR_CONFIG, --config <FILE>, /LINKS/default/my-ocr.conf,
 #   /LINKS/default/my-ocr, ~/.my-ocr.conf, /etc/my-ocr.conf,
 #   /usr/local/etc/my-ocr.conf
-# Anything not set here keeps the default built into my-ocr.
+# This text IS my-ocr's defaults: it loads it first, then your file on top.
+# So a config holding only the lines you change is complete; anything not set
+# here keeps the default printed by 'my-ocr --create-config'.
+
+# ---- folders ---------------------------------------------------------------
+# The Folder Action watches S_PATH; FineReader writes its results to T_PATH.
+# 'my-ocr setup go' wires the workflow to them -- run it again after a change.
+S_PATH="/Users/${WHOAMI}/Public/,ocr.in"
+T_PATH="/Users/${WHOAMI}/Public/,ocr.out"
+# Where 'reset' puts documents it finds stranded mid-flight. MOVED, never
+# deleted, so a reset is always undoable by looking in one folder.
+RESET_RETRY_TO="/Users/${WHOAMI}/Public/,ocr.retry"
+# "" = leave what could not be OCRed exactly where it is. A directory = move
+# it there, so a caller does not have to work out which files those were.
+MOVE_FAILED_TO=""
+# Where the STUCK marker file lands when an OCR stalls.
+STUCK_MARKER_DIR="/Users/${WHOAMI}/Desktop"
+
+# ---- what gets OCRed, and how ---------------------------------------------
+# Recognition languages, spelled as FineReader names them.
+OCR_LANGUAGES="German,English,French,GermanLuxembourg"
+# Filenames matching any of these shell patterns are skipped and left where
+# they are. "" = no marker, OCR everything.
+NO_OCR_FILENAME_PATTERNS="no-ocr-scan*"
+# Reveal the finished file in the Finder?
+#   auto   = only when the run was started from a terminal
+#   always = also for Folder Action / LaunchDaemon runs
+#   never  = not at all
+REVEAL_IN_FINDER="auto"
 
 # ---- how FineReader EXPORTS the PDF --------------------------------------
 # The two controls of the Automator step "Convert to PDF Document":
@@ -301,8 +259,44 @@ OCRAPP_IMAGE_QUALITY_NO_MRC=1     # Balanced kept the scan's own resolution
 # 3 of 10 test documents came back with extra half-pages.
 #   0 = off, 1 = on
 OCRAPP_SPLIT_FACING_PAGES=0
+
+# ---- waiting, and when to give up ----------------------------------------
+# All in seconds.
+# How long a run queues for its turn while another one has FineReader.
+OCRAPP_MUTEX_TIMEOUT=1800
+# How long part-1 and part-2 wait for FineReader to take and finish a batch --
+# and how long a new run waits for the batch of a run that died.
+OCRAPP_TIMEOUT=1800
+# A stall is NOT an abort: my-ocr never stops waiting while FineReader might
+# still work -- giving up would let a second FineReader start. These only
+# decide when to ALERT: first after STALL_ALERT_AFTER, then every
+# STALL_REALERT_EVERY.
+STALL_ALERT_AFTER=300
+STALL_REALERT_EVERY=3600
+# A stalled FineReader is grinding a huge scan (wait) or sitting on a dialog
+# nobody will click (recover). CPU time tells them apart. Measured on ada:
+# stuck on a dialog 0.3 s of cpu per minute, real OCR ~36 s per minute.
+# Below OCRAPP_IDLE_MAX_CPU_PER_MIN (s per minute) for OCRAPP_IDLE_GIVEUP
+# while the queue is stalled too = stuck, and it is recovered.
+# OCRAPP_IDLE_GIVEUP=0 disables that; my-ocr then waits for a person.
+OCRAPP_IDLE_GIVEUP=120
+OCRAPP_IDLE_MAX_CPU_PER_MIN=3
+# The hand-over starts the OCR only if the Folder Action FIRES, and once one
+# event went missing. No FineReader this long after the hand-over: make it
+# again, ONCE. 0 disables that.
+OCRAPP_TRIGGER_WAIT=60
+# How long to wait for launchd to bring up a new Folder Actions dispatcher
+# after a wedged one was restarted.
+FA_RESTART_WAIT=10
+# osascript has no timeout of its own, and the first System Events call from a
+# new caller raises a consent dialog ON THE CONSOLE -- nobody answers it over
+# ssh, so the wait is bounded.
+OSASCRIPT_TIMEOUT=180
 _EOCONF_
 }
+# The defaults, loaded from the one place they are written. main then sources a
+# config file, if one is found, on top -- so each default exists exactly once.
+eval "$(default_config_content)"
 
 # Refuse a value FineReader cannot take BEFORE it is written into a workflow:
 # a quality of 3 does not merely look wrong, it aborts the app. Both quality
@@ -387,15 +381,17 @@ a file called '--part-1' ;))
                  Default (\$MOVE_FAILED_TO empty): leave them where they are.
 --config <FILE>  Use this config. Otherwise the first found of: \$MY_OCR_CONFIG,
                  $(config_search_paths | tr '\n' ' ')
-                 None found: the built-in defaults (the file is optional for now).
+                 The file is optional: none found = the defaults --create-config
+                 prints, and a file needs only the lines it changes.
 --create-config [<FILE>]
                  Print the default config, or write it to <FILE> (never over an
-                 existing one). It holds, among others:
+                 existing one). Every setting, with its default and why -- e.g.:
                    OCRAPP_MRC                   0/1  \"Compress images using MRC\"  (default 0)
                    OCRAPP_IMAGE_QUALITY_MRC     0 Low, 1 Balanced, 2 High, with MRC (2)
                    OCRAPP_IMAGE_QUALITY_NO_MRC  the same, without MRC            (1)
                    OCRAPP_SPLIT_FACING_PAGES    0/1  FineReader's \"Split facing pages\" (0)
-                 The first three take effect with 'setup go'; the last at every run.
+                 The first three -- and S_PATH, T_PATH -- take effect with 'setup go';
+                 the last at every run.
 --version        Print version, the commit this file came from, and a build id
                  taken from the file's own bytes -- so two copies that differ
                  can never report the same string.
@@ -889,7 +885,7 @@ $(cat "$QUEUED_FILE_MOVES_LOG"|sed -e "s/.*/$$|              | '&'/")"
            [ $DBG ] && echo "${PFX}timeout-counter='$i' / '$i_max', sleep 1 ..."
            [ $(( $i % 300 )) -eq 0 ] && m="Still in LOCKFILE LOOP for max. further '$(( $i_max - $i ))' sec ..." && echo "${PFX} ... $m" && "$my_notify" -- "PART-1 -- WARNING" "$m"
            sleep 1; i=$(( $i + 1 )); done
-    [ $i -gt $OCRAPP_TIMEOUT ] && err 011 "TIMEOUT waiting for $OCRAPP_NAME!"
+    [ "$i" -gt "$OCRAPP_TIMEOUT" ] && err 011 "TIMEOUT waiting for $OCRAPP_NAME!"
     echo "${PFX}Done with LOCKFILE loop.";
   fi
 
@@ -1080,7 +1076,7 @@ _EOF_
 $(cat "$OCRAPP_LOCKFILE"|sed -e "s/.*/${PFX}   > '&'/")"
     sleep 1; i=$(( $i + 1 ));
   done
-  [ $i -gt $OCRAPP_TIMEOUT ] && err 012 "TIMEOUT waiting for $OCRAPP_NAME to finish all files!"
+  [ "$i" -gt "$OCRAPP_TIMEOUT" ] && err 012 "TIMEOUT waiting for $OCRAPP_NAME to finish all files!"
 
   t_notOK="$(cat "$OCRAPP_LOCKFILE"|grep -v "\t_OK_\t")"; [ -z "$t_notOK" ] && t_ok_cnt=0 || t_notOK_cnt=$(( $(echo "$t_notOK"|wc -l) + 0 ));
   t_total_cnt="$(( $(cat "$OCRAPP_LOCKFILE"|wc -l) + 0 ))";
@@ -1810,7 +1806,7 @@ session, so AUTOMATOR will never run. Use:  su - ${_t_gui:-<console user>} -c '$
     fi
     [ $_mi -eq 0 ] && echo "$$| >>> [trigger-OCR] ${x}$OCRAPP_NAME is busy (${_mo:-another my-ocr}) -- waiting (max ${OCRAPP_MUTEX_TIMEOUT}s) for our turn..."
     _mi=$(( $_mi + 1 ));
-    [ $_mi -gt $OCRAPP_MUTEX_TIMEOUT ] && err 129 "TIMEOUT [${_mi}s] waiting for the OCR mutex '$OCRAPP_MUTEX_DIR' (held by ${_mo:-unknown})."
+    [ "$_mi" -gt "$OCRAPP_MUTEX_TIMEOUT" ] && err 129 "TIMEOUT [${_mi}s] waiting for the OCR mutex '$OCRAPP_MUTEX_DIR' (held by ${_mo:-unknown})."
     sleep 1
   done
   WE_HOLD_OCRAPP_MUTEX=1
@@ -2081,7 +2077,7 @@ Check that Folder Actions are enabled and that '$S_PATH' still has ours attached
     else stalled=$(( $stalled + 1 )); fi
     last_q="$q"
 
-    [ $stalled -lt $STALL_ALERT_AFTER ] && continue
+    [ "$stalled" -lt "$STALL_ALERT_AFTER" ] && continue
 
     ocr_pids="$(ocrapp_all_pids | xargs echo)"
     if [ -z "$ocr_pids" ]; then
@@ -2139,7 +2135,7 @@ closing it, and the documents go back for a retry."
     # the Desktop -- eight of them for one evening of healthy runs. So it is
     # logged, with the evidence; the mail is kept for an app that is NOT
     # working, or for when the cpu check is off and nothing can be told.
-    if [ $stalled -ge $next_alert ]; then
+    if [ "$stalled" -ge "$next_alert" ]; then
       _as_msg="$OCRAPP_NAME [pid(s) $ocr_pids] is running but the queue has not moved for ${stalled}s. Still waiting; NOT releasing the lock."
       if [ -n "$_cpu_busy" ]; then
         echo "$$| >>> [trigger-OCR] $_as_msg -- it IS working [cpu ${_cpu_now}/100s total over $(ocrapp_all_pids | awk 'END{print NR+0}') process(es)], so no alert"
@@ -2316,8 +2312,9 @@ t_reveal_policy() {
 # --- REGRESSION: my-ocr must be able to quarantine what it could not OCR,
 #     so a caller never has to infer which files failed.
 t_move_failed_to() {
-  # default is "": current behaviour, files stay put
-  if grep -q '^  MOVE_FAILED_TO=""' "$0"; then
+  # default is "": current behaviour, files stay put (the default lives in
+  # default_config_content(), unindented)
+  if default_config_content | grep -qx 'MOVE_FAILED_TO=""'; then
     t_ok "MOVE_FAILED_TO defaults to '' (failed files stay put)"
   else
     t_bad "MOVE_FAILED_TO defaults to '' (failed files stay put)" "changed default = behaviour change for hand use"
@@ -4028,21 +4025,26 @@ t_trash_by_mv() {
 
 t_config_file() {
   _tc_d="$T_TMP/config"; mkdir -p "$_tc_d"
-  # the defaults in the script and the ones --create-config prints must agree
+  # Each default exists ONCE: in default_config_content(). A second assignment
+  # of a setting before it -- the old defaults block -- is a copy that drifts.
   "$0" --create-config >"$_tc_d/default" 2>&1
+  _tc_keys="$(sed -n 's/^\([A-Z_][A-Z0-9_]*\)=.*/\1/p' "$_tc_d/default")"
   _tc_bad=""
-  for _tc_k in OCRAPP_MRC OCRAPP_IMAGE_QUALITY_MRC OCRAPP_IMAGE_QUALITY_NO_MRC OCRAPP_SPLIT_FACING_PAGES; do
-    _tc_c="$(sed -n "s/^$_tc_k=\([0-9]*\).*/\1/p" "$_tc_d/default")"
-    case "$_tc_k" in
-      OCRAPP_MRC) _tc_s="$OCRAPP_MRC" ;;
-      OCRAPP_IMAGE_QUALITY_MRC) _tc_s="$OCRAPP_IMAGE_QUALITY_MRC" ;;
-      OCRAPP_IMAGE_QUALITY_NO_MRC) _tc_s="$OCRAPP_IMAGE_QUALITY_NO_MRC" ;;
-      OCRAPP_SPLIT_FACING_PAGES) _tc_s="$OCRAPP_SPLIT_FACING_PAGES" ;;
-    esac
-    [ "$_tc_c" = "$_tc_s" ] || _tc_bad="$_tc_bad $_tc_k(config $_tc_c, script $_tc_s)"
+  for _tc_k in $_tc_keys; do
+    awk -v k="$_tc_k" '/^default_config_content\(\)/{exit} $0 ~ "^[ \t]*" k "=" {f=1} END{exit !f}' "$0" \
+      && _tc_bad="$_tc_bad $_tc_k"
   done
-  if [ -z "$_tc_bad" ]; then t_ok "config: --create-config prints exactly the built-in defaults"
-  else t_bad "config: --create-config prints exactly the built-in defaults" "differ:$_tc_bad"; fi
+  if [ -n "$_tc_keys" ] && [ -z "$_tc_bad" ]; then t_ok "config: every setting ($(echo "$_tc_keys" | wc -w | tr -d ' ')) has its default only in default_config_content()"
+  else t_bad "config: every setting has its default only in default_config_content()" "also assigned before it:$_tc_bad"; fi
+  # ...and that one place is what the script loads: once, before main sources
+  # a config file on top of it
+  # shellcheck disable=SC2016  # matching literal source text
+  if awk '/^eval "\$\(default_config_content\)"$/{e=NR; c++} /^\[ -n "\$CONFIG_FILE" \] && \{ \. /{m=NR}
+          END{exit !(c == 1 && m && e < m)}' "$0"; then
+    t_ok "config: the defaults are loaded from default_config_content(), before a config file"
+  else
+    t_bad "config: the defaults are loaded from default_config_content(), before a config file" "no single eval of it ahead of main"
+  fi
   # a config really takes effect -- by the env var, and by --config
   printf 'OCRAPP_MRC=1\n' >"$_tc_d/mrc.conf"
   _tc_o="$(MY_OCR_CONFIG="$_tc_d/mrc.conf" "$0" status 2>&1)"
@@ -4492,7 +4494,7 @@ t_stall_recovery() {
   # evidence says the app is NOT working -- and that evidence must exist on the
   # FIRST look, which is the one the first alert fires on.
   # shellcheck disable=SC2016  # matching literal source text
-  _cs_blk="$(awk '/if \[ \$stalled -ge \$next_alert \]; then/,/next_alert=\$\(\( \$stalled/' "$0")"
+  _cs_blk="$(awk '/if \[ "\$stalled" -ge "\$next_alert" \]; then/,/next_alert=\$\(\( \$stalled/' "$0")"
   if printf '%s\n' "$_cs_blk" | awk '/_cpu_busy/{b=NR} /alert_stuck/{a=NR} END{exit !(b && a && b < a)}'; then
     t_ok "stall: the periodic notice alerts only when the cpu says the app is NOT working"
   else

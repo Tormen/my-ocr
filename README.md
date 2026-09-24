@@ -67,17 +67,42 @@ command to retry it is printed. It refuses while a run is live.
 `my-ocr --create-config` prints the default config; `--create-config <FILE>`
 writes it (never over an existing file). The first found of `$MY_OCR_CONFIG`,
 `--config <FILE>`, `/LINKS/default/my-ocr.conf`, `/LINKS/default/my-ocr`,
-`~/.my-ocr.conf`, `/etc/my-ocr.conf`, `/usr/local/etc/my-ocr.conf` is read. For
-now the file is optional: whatever it does not set keeps the built-in default.
+`~/.my-ocr.conf`, `/etc/my-ocr.conf`, `/usr/local/etc/my-ocr.conf` is read.
+
+The printed text IS my-ocr's defaults: it loads that first and the file on top.
+So the file is optional, and one that holds only the lines it changes is
+complete. Every setting, with the reasons behind each default, is in the
+`--create-config` output:
 
 | key | default | meaning |
 |---|---|---|
+| `S_PATH` | `~/Public/,ocr.in` | the folder the Folder Action watches |
+| `T_PATH` | `~/Public/,ocr.out` | where the OCR application writes its results |
+| `RESET_RETRY_TO` | `~/Public/,ocr.retry` | where `reset` moves stranded documents |
+| `MOVE_FAILED_TO` | `""` | where failed originals go; `""` = leave them in place |
+| `STUCK_MARKER_DIR` | `~/Desktop` | where the STUCK marker lands |
+| `OCR_LANGUAGES` | `German,English,French,GermanLuxembourg` | recognition languages |
+| `NO_OCR_FILENAME_PATTERNS` | `no-ocr-scan*` | filenames never OCRed |
+| `REVEAL_IN_FINDER` | `auto` | `auto` (terminal runs only), `always`, `never` |
 | `OCRAPP_MRC` | `0` | "Compress images using MRC" |
 | `OCRAPP_IMAGE_QUALITY_MRC` | `2` | image quality when MRC is on: 0 Low, 1 Balanced, 2 High |
 | `OCRAPP_IMAGE_QUALITY_NO_MRC` | `1` | image quality when MRC is off |
 | `OCRAPP_SPLIT_FACING_PAGES` | `0` | the OCR application's "Split facing pages" |
+| `OCRAPP_MUTEX_TIMEOUT` | `1800` | s a run queues for its turn |
+| `OCRAPP_TIMEOUT` | `1800` | s to wait for the OCR application, or for a dead run's batch |
+| `STALL_ALERT_AFTER` | `300` | s without progress before the first alert |
+| `STALL_REALERT_EVERY` | `3600` | s between further alerts |
+| `OCRAPP_IDLE_GIVEUP` | `120` | s of near-zero cpu while stalled before recovering; 0 = never |
+| `OCRAPP_IDLE_MAX_CPU_PER_MIN` | `3` | "near zero": s of cpu per minute |
+| `OCRAPP_TRIGGER_WAIT` | `60` | s without the OCR application before re-making the hand-over once; 0 = never |
+| `FA_RESTART_WAIT` | `10` | s to wait for a restarted Folder Actions dispatcher |
+| `OSASCRIPT_TIMEOUT` | `180` | s any osascript call may take |
 
-The first three are the two export controls of the Automator step; the quality
+The workflow carries `S_PATH`, `T_PATH` and the three export keys, so changing
+any of them needs `my-ocr setup go` again; `status` reports a MISMATCH for the
+export keys. "Split facing pages" is set by every run.
+
+`OCRAPP_MRC` and the two qualities are the export controls of the Automator step; the quality
 follows the MRC switch, so each mode carries its own. They are written into the
 workflow by `setup go` -- nothing changes them at run time -- and `status` reads
 them back out of the installed workflow and reports a MISMATCH when the config
