@@ -14,11 +14,11 @@ NL="
 # and is authoritative at runtime -- the deployed copy needs no git and no
 # repository. The build id is a hash of this file, so it is right even unstamped.
 SCRIPT_VERSION="v1.0"
-SCRIPT_COMMIT="ccaa0fd"           # rewritten by 'my-ocr stamp-version'
+SCRIPT_COMMIT="548ec54"           # rewritten by 'my-ocr stamp-version'
 # What git said when this build was stamped: 'git describe --tags --long' --
 # <nearest tag>-<commits since it>-g<short sha>. It says whether these bytes
 # ARE that release or work on top of it, on a machine with no git.
-SCRIPT_RELEASE="v1.0-40-gccaa0fd"
+SCRIPT_RELEASE="v1.0-41-g548ec54"
 
 WHOAMI="$(/usr/bin/whoami)"
 [ "$USER" = "$WHOAMI" ] || err 126 "USER '$USER' ? != ? '$WHOAMI' WHOAMI"
@@ -1857,7 +1857,17 @@ session, so AUTOMATOR will never run. Use:  su - ${_t_gui:-<console user>} -c '$
   [ -e "$PARTx_ERRORED_FLAGFILE" ] && { rm "$PARTx_ERRORED_FLAGFILE" || err 083 "Failed to 'rm \"$PARTx_ERRORED_FLAGFILE\"'"; }
   touch "$PARTx_ERRORED_FLAGFILE" || err 027
 
-  [ -s "$QUEUED_FILE_MOVES_LOG" ] && err 047 "Found QUEUED_FILE_MOVES_LOG '$QUEUED_FILE_MOVES_LOG':
+  # A queue log here belongs to a run that is GONE -- this one holds the mutex,
+  # so its owner cannot be alive (a KILLed run cannot clean up; nothing can trap
+  # that). Refusing left the documents waiting for someone to type 'reset go',
+  # and the refusal is what my-scan once mistook for success. So repair it the
+  # same way, right here, and fail only if the repair did not work.
+  if [ -s "$QUEUED_FILE_MOVES_LOG" ]; then
+    echo "$$| >>> [trigger-OCR] a run that is gone left its queue behind -- repairing it the way 'reset go' does:"
+    _rs_go=1; _rs_n=0
+    reset_stranded 2>&1 | sed "s/^/$$|  /"
+  fi
+  [ -s "$QUEUED_FILE_MOVES_LOG" ] && err 047 "Found QUEUED_FILE_MOVES_LOG '$QUEUED_FILE_MOVES_LOG' and could not repair it:
 
 $(cat "$QUEUED_FILE_MOVES_LOG"|sed -e "s/.*/${PFX}        | '&'/")
 
@@ -2961,77 +2971,14 @@ self_heal() {
 # a file in flight is MOVED to RESET_RETRY_TO, so a reset can always be undone
 # by looking in one folder -- which is what makes it safe to run when you have
 # no idea what is wrong.
-do_reset() {
-  _rs_go=""; [ "$1" = "go" ] && _rs_go=1
-  if [ -n "$_rs_go" ]; then
-    echo " >>> my-ocr RESET -- putting the machinery back to clean"
-  else
-    echo " >>> my-ocr RESET -- DRY RUN. Nothing is changed. Apply with: $US reset go"
-  fi
-  _rs_n=0
-
-  # A LIVE run is not a broken one. Refuse rather than pull the rug out.
-  if [ -d "$OCRAPP_MUTEX_DIR" ]; then
-    _rs_o="$(cat "$OCRAPP_MUTEX_DIR/owner" 2>/dev/null)"
-    _rs_p="${_rs_o#pid=}"; _rs_p="${_rs_p%% *}"
-    if run_is_alive "$_rs_p"; then
-      echo "  >> a my-ocr run is LIVE (${_rs_o:-unknown}) -- nothing reset."
-      echo "     Wait for it, or stop it first. reset never interrupts real work."
-      return 1
-    fi
-  fi
-
-  echo "  >> OCR mutex"
-  if [ -d "$OCRAPP_MUTEX_DIR" ]; then
-    if [ -z "$_rs_go" ]; then
-      echo "    > WOULD BREAK it: owner ${_rs_p:-unknown} is gone"
-    else
-      rm -f "$OCRAPP_MUTEX_DIR/owner"; rmdir "$OCRAPP_MUTEX_DIR" 2>/dev/null
-      echo "    > broke it: owner ${_rs_p:-unknown} is gone"; _rs_n=$(( _rs_n + 1 ))
-    fi
-  else
-    echo "    > free"
-  fi
-
-  echo "  >> leftovers from runs that are gone"
-  _rs_any=""
-  for _rs_f in $(stale_run_files); do
-    _rs_any=1
-    if [ -z "$_rs_go" ]; then echo "    > WOULD REMOVE ${_rs_f##*/}"
-    else rm -f "$_rs_f" && { echo "    > removed ${_rs_f##*/}"; _rs_n=$(( _rs_n + 1 )); }; fi
-  done
-  for _rs_f in "$PARTx_ERRORED_FLAGFILE" "$DBG_FLAGFILE" "$FORCE_FLAGFILE" "$INTERACTIVE_FLAGFILE"; do
-    [ -e "$_rs_f" ] || continue
-    _rs_any=1
-    if [ -z "$_rs_go" ]; then echo "    > WOULD REMOVE ${_rs_f##*/}"
-    else rm -f "$_rs_f" && { echo "    > removed ${_rs_f##*/}"; _rs_n=$(( _rs_n + 1 )); }; fi
-  done
-  [ -z "$_rs_any" ] && echo "    > none"
-
-  # A run that dies before part-2 orphans the OCR application. Every later run
-  # then sees it "already running", records it as pre-existing, and correctly
-  # leaves it alone -- so one crash leaks it for ever. With no my-ocr live, a
-  # running OCR app is by definition nobody's, and closing it is machinery.
-  echo "  >> $OCRAPP_NAME left over from a crashed run"
-  _rs_ap="$(pgrep -x "$OCRAPP_NAME" 2>/dev/null | xargs echo)"
-  if [ -z "$_rs_ap" ]; then
-    echo "    > not running"
-  elif [ -z "$_rs_go" ]; then
-    echo "    > WOULD CLOSE it (pid(s) $_rs_ap) -- no my-ocr run is live, so it is orphaned"
-  elif ocrapp_quit; then
-    echo "    > closed it (pid(s) $_rs_ap)"; _rs_n=$(( _rs_n + 1 ))
-  else
-    echo "    > FAILED to close it (pid(s) $_rs_ap) -- close it by hand"
-  fi
-
-  echo "  >> lockfile / queued moves"
-  if [ -s "$OCRAPP_LOCKFILE" ]; then
-    if [ -z "$_rs_go" ]; then echo "    > WOULD EMPTY the lockfile"
-    else printf "" > "$OCRAPP_LOCKFILE" && { echo "    > emptied the lockfile"; _rs_n=$(( _rs_n + 1 )); }; fi
-  else
-    echo "    > lockfile clean"
-  fi
-
+# The part of reset that deals with DOCUMENTS: what a dead run left in the
+# staging directories, those directories themselves, and the queue log --
+# last, as it is the only record of where each stranded file came from.
+# 'reset' runs it after the machinery; a run that finds a dead run's queue
+# log runs it alone, before it starts (the mutex is then its own, and the
+# OCR app -- which may be someone's -- is left alone). Uses reset's _rs_
+# variables: _rs_go ('' = dry run) and the _rs_n counter.
+reset_stranded() {
   # Documents stranded mid-flight: put them somewhere they can be RETRIED.
   echo "  >> stranded documents -> retry"
   _rs_dest="$RESET_RETRY_TO"
@@ -3118,6 +3065,80 @@ do_reset() {
   else
     echo "    > no queued moves outstanding"
   fi
+}
+
+do_reset() {
+  _rs_go=""; [ "$1" = "go" ] && _rs_go=1
+  if [ -n "$_rs_go" ]; then
+    echo " >>> my-ocr RESET -- putting the machinery back to clean"
+  else
+    echo " >>> my-ocr RESET -- DRY RUN. Nothing is changed. Apply with: $US reset go"
+  fi
+  _rs_n=0
+
+  # A LIVE run is not a broken one. Refuse rather than pull the rug out.
+  if [ -d "$OCRAPP_MUTEX_DIR" ]; then
+    _rs_o="$(cat "$OCRAPP_MUTEX_DIR/owner" 2>/dev/null)"
+    _rs_p="${_rs_o#pid=}"; _rs_p="${_rs_p%% *}"
+    if run_is_alive "$_rs_p"; then
+      echo "  >> a my-ocr run is LIVE (${_rs_o:-unknown}) -- nothing reset."
+      echo "     Wait for it, or stop it first. reset never interrupts real work."
+      return 1
+    fi
+  fi
+
+  echo "  >> OCR mutex"
+  if [ -d "$OCRAPP_MUTEX_DIR" ]; then
+    if [ -z "$_rs_go" ]; then
+      echo "    > WOULD BREAK it: owner ${_rs_p:-unknown} is gone"
+    else
+      rm -f "$OCRAPP_MUTEX_DIR/owner"; rmdir "$OCRAPP_MUTEX_DIR" 2>/dev/null
+      echo "    > broke it: owner ${_rs_p:-unknown} is gone"; _rs_n=$(( _rs_n + 1 ))
+    fi
+  else
+    echo "    > free"
+  fi
+
+  echo "  >> leftovers from runs that are gone"
+  _rs_any=""
+  for _rs_f in $(stale_run_files); do
+    _rs_any=1
+    if [ -z "$_rs_go" ]; then echo "    > WOULD REMOVE ${_rs_f##*/}"
+    else rm -f "$_rs_f" && { echo "    > removed ${_rs_f##*/}"; _rs_n=$(( _rs_n + 1 )); }; fi
+  done
+  for _rs_f in "$PARTx_ERRORED_FLAGFILE" "$DBG_FLAGFILE" "$FORCE_FLAGFILE" "$INTERACTIVE_FLAGFILE"; do
+    [ -e "$_rs_f" ] || continue
+    _rs_any=1
+    if [ -z "$_rs_go" ]; then echo "    > WOULD REMOVE ${_rs_f##*/}"
+    else rm -f "$_rs_f" && { echo "    > removed ${_rs_f##*/}"; _rs_n=$(( _rs_n + 1 )); }; fi
+  done
+  [ -z "$_rs_any" ] && echo "    > none"
+
+  # A run that dies before part-2 orphans the OCR application. Every later run
+  # then sees it "already running", records it as pre-existing, and correctly
+  # leaves it alone -- so one crash leaks it for ever. With no my-ocr live, a
+  # running OCR app is by definition nobody's, and closing it is machinery.
+  echo "  >> $OCRAPP_NAME left over from a crashed run"
+  _rs_ap="$(pgrep -x "$OCRAPP_NAME" 2>/dev/null | xargs echo)"
+  if [ -z "$_rs_ap" ]; then
+    echo "    > not running"
+  elif [ -z "$_rs_go" ]; then
+    echo "    > WOULD CLOSE it (pid(s) $_rs_ap) -- no my-ocr run is live, so it is orphaned"
+  elif ocrapp_quit; then
+    echo "    > closed it (pid(s) $_rs_ap)"; _rs_n=$(( _rs_n + 1 ))
+  else
+    echo "    > FAILED to close it (pid(s) $_rs_ap) -- close it by hand"
+  fi
+
+  echo "  >> lockfile / queued moves"
+  if [ -s "$OCRAPP_LOCKFILE" ]; then
+    if [ -z "$_rs_go" ]; then echo "    > WOULD EMPTY the lockfile"
+    else printf "" > "$OCRAPP_LOCKFILE" && { echo "    > emptied the lockfile"; _rs_n=$(( _rs_n + 1 )); }; fi
+  else
+    echo "    > lockfile clean"
+  fi
+
+  reset_stranded
 
   echo
   if [ -z "$_rs_go" ]; then
@@ -4159,8 +4180,47 @@ t_reset_stable() {
   fi
 }
 
+t_preflight_repair() {
+  # What a KILLed run leaves: its queue log and a staged copy of a document
+  # already filed. The NEXT run holds the mutex (a live owner -- itself), so
+  # 'reset' would refuse; the pre-flight repair must not.
+  _pr="$T_TMP/preflight"; mkdir -p "$_pr/bin" "$_pr/pub/my-ocr.pre_,ocr.in_TMP-path" "$_pr/filed" "$_pr/lib/mutex"
+  printf '#!/bin/dash\nshift 2>/dev/null\nrm -rf "$@"\n' >"$_pr/bin/trash"; chmod +x "$_pr/bin/trash"
+  printf 'the document\n' >"$_pr/filed/doc.pdf"
+  cp "$_pr/filed/doc.pdf" "$_pr/pub/my-ocr.pre_,ocr.in_TMP-path/doc.#1.pdf"
+  printf '%s\t%s\t%s\t%s\n' "$_pr/orig/doc.pdf" "$_pr/pub/my-ocr.pre_,ocr.in_TMP-path/doc.#1.pdf" \
+         "$_pr/out/doc.#1.pdf" "$_pr/filed/doc.pdf" >"$_pr/lib/files-2-move"
+  printf 'pid=%s at=now\n' "$$" >"$_pr/lib/mutex/owner"          # a LIVE owner
+  _pr_o="$(
+    t_reset_sandbox "$_pr"
+    do_reset go >"$_pr/reset.out" 2>&1; echo "RESET-RC=$?"
+    _rs_go=1; _rs_n=0; reset_stranded >"$_pr/repair.out" 2>&1
+    [ -s "$QUEUED_FILE_MOVES_LOG" ] || echo "QUEUE-GONE"
+    [ -e "$_pr/pub/my-ocr.pre_,ocr.in_TMP-path/doc.#1.pdf" ] || echo "COPY-GONE"
+    [ -f "$_pr/filed/doc.pdf" ] && echo "DOC-KEPT"
+  )"
+  case "$_pr_o" in
+    *"RESET-RC=1"*) t_ok "preflight: with a live mutex owner, 'reset' still refuses (it never interrupts a run)";;
+    *) t_bad "preflight: with a live mutex owner, 'reset' still refuses (it never interrupts a run)" "$_pr_o";;
+  esac
+  case "$_pr_o" in
+    *QUEUE-GONE*COPY-GONE*DOC-KEPT*) t_ok "preflight: a dead run's queue is repaired anyway -- duplicate trashed, queue log gone, document kept";;
+    *) t_bad "preflight: a dead run's queue is repaired anyway -- duplicate trashed, queue log gone, document kept" "$_pr_o // $(cat "$_pr/repair.out")";;
+  esac
+  # and a run REPAIRS before it would refuse -- err 047 only when that failed
+  # shellcheck disable=SC2016  # matching literal source text
+  if awk '/^do_trigger_ocr\(\) \{/,/^\}/' "$0" \
+     | awk '/^    reset_stranded /{r=NR} /err 047 /{e=NR} END{exit !(r && e && r < e)}'; then
+    t_ok "preflight: trigger-OCR repairs a dead run's queue before it would refuse (err 047)"
+  else
+    t_bad "preflight: trigger-OCR repairs a dead run's queue before it would refuse (err 047)" "err 047 is reachable without the repair"
+  fi
+}
+
 t_reset_log_last() {
-  _rl="$(awk '/^do_reset\(\)/,/^\}/' "$0")"
+  # the documents part of reset lives in reset_stranded(), shared with the
+  # pre-flight repair -- the order has to hold there
+  _rl="$(awk '/^reset_stranded\(\)/,/^\}/' "$0")"
   _rl_docs="$(printf '%s\n' "$_rl" | grep -n 'retry them with' | head -n 1 | cut -d: -f1)"
   _rl_log="$(printf '%s\n' "$_rl" | grep -n 'removed the queued-moves log' | head -n 1 | cut -d: -f1)"
   if [ -n "$_rl_docs" ] && [ -n "$_rl_log" ] && [ "$_rl_log" -gt "$_rl_docs" ]; then
@@ -5050,6 +5110,7 @@ do_run_tests() {
   t_bundle_pids
   t_reset_log_last
   t_reset_stable
+  t_preflight_repair
   t_trap_term
   t_fa_restart
   t_workflow_export
