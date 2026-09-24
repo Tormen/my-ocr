@@ -14,11 +14,11 @@ NL="
 # and is authoritative at runtime -- the deployed copy needs no git and no
 # repository. The build id is a hash of this file, so it is right even unstamped.
 SCRIPT_VERSION="v1.0"
-SCRIPT_COMMIT="e2cc8d6"           # rewritten by 'my-ocr stamp-version'
+SCRIPT_COMMIT="ccaa0fd"           # rewritten by 'my-ocr stamp-version'
 # What git said when this build was stamped: 'git describe --tags --long' --
 # <nearest tag>-<commits since it>-g<short sha>. It says whether these bytes
 # ARE that release or work on top of it, on a machine with no git.
-SCRIPT_RELEASE="v1.0-39-ge2cc8d6"
+SCRIPT_RELEASE="v1.0-40-gccaa0fd"
 
 WHOAMI="$(/usr/bin/whoami)"
 [ "$USER" = "$WHOAMI" ] || err 126 "USER '$USER' ? != ? '$WHOAMI' WHOAMI"
@@ -324,6 +324,28 @@ export_quality() { # sets EXPORT_Q (the value) and EXPORT_QK (the key it came fr
 }
 
 quality_name() { case "$1" in 0) echo Low;; 1) echo Balanced;; 2) echo High;; *) echo "?";; esac; }
+
+# Move a file into the Trash with mv -- 'trash' does not work on network shares
+# -- but NEVER onto a name that is already there. Moving onto it silently
+# destroyed the file trashed earlier under that name, and when that file
+# belonged to another user (the FTP scan user owns every original) the move was
+# refused outright: the document had been OCRed, and part-2 still died on this
+# last step (err 033, seen in production). A taken name gets a time suffix,
+# the way Finder does it. Leaves mv's own words in _tm_err when it fails.
+TRASH_DIR="$HOME/.Trash"
+trash_by_mv() { # $1 = file
+  _tm_b="${1##*/}"
+  case "$_tm_b" in
+    ?*.*) _tm_stem="${_tm_b%.*}"; _tm_ext=".${_tm_b##*.}" ;;
+    *)    _tm_stem="$_tm_b";      _tm_ext="" ;;
+  esac
+  _tm_t="$TRASH_DIR/$_tm_b"
+  if [ -e "$_tm_t" ] || [ -L "$_tm_t" ]; then
+    _tm_t="$TRASH_DIR/$_tm_stem $(date +%H-%M-%S)$_tm_ext"
+    if [ -e "$_tm_t" ] || [ -L "$_tm_t" ]; then _tm_t="$TRASH_DIR/$_tm_stem $(date +%H-%M-%S) $$$_tm_ext"; fi
+  fi
+  _tm_err="$(/bin/mv -- "$1" "$_tm_t" 2>&1)"
+}
 
 # What an installed workflow actually tells FineReader: "<mrc> <quality>", or
 # nothing. MRC is a BOOLEAN when setup wrote it and an INTEGER in the hand-built
@@ -1240,8 +1262,8 @@ looked at, and probably scanned again." >/dev/null 2>&1
         #[ $DBG ] && echo "${PFX}   --> \"$c_trash\" -- \"$orig_fp\"(==orig_fp)"
         #"$c_trash" -- "$orig_fp" || err 033 "FAILED to \"$c_trash\" -- \"$orig_fp\""
 
-        [ $DBG ] && echo "${PFX}   --> \"/bin/mv\" -- \"$orig_fp\"(==orig_fp) ~/.Trash/"
-        "/bin/mv" -- "$orig_fp" ~/.Trash/ || err 033 "FAILED to \"/bin/mv\" -- \"$orig_fp\" ~/.Trash/"
+        [ $DBG ] && echo "${PFX}   --> \"/bin/mv\" -- \"$orig_fp\"(==orig_fp) $TRASH_DIR/"
+        trash_by_mv "$orig_fp" || err 033 "FAILED to move \"$orig_fp\" into the Trash: $_tm_err"
       fi
 
 #XXX FIXME: seen in the wild (2020): part-2 aborted with ERROR 078 because
@@ -3856,6 +3878,46 @@ t_workflow_export() {
   esac
 }
 
+t_trash_by_mv() {
+  _tt_d="$T_TMP/trash-mv"; mkdir -p "$_tt_d/trash" "$_tt_d/in"
+  _tt_o="$(
+    TRASH_DIR="$_tt_d/trash"
+    echo earlier >"$_tt_d/trash/doc.pdf"                    # trashed before, same name
+    echo new >"$_tt_d/in/doc.pdf"
+    trash_by_mv "$_tt_d/in/doc.pdf" && echo "RC0"
+    echo plain >"$_tt_d/in/fresh.pdf"; trash_by_mv "$_tt_d/in/fresh.pdf" && echo "FRESH-RC0"
+    echo x >"$_tt_d/trash/noext"; echo y >"$_tt_d/in/noext"; trash_by_mv "$_tt_d/in/noext" && echo "NOEXT-RC0"
+    chmod 500 "$_tt_d/trash"; echo z >"$_tt_d/in/locked.pdf"
+    if trash_by_mv "$_tt_d/in/locked.pdf"; then echo "LOCKED-RC0"; else echo "LOCKED-FAILED [$_tm_err]"; fi
+    chmod 700 "$_tt_d/trash"
+  )"
+  _tt_doc=""; _tt_noext=""; _tt_all=""
+  for _tt_f in "$_tt_d/trash"/*; do
+    [ -e "$_tt_f" ] || continue
+    _tt_all="$_tt_all${_tt_f##*/}|"
+    case "${_tt_f##*/}" in
+      "doc "[0-9][0-9]-[0-9][0-9]-[0-9][0-9].pdf) _tt_doc=1 ;;
+      "noext "[0-9][0-9]-[0-9][0-9]-[0-9][0-9]) _tt_noext=1 ;;
+    esac
+  done
+  # THE production case: the name is taken -- the earlier file must SURVIVE
+  if [ "$(cat "$_tt_d/trash/doc.pdf" 2>/dev/null)" = "earlier" ] && [ -n "$_tt_doc" ] \
+     && [ ! -e "$_tt_d/in/doc.pdf" ] && case "$_tt_o" in *RC0*) true;; *) false;; esac; then
+    t_ok "trash: a taken name is never overwritten -- the new one gets a time suffix, the earlier survives"
+  else
+    t_bad "trash: a taken name is never overwritten -- the new one gets a time suffix, the earlier survives" \
+          "trash holds: $_tt_all earlier=[$(cat "$_tt_d/trash/doc.pdf" 2>/dev/null)] out=[$_tt_o]"
+  fi
+  if [ "$(cat "$_tt_d/trash/fresh.pdf" 2>/dev/null)" = "plain" ]; then t_ok "trash: a free name is used as it is"
+  else t_bad "trash: a free name is used as it is" "$_tt_all"; fi
+  if [ -n "$_tt_noext" ]; then t_ok "trash: a name without an extension gets the suffix at the end"
+  else t_bad "trash: a name without an extension gets the suffix at the end" "$_tt_all"; fi
+  case "$_tt_o" in
+    *"LOCKED-FAILED ["?*"]"*) t_ok "trash: a refused move fails, and carries mv's own words";;
+    *) t_bad "trash: a refused move fails, and carries mv's own words" "$_tt_o";;
+  esac
+}
+
 t_config_file() {
   _tc_d="$T_TMP/config"; mkdir -p "$_tc_d"
   # the defaults in the script and the ones --create-config prints must agree
@@ -4993,6 +5055,7 @@ do_run_tests() {
   t_workflow_export
   t_config_file
   t_split_pref
+  t_trash_by_mv
   t_open_cmd
   t_nudge
   t_staging_sweep
