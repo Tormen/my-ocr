@@ -14,11 +14,11 @@ NL="
 # and is authoritative at runtime -- the deployed copy needs no git and no
 # repository. The build id is a hash of this file, so it is right even unstamped.
 SCRIPT_VERSION="v1.0"
-SCRIPT_COMMIT="548ec54"           # rewritten by 'my-ocr stamp-version'
+SCRIPT_COMMIT="f8ebde3"           # rewritten by 'my-ocr stamp-version'
 # What git said when this build was stamped: 'git describe --tags --long' --
 # <nearest tag>-<commits since it>-g<short sha>. It says whether these bytes
 # ARE that release or work on top of it, on a machine with no git.
-SCRIPT_RELEASE="v1.0-41-g548ec54"
+SCRIPT_RELEASE="v1.0-42-gf8ebde3"
 
 WHOAMI="$(/usr/bin/whoami)"
 [ "$USER" = "$WHOAMI" ] || err 126 "USER '$USER' ? != ? '$WHOAMI' WHOAMI"
@@ -1857,16 +1857,7 @@ session, so AUTOMATOR will never run. Use:  su - ${_t_gui:-<console user>} -c '$
   [ -e "$PARTx_ERRORED_FLAGFILE" ] && { rm "$PARTx_ERRORED_FLAGFILE" || err 083 "Failed to 'rm \"$PARTx_ERRORED_FLAGFILE\"'"; }
   touch "$PARTx_ERRORED_FLAGFILE" || err 027
 
-  # A queue log here belongs to a run that is GONE -- this one holds the mutex,
-  # so its owner cannot be alive (a KILLed run cannot clean up; nothing can trap
-  # that). Refusing left the documents waiting for someone to type 'reset go',
-  # and the refusal is what my-scan once mistook for success. So repair it the
-  # same way, right here, and fail only if the repair did not work.
-  if [ -s "$QUEUED_FILE_MOVES_LOG" ]; then
-    echo "$$| >>> [trigger-OCR] a run that is gone left its queue behind -- repairing it the way 'reset go' does:"
-    _rs_go=1; _rs_n=0
-    reset_stranded 2>&1 | sed "s/^/$$|  /"
-  fi
+  preflight_dead_queue
   [ -s "$QUEUED_FILE_MOVES_LOG" ] && err 047 "Found QUEUED_FILE_MOVES_LOG '$QUEUED_FILE_MOVES_LOG' and could not repair it:
 
 $(cat "$QUEUED_FILE_MOVES_LOG"|sed -e "s/.*/${PFX}        | '&'/")
@@ -2971,6 +2962,32 @@ self_heal() {
 # a file in flight is MOVED to RESET_RETRY_TO, so a reset can always be undone
 # by looking in one folder -- which is what makes it safe to run when you have
 # no idea what is wrong.
+# A queue log found at the start of a run belongs to a run whose TRIGGER is gone
+# -- this run holds the mutex. Refusing (err 047) left the documents waiting for
+# someone to type 'reset go'. But a dead trigger is not a dead run: its batch
+# may still be inside the OCR app, and its part-2 may still be waiting to file
+# it. Repairing then pulled a staged copy out from under a working OCR and took
+# the queue from a part-2 that still needed it (seen on ada, in a kill -9 test).
+# So: wait while any of that run's work is alive -- its own part-2 usually
+# finishes and removes the queue, leaving nothing to repair -- and repair only
+# once none is. Still busy after OCRAPP_TIMEOUT: leave it, the caller refuses.
+preflight_dead_queue() {
+  [ -s "$QUEUED_FILE_MOVES_LOG" ] || return 0
+  _pf_w=0
+  while pgrep -x "$OCRAPP_NAME" >/dev/null 2>&1 || pgrep -f "$US --part-[12]" >/dev/null 2>&1; do
+    [ -s "$QUEUED_FILE_MOVES_LOG" ] || return 0           # its part-2 finished the job
+    [ "$_pf_w" -eq 0 ] && echo "$$| >>> [trigger-OCR] a run that is gone left its queue, and its batch is still at work ($OCRAPP_NAME or its part-2) -- waiting for it to finish"
+    [ "$_pf_w" -ge "${OCRAPP_TIMEOUT:-1800}" ] && {
+      echo "$$| >>> [trigger-OCR] still at work after ${_pf_w}s -- not touching it"; return 1; }
+    sleep 5; _pf_w=$(( _pf_w + 5 ))
+  done
+  [ -s "$QUEUED_FILE_MOVES_LOG" ] || return 0
+  echo "$$| >>> [trigger-OCR] a run that is gone left its queue, and nothing of it is at work any more -- repairing it the way 'reset go' does:"
+  _rs_go=1; _rs_n=0
+  reset_stranded 2>&1 | sed "s/^/$$|  /"
+  return 0
+}
+
 # The part of reset that deals with DOCUMENTS: what a dead run left in the
 # staging directories, those directories themselves, and the queue log --
 # last, as it is the only record of where each stranded file came from.
@@ -4180,21 +4197,30 @@ t_reset_stable() {
   fi
 }
 
+t_pf_app() { # the stand-in OCR app and the wait -- called INSIDE a subshell only
+  OCRAPP_NAME="$1"; OCRAPP_TIMEOUT="$2"
+}
+
 t_preflight_repair() {
   # What a KILLed run leaves: its queue log and a staged copy of a document
   # already filed. The NEXT run holds the mutex (a live owner -- itself), so
-  # 'reset' would refuse; the pre-flight repair must not.
-  _pr="$T_TMP/preflight"; mkdir -p "$_pr/bin" "$_pr/pub/my-ocr.pre_,ocr.in_TMP-path" "$_pr/filed" "$_pr/lib/mutex"
-  printf '#!/bin/dash\nshift 2>/dev/null\nrm -rf "$@"\n' >"$_pr/bin/trash"; chmod +x "$_pr/bin/trash"
-  printf 'the document\n' >"$_pr/filed/doc.pdf"
-  cp "$_pr/filed/doc.pdf" "$_pr/pub/my-ocr.pre_,ocr.in_TMP-path/doc.#1.pdf"
-  printf '%s\t%s\t%s\t%s\n' "$_pr/orig/doc.pdf" "$_pr/pub/my-ocr.pre_,ocr.in_TMP-path/doc.#1.pdf" \
-         "$_pr/out/doc.#1.pdf" "$_pr/filed/doc.pdf" >"$_pr/lib/files-2-move"
-  printf 'pid=%s at=now\n' "$$" >"$_pr/lib/mutex/owner"          # a LIVE owner
+  # 'reset' refuses; the pre-flight repair must not -- but only once nothing of
+  # the dead run is still at work.
+  _pr="$T_TMP/preflight"
+  _pr_world() {
+    rm -rf "$_pr"; mkdir -p "$_pr/bin" "$_pr/pub/my-ocr.pre_,ocr.in_TMP-path" "$_pr/filed" "$_pr/lib/mutex"
+    printf '#!/bin/dash\nshift 2>/dev/null\nrm -rf "$@"\n' >"$_pr/bin/trash"; chmod +x "$_pr/bin/trash"
+    printf 'the document\n' >"$_pr/filed/doc.pdf"
+    cp "$_pr/filed/doc.pdf" "$_pr/pub/my-ocr.pre_,ocr.in_TMP-path/doc.#1.pdf"
+    printf '%s\t%s\t%s\t%s\n' "$_pr/orig/doc.pdf" "$_pr/pub/my-ocr.pre_,ocr.in_TMP-path/doc.#1.pdf" \
+           "$_pr/out/doc.#1.pdf" "$_pr/filed/doc.pdf" >"$_pr/lib/files-2-move"
+    printf 'pid=%s at=now\n' "$$" >"$_pr/lib/mutex/owner"          # a LIVE owner
+  }
+  _pr_world
   _pr_o="$(
     t_reset_sandbox "$_pr"
     do_reset go >"$_pr/reset.out" 2>&1; echo "RESET-RC=$?"
-    _rs_go=1; _rs_n=0; reset_stranded >"$_pr/repair.out" 2>&1
+    preflight_dead_queue >"$_pr/repair.out" 2>&1; echo "PF-RC=$?"
     [ -s "$QUEUED_FILE_MOVES_LOG" ] || echo "QUEUE-GONE"
     [ -e "$_pr/pub/my-ocr.pre_,ocr.in_TMP-path/doc.#1.pdf" ] || echo "COPY-GONE"
     [ -f "$_pr/filed/doc.pdf" ] && echo "DOC-KEPT"
@@ -4204,16 +4230,51 @@ t_preflight_repair() {
     *) t_bad "preflight: with a live mutex owner, 'reset' still refuses (it never interrupts a run)" "$_pr_o";;
   esac
   case "$_pr_o" in
-    *QUEUE-GONE*COPY-GONE*DOC-KEPT*) t_ok "preflight: a dead run's queue is repaired anyway -- duplicate trashed, queue log gone, document kept";;
-    *) t_bad "preflight: a dead run's queue is repaired anyway -- duplicate trashed, queue log gone, document kept" "$_pr_o // $(cat "$_pr/repair.out")";;
+    *"PF-RC=0"*QUEUE-GONE*COPY-GONE*DOC-KEPT*) t_ok "preflight: nothing of the dead run at work -- its queue is repaired: duplicate trashed, queue log gone, document kept";;
+    *) t_bad "preflight: nothing of the dead run at work -- its queue is repaired" "$_pr_o // $(cat "$_pr/repair.out")";;
   esac
-  # and a run REPAIRS before it would refuse -- err 047 only when that failed
+
+  # THE ada CASE: the dead run's batch is still in the OCR app. Then it is not
+  # dead, and NOTHING may be touched -- here the app outlives the wait.
+  _pr_world; mkdir -p "$_pr/app"; _pr_n="mopf$$"; ln -s /bin/sleep "$_pr/app/$_pr_n"
+  "$_pr/app/$_pr_n" 30 & _pr_app=$!
+  sleep 1
+  _pr_o="$(
+    t_reset_sandbox "$_pr"; t_pf_app "$_pr_n" 5
+    preflight_dead_queue >"$_pr/busy.out" 2>&1; echo "PF-RC=$?"
+    [ -s "$QUEUED_FILE_MOVES_LOG" ] && echo "QUEUE-KEPT"
+    [ -e "$_pr/pub/my-ocr.pre_,ocr.in_TMP-path/doc.#1.pdf" ] && echo "COPY-KEPT"
+  )"
+  kill "$_pr_app" 2>/dev/null; wait "$_pr_app" 2>/dev/null
+  case "$_pr_o" in
+    *"PF-RC=1"*QUEUE-KEPT*COPY-KEPT*) t_ok "preflight: while the dead run's batch is still in the OCR app, nothing is touched -- and it gives up, it does not repair";;
+    *) t_bad "preflight: while the dead run's batch is still in the OCR app, nothing is touched" "$_pr_o // $(cat "$_pr/busy.out")";;
+  esac
+
+  # ...and the usual ending: that run's own part-2 finishes and removes its
+  # queue while we wait -- then there is nothing to repair at all
+  _pr_world; mkdir -p "$_pr/app"; ln -s /bin/sleep "$_pr/app/$_pr_n"
+  "$_pr/app/$_pr_n" 30 & _pr_app=$!
+  ( sleep 3; rm -f "$_pr/lib/files-2-move" ) &
+  sleep 1
+  _pr_o="$(
+    t_reset_sandbox "$_pr"; t_pf_app "$_pr_n" 20
+    preflight_dead_queue >"$_pr/done.out" 2>&1; echo "PF-RC=$?"
+    [ -e "$_pr/pub/my-ocr.pre_,ocr.in_TMP-path/doc.#1.pdf" ] && echo "COPY-UNTOUCHED"
+  )"
+  kill "$_pr_app" 2>/dev/null; wait "$_pr_app" 2>/dev/null
+  case "$_pr_o" in
+    *"PF-RC=0"*COPY-UNTOUCHED*) t_ok "preflight: when the old run finishes its own queue while we wait, nothing is repaired";;
+    *) t_bad "preflight: when the old run finishes its own queue while we wait, nothing is repaired" "$_pr_o // $(cat "$_pr/done.out")";;
+  esac
+
+  # and trigger-OCR goes through it before it would refuse (err 047)
   # shellcheck disable=SC2016  # matching literal source text
   if awk '/^do_trigger_ocr\(\) \{/,/^\}/' "$0" \
-     | awk '/^    reset_stranded /{r=NR} /err 047 /{e=NR} END{exit !(r && e && r < e)}'; then
-    t_ok "preflight: trigger-OCR repairs a dead run's queue before it would refuse (err 047)"
+     | awk '/^  preflight_dead_queue$/{r=NR} /err 047 /{e=NR} END{exit !(r && e && r < e)}'; then
+    t_ok "preflight: trigger-OCR runs it before it would refuse (err 047)"
   else
-    t_bad "preflight: trigger-OCR repairs a dead run's queue before it would refuse (err 047)" "err 047 is reachable without the repair"
+    t_bad "preflight: trigger-OCR runs it before it would refuse (err 047)" "err 047 is reachable without it"
   fi
 }
 
