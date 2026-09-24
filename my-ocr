@@ -1,6 +1,6 @@
 #!/bin/dash
 
-# 177 == highest used errCode
+# 178 == highest used errCode
 
 US="${0##*/}";   # get filename without path
 
@@ -14,11 +14,15 @@ NL="
 # and is authoritative at runtime -- the deployed copy needs no git and no
 # repository. The build id is a hash of this file, so it is right even unstamped.
 SCRIPT_VERSION="v1.0"
-SCRIPT_COMMIT="9775b60"           # rewritten by 'my-ocr stamp-version'
+SCRIPT_COMMIT="203c78d"           # rewritten by 'my-ocr stamp-version'
 # What git said when this build was stamped: 'git describe --tags --long' --
 # <nearest tag>-<commits since it>-g<short sha>. It says whether these bytes
 # ARE that release or work on top of it, on a machine with no git.
-SCRIPT_RELEASE="v1.0-47-g9775b60"
+SCRIPT_RELEASE="v1.0-48-g203c78d"
+# The commit the stamped one sits on. SCRIPT_COMMIT itself is never pushed --
+# the amend replaces it -- so no other clone has it; its parent is always
+# there, and that is what proves a repository is this tool's own.
+SCRIPT_PARENT="ef58141"
 
 WHOAMI="$(/usr/bin/whoami)"
 [ "$USER" = "$WHOAMI" ] || err 126 "USER '$USER' ? != ? '$WHOAMI' WHOAMI"
@@ -2544,10 +2548,13 @@ do_version() {
   _vd="$(git -c safe.directory='*' -C "$(_self_dir)" describe --tags --long 2>/dev/null)"
   # describe answers about WHERE this file sits, not about what it is: a copy
   # dropped in a foreign repo gets THAT repo's tags (/LINKS/global is one, and
-  # it holds the copies update-LINKS promotes). The stamped commit is the
-  # proof -- a repo that does not have it is not this tool's repo.
-  if [ -n "$_vd" ] && [ -n "$SCRIPT_COMMIT" ] \
-     && ! git -c safe.directory='*' -C "$(_self_dir)" cat-file -e "${SCRIPT_COMMIT}^{commit}" 2>/dev/null; then
+  # it holds the copies update-LINKS promotes). The stamped PARENT is the
+  # proof -- a repo that does not have it is not this tool's repo. Not
+  # SCRIPT_COMMIT: that one only ever existed in the clone that stamped, so
+  # every other checkout of the real repo was taken for a foreign one.
+  _vproof="${SCRIPT_PARENT:-$SCRIPT_COMMIT}"
+  if [ -n "$_vd" ] && [ -n "$_vproof" ] \
+     && ! git -c safe.directory='*' -C "$(_self_dir)" cat-file -e "${_vproof}^{commit}" 2>/dev/null; then
     _vd=""
   fi
   # The stamp is a PAIR, written together: without SCRIPT_COMMIT there is no
@@ -2635,11 +2642,15 @@ do_stamp_version() {
   # git's own spelling, kept verbatim so it can be pasted back into git
   _desc="$(git -c safe.directory='*' -C "$(_self_dir)" describe --tags --long 2>/dev/null)"
   _tmp="$0.stamp.$$"
+  _par="$(git -C "$_dir" rev-parse --short HEAD~1 2>/dev/null)"   # "" for a first commit
   sed -e "s|^SCRIPT_COMMIT=\".*\"|SCRIPT_COMMIT=\"$_sha\"|" \
-      -e "s|^SCRIPT_RELEASE=\".*\"|SCRIPT_RELEASE=\"$_desc\"|" "$0" >"$_tmp" \
+      -e "s|^SCRIPT_RELEASE=\".*\"|SCRIPT_RELEASE=\"$_desc\"|" \
+      -e "s|^SCRIPT_PARENT=\".*\"|SCRIPT_PARENT=\"$_par\"|" "$0" >"$_tmp" \
     || { rm -f "$_tmp"; err 147 "FAILED to rewrite SCRIPT_COMMIT."; }
   grep -q "^SCRIPT_COMMIT=\"$_sha\"" "$_tmp" \
     || { rm -f "$_tmp"; err 148 "SCRIPT_COMMIT line not found -- refusing to install."; }
+  grep -q "^SCRIPT_PARENT=\"$_par\"" "$_tmp" \
+    || { rm -f "$_tmp"; err 178 "SCRIPT_PARENT line not found -- refusing to install."; }
 
   _mode="$(/usr/bin/stat -f '%Lp' "$0")" || _mode=750
   if ! { chmod "$_mode" "$_tmp" && mv -f "$_tmp" "$0"; }; then
@@ -4436,6 +4447,55 @@ t_errflag_cleanup() {
   fi
 }
 
+# --version in ANOTHER clone of this tool's repo. The proof that a repository is
+# the tool's own was the stamped SCRIPT_COMMIT -- a commit the amend replaces and
+# that is therefore never pushed. So every checkout but the one that stamped
+# (the scan host's) was taken for a foreign repo and fell back to the stamp. The
+# proof is the stamped PARENT now. The stamp itself is recreated here -- the
+# real one runs this suite first -- and checked separately below. The case the
+# proof exists for must still hold: a copy in a foreign repo reports NOT its tags.
+t_version_clone() {
+  _vc="$T_TMP/vclone"; rm -rf "$_vc"; mkdir -p "$_vc/src" "$_vc/foreign"
+  cp "$0" "$_vc/src/$US"
+  (
+    cd "$_vc/src" && git init -q && git config user.email t@example.invalid \
+      && git config user.name t && git add -- "$US" && git commit -qm one \
+      && git tag v1.0 && echo "# two" >>"$US" && git commit -qam two \
+      && _vx="$(git rev-parse --short HEAD)" && _vp="$(git rev-parse --short HEAD~1)" \
+      && sed -e "s|^SCRIPT_COMMIT=\"[^\"]*\"|SCRIPT_COMMIT=\"$_vx\"|" \
+             -e "s|^SCRIPT_PARENT=\".*\"|SCRIPT_PARENT=\"$_vp\"|" "$US" >"$US.tmp" \
+      && mv "$US.tmp" "$US" && chmod +x "$US" && git commit -q --amend -a --no-edit
+  ) || { t_bad "--version in another clone: set-up" "could not build the test repo"; return; }
+  # --no-local: a clone from a PATH copies the object store wholesale, the
+  # unpushed pre-amend commit included -- and then the old proof passed too.
+  # A clone over a transport gets only what is reachable, as one from GitHub.
+  git clone -q --no-local "$_vc/src" "$_vc/clone" 2>/dev/null
+  _vc_head="$(git -C "$_vc/clone" rev-parse --short HEAD)"
+  _vc_o="$("$_vc/clone/$US" --version 2>&1)"
+  case "$_vc_o" in
+    *"v1.0-1-g$_vc_head"*) t_ok "--version in another clone names git's HEAD ($_vc_head), not the stamp";;
+    *) t_bad "--version in another clone names git's HEAD ($_vc_head), not the stamp" "got: $_vc_o";;
+  esac
+  (
+    cd "$_vc/foreign" && git init -q && git config user.email t@example.invalid \
+      && git config user.name t && echo x >x && git add x && git commit -qm x \
+      && git tag v9.9 && cp "$_vc/src/$US" . && git add -- "$US" && git commit -qm copy
+  ) >/dev/null 2>&1
+  _vc_o="$("$_vc/foreign/$US" --version 2>&1)"
+  case "$_vc_o" in
+    *v9.9*) t_bad "--version in a FOREIGN repo does not report that repo's tag" "got: $_vc_o";;
+    *) t_ok "--version in a FOREIGN repo does not report that repo's tag";;
+  esac
+  # the real stamp writes the parent, and refuses to install without it
+  # shellcheck disable=SC2016  # matching literal source text
+  if awk '/^do_stamp_version\(\)/,/^}/' "$0" | grep -q 's|^SCRIPT_PARENT=' \
+     && awk '/^do_stamp_version\(\)/,/^}/' "$0" | grep -q 'grep -q "^SCRIPT_PARENT='; then
+    t_ok "stamp-version records SCRIPT_PARENT, and checks it landed"
+  else
+    t_bad "stamp-version records SCRIPT_PARENT, and checks it landed" "do_stamp_version() does not"
+  fi
+}
+
 t_reset_log_last() {
   # the documents part of reset lives in reset_stranded(), shared with the
   # pre-flight repair -- the order has to hold there
@@ -5332,6 +5392,7 @@ do_run_tests() {
   t_reset_stable
   t_preflight_repair
   t_errflag_cleanup
+  t_version_clone
   t_trap_term
   t_fa_restart
   t_workflow_export
