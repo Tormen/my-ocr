@@ -45,11 +45,47 @@ per-run file carries the pid of the run that owns it. That is what makes
 staleness decidable instead of guessed, and what lets a crashed run's leftovers
 be swept without touching a live one's.
 
+## When FineReader gets stuck
+
+The OCR application is unmaintained; it will crash, hang, leave debris behind
+and sit on dialogs. my-ocr treats each of those as routine:
+
+- **Every run starts clean.** Right after taking the mutex, before it creates a
+  file of its own, a run looks for what a run that is gone left behind. While
+  that run's work is still going -- its Folder Action steps, or the OCR
+  application on its batch -- it waits. Then it repairs the rest the way
+  `reset go` would: the queue, and the staged copies its cleanup never removed.
+  A run releases the mutex only after its own shared files are gone.
+- **No launch onto a recovery dialog.** A half-built document the application
+  left behind is cleared before every launch -- but only when it is provably
+  my-ocr's: the paths it names lie in my-ocr's staging, or every page source in
+  it is a byte-identical copy of a document this run staged. Anything else is
+  left alone and reported.
+- **A stall is judged by CPU time.** A queue that does not move is not an
+  alarm while the application is measurably working, however long it takes.
+  Near-zero CPU while the queue stands still means it waits on a dialog.
+- **One retry.** A stalled chunk is handed over ONCE more: the application is
+  closed, the machinery is put back as the first hand-over found it, and the
+  same staged documents go in again. Only a second stall gives up, and the
+  documents go back as failed. There is no retry once a document of the chunk
+  has been filed, since a second hand-over would OCR it again.
+- **A hand-over that never fires** is made again once; if that fails too, the
+  Folder Actions dispatcher is restarted once, since it can wedge while every
+  check reports it healthy.
+- **One incident, one marker, a few mails.** Mails go out on changes of state
+  only -- `STUCK`, `STUCK -- retrying`, then `STUCK -- gave up` or `RESOLVED` --
+  and one marker file on the Desktop holds the incident's timeline. When it
+  resolves, the marker goes to the Trash.
+- **`status` shows the debris.** Its `HEALTH` line names helpers without the
+  application, a leftover document, files of runs that are gone, a non-empty
+  error flag, workflow steps of a run that is gone, and a staging folder that
+  still holds documents -- each with its raw value.
+
 ## Commands
 
 ```sh
 my-ocr [FLAGS] [FILES]      OCR those files (default)
-my-ocr status               what is running, on which document, what is queued
+my-ocr status               what is running, on which document, what is queued, HEALTH
 my-ocr setup [go]           generate the Automator workflow, bind the Folder Action
 my-ocr uninstall [go]       remove that wiring again
 my-ocr reset [go]           clean up after a crashed run; retry what was stranded

@@ -14,15 +14,15 @@ NL="
 # and is authoritative at runtime -- the deployed copy needs no git and no
 # repository. The build id is a hash of this file, so it is right even unstamped.
 SCRIPT_VERSION="v1.0"
-SCRIPT_COMMIT="5cc4a95"           # rewritten by 'my-ocr stamp-version'
+SCRIPT_COMMIT="9709374"           # rewritten by 'my-ocr stamp-version'
 # What git said when this build was stamped: 'git describe --tags --long' --
 # <nearest tag>-<commits since it>-g<short sha>. It says whether these bytes
 # ARE that release or work on top of it, on a machine with no git.
-SCRIPT_RELEASE="v1.0-50-g5cc4a95"
+SCRIPT_RELEASE="v1.0-51-g9709374"
 # The commit the stamped one sits on. SCRIPT_COMMIT itself is never pushed --
 # the amend replaces it -- so no other clone has it; its parent is always
 # there, and that is what proves a repository is this tool's own.
-SCRIPT_PARENT="61338d2"
+SCRIPT_PARENT="0401bf8"
 
 WHOAMI="$(/usr/bin/whoami)"
 [ "$USER" = "$WHOAMI" ] || err 126 "USER '$USER' ? != ? '$WHOAMI' WHOAMI"
@@ -405,7 +405,8 @@ stamp-version    Record the current commit into this file (run before deploying)
                  a notification plus a mail) and exit. Fails, with
                  my-notify's exit status, when it cannot be sent.
 -S|--status OR status
-                 Print what my-ocr is doing (mutex, OCR app, queue) and exit.
+                 Print what my-ocr is doing (mutex, OCR app, queue), what runs
+                 that are gone left behind (HEALTH), the export and the config.
                  Read-only: starts nothing and takes no lock. -V adds paths.
 setup [go] OR install [go]
                  Check that everything my-ocr needs is installed and present,
