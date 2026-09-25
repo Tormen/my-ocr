@@ -14,15 +14,15 @@ NL="
 # and is authoritative at runtime -- the deployed copy needs no git and no
 # repository. The build id is a hash of this file, so it is right even unstamped.
 SCRIPT_VERSION="v1.1"
-SCRIPT_COMMIT="85c7978"           # rewritten by 'my-ocr stamp-version'
+SCRIPT_COMMIT="127ebb7"           # rewritten by 'my-ocr stamp-version'
 # What git said when this build was stamped: 'git describe --tags --long' --
 # <nearest tag>-<commits since it>-g<short sha>. It says whether these bytes
 # ARE that release or work on top of it, on a machine with no git.
-SCRIPT_RELEASE="v1.0-53-g85c7978"
+SCRIPT_RELEASE="v1.1-1-g127ebb7"
 # The commit the stamped one sits on. SCRIPT_COMMIT itself is never pushed --
 # the amend replaces it -- so no other clone has it; its parent is always
 # there, and that is what proves a repository is this tool's own.
-SCRIPT_PARENT="e2d6012"
+SCRIPT_PARENT="efde1db"
 
 WHOAMI="$(/usr/bin/whoami)"
 [ "$USER" = "$WHOAMI" ] || err 126 "USER '$USER' ? != ? '$WHOAMI' WHOAMI"
@@ -5199,7 +5199,10 @@ t_concurrency_state() {
   # commit sets it. Whether this build IS that release is what the describe
   # string in '--version' says, so the check here is that the number still
   # names the nearest tag.
-  _vd="$(cd "$(dirname "$0")" && pwd)"
+  # the REAL file's directory, as --version itself resolves it: run through the
+  # farm link /LINKS/bin/my-ocr, dirname "$0" is /LINKS/bin -- another repo, with
+  # no tags -- and the check compared the tool's answer with a stranger's.
+  _vd="$(_self_dir)"
   if git -C "$_vd" rev-parse --git-dir >/dev/null 2>&1; then
     _vnear="$(git -C "$_vd" describe --tags --abbrev=0 2>/dev/null)"
     if [ -z "$_vnear" ]; then
