@@ -14,15 +14,15 @@ NL="
 # and is authoritative at runtime -- the deployed copy needs no git and no
 # repository. The build id is a hash of this file, so it is right even unstamped.
 SCRIPT_VERSION="v1.0"
-SCRIPT_COMMIT="9709374"           # rewritten by 'my-ocr stamp-version'
+SCRIPT_COMMIT="d6b577a"           # rewritten by 'my-ocr stamp-version'
 # What git said when this build was stamped: 'git describe --tags --long' --
 # <nearest tag>-<commits since it>-g<short sha>. It says whether these bytes
 # ARE that release or work on top of it, on a machine with no git.
-SCRIPT_RELEASE="v1.0-51-g9709374"
+SCRIPT_RELEASE="v1.0-52-gd6b577a"
 # The commit the stamped one sits on. SCRIPT_COMMIT itself is never pushed --
 # the amend replaces it -- so no other clone has it; its parent is always
 # there, and that is what proves a repository is this tool's own.
-SCRIPT_PARENT="0401bf8"
+SCRIPT_PARENT="e75bdfd"
 
 WHOAMI="$(/usr/bin/whoami)"
 [ "$USER" = "$WHOAMI" ] || err 126 "USER '$USER' ? != ? '$WHOAMI' WHOAMI"
@@ -5206,6 +5206,11 @@ t_concurrency_state() {
       t_ok "no release tag yet -- nothing for the version to name"
     elif [ "$_vnear" = "$SCRIPT_VERSION" ]; then
       t_ok "version $SCRIPT_VERSION names the release it is based on"
+    elif git -C "$_vd" diff HEAD~1 HEAD -- "$US" 2>/dev/null | grep -q "^+SCRIPT_VERSION=\"$SCRIPT_VERSION\""; then
+      # the RELEASE commit itself: it sets the number, and its tag can only
+      # follow the stamp -- which runs this suite first. Any later commit
+      # without the tag still fails below.
+      t_ok "version $SCRIPT_VERSION is set by this release commit -- its tag follows the stamp"
     else
       t_bad "version $SCRIPT_VERSION does not name the nearest tag $_vnear" \
         "set SCRIPT_VERSION to $_vnear, or tag this release"
