@@ -14,15 +14,15 @@ NL="
 # and is authoritative at runtime -- the deployed copy needs no git and no
 # repository. The build id is a hash of this file, so it is right even unstamped.
 SCRIPT_VERSION="v1.0"
-SCRIPT_COMMIT="203c78d"           # rewritten by 'my-ocr stamp-version'
+SCRIPT_COMMIT="32ac76d"           # rewritten by 'my-ocr stamp-version'
 # What git said when this build was stamped: 'git describe --tags --long' --
 # <nearest tag>-<commits since it>-g<short sha>. It says whether these bytes
 # ARE that release or work on top of it, on a machine with no git.
-SCRIPT_RELEASE="v1.0-48-g203c78d"
+SCRIPT_RELEASE="v1.0-49-g32ac76d"
 # The commit the stamped one sits on. SCRIPT_COMMIT itself is never pushed --
 # the amend replaces it -- so no other clone has it; its parent is always
 # there, and that is what proves a repository is this tool's own.
-SCRIPT_PARENT="ef58141"
+SCRIPT_PARENT="f0e381a"
 
 WHOAMI="$(/usr/bin/whoami)"
 [ "$USER" = "$WHOAMI" ] || err 126 "USER '$USER' ? != ? '$WHOAMI' WHOAMI"
@@ -1513,11 +1513,16 @@ send_alert() { # $1 = subject, $2 = notification text, $3 = mail body
 # Three channels, because each one alone can be missed: a notification for
 # whoever is at the machine, a mail for whoever is not, and a file on the
 # Desktop that is still there tomorrow.
-alert_stuck() { _as_m="$1"
+# Every alert of a run belongs to ONE incident: STUCK, then RETRYING, then
+# either FAILED (the run ends with an error) or RESOLVED (see alert_resolved).
+# AS_MARKERS collects this run's marker files, so a resolved incident can take
+# its markers off the Desktop again.
+AS_MARKERS=""
+alert_stuck() { _as_m="$1"; _as_s="${2:-my-ocr STUCK}"
   echo "$$| >>> [trigger-OCR] !!! $_as_m"
 
   # $(cat ...) is the portable slurp; $(<file) yields an EMPTY string in dash.
-  send_alert "my-ocr STUCK" "$_as_m" "$_as_m
+  send_alert "$_as_s" "$_as_m" "$_as_m
 
 still queued in '$QUEUED_FILE_MOVES_LOG':
 $(cat "$QUEUED_FILE_MOVES_LOG")" \
@@ -1527,9 +1532,29 @@ $(cat "$QUEUED_FILE_MOVES_LOG")" \
   _as_f="$STUCK_MARKER_DIR/,,my-ocr.STUCK.$(date +%Y-%m-%d_%H%M.%S).txt"
   if { echo "$_as_m"; echo; echo "still queued:"; cat "$QUEUED_FILE_MOVES_LOG"; } > "$_as_f"; then
     echo "$$|     wrote marker '$_as_f'"
+    AS_MARKERS="$AS_MARKERS$_as_f$NL"
   else
     echo "$$|     WARNING: could not write marker '$_as_f'"
   fi
+}
+
+# The incident is over and nothing is left to do: ONE mail that says so, and
+# this run's markers go to the Trash -- a marker is there to be acted on, and a
+# resolved one only teaches you to ignore the next. Nothing when nothing alerted.
+alert_resolved() { # $1 = what ended it
+  [ -n "$AS_MARKERS" ] || return 0
+  _ar_n=0; _ar_left=""
+  while IFS= read -r _ar_f; do
+    [ -n "$_ar_f" ] || continue
+    if trash_by_mv "$_ar_f"; then _ar_n=$(( _ar_n + 1 )); else _ar_left="$_ar_left '$_ar_f'"; fi
+  done <<_EOAR_
+$AS_MARKERS
+_EOAR_
+  _ar_m="RESOLVED: $1 [$_ar_n marker(s) moved to the Trash${_ar_left:+; could not move:$_ar_left}]"
+  echo "$$| >>> [trigger-OCR] $_ar_m"
+  send_alert "my-ocr RESOLVED" "$_ar_m" "$_ar_m" \
+    || echo "$$| >>> [trigger-OCR] WARNING: my-notify failed [$?] -- the RESOLVED mail may not have been delivered!"
+  AS_MARKERS=""
 }
 
 # Nobody watches FineReader while my-ocr drives it. After a crash, macOS asks at
@@ -2025,6 +2050,7 @@ $(ls -la "$S_PATH"|sed -e "s/^/${PFX}     | /")"
   local i=0; local stalled=0; local last_q=""; local next_alert=$STALL_ALERT_AFTER
   local _cpu_was=""; local _cpu_still=0; local _cpu_busy=""
   local _fr_seen=""; local _nudged=""; local _tw=0; local _fa_restarted=""; _fa_ev=""
+  local _retried=""; local _retry_done=""   # attempted / actually handed over again
   while [ -s "$QUEUED_FILE_MOVES_LOG" ]; do
 
     if [ -s "$PARTx_ERRORED_FLAGFILE" ]; then
@@ -2087,7 +2113,17 @@ Check that Folder Actions are enabled and that '$S_PATH' still has ours attached
     if [ -z "$ocr_pids" ]; then
       # CONCLUSIVE: nothing is running, so nothing can collide -> safe to end.
       m="$OCRAPP_NAME is NOT running and the queue has not moved for ${stalled}s -- the OCR cannot finish."
-      alert_stuck "$m"
+      if [ -z "$_retried" ]; then
+        _retried=1
+        alert_stuck "$m
+Retrying ONCE: the same documents are handed over again." "my-ocr STUCK -- retrying"
+        if retry_stalled_chunk "$QUEUED_FILE_MOVES_LOG_CNT"; then
+          _retry_done=1; stalled=0; last_q=""; next_alert=$STALL_ALERT_AFTER
+          _cpu_was=""; _cpu_still=0; _cpu_busy=""; _fr_seen=""; _tw=0
+          continue
+        fi
+      fi
+      alert_stuck "$m${_retry_done:+ It had already been retried once.}"
       err 128 "$m${NL}Still queued in '$QUEUED_FILE_MOVES_LOG':${NL}$(cat "$QUEUED_FILE_MOVES_LOG")"
     fi
 
@@ -2122,8 +2158,19 @@ Check that Folder Actions are enabled and that '$S_PATH' still has ours attached
       fi
       if [ "$_cpu_still" -ge "$OCRAPP_IDLE_GIVEUP" ]; then
         m="$OCRAPP_NAME [pid(s) $ocr_pids] has used almost no cpu (under ${OCRAPP_IDLE_MAX_CPU_PER_MIN}s per minute) for ${_cpu_still}s while the queue stood still for ${stalled}s [cpu ${_cpu_now}/100s total over $(ocrapp_all_pids | awk 'END{print NR+0}') process(es)].
-It is not working -- it is waiting for someone to answer a dialog. Recovering:
-closing it, and the documents go back for a retry."
+It is not working -- it is waiting for someone to answer a dialog."
+        if [ -z "$_retried" ]; then
+          _retried=1
+          alert_stuck "$m
+Retrying ONCE: closing it and handing the same documents over again." "my-ocr STUCK -- retrying"
+          if retry_stalled_chunk "$QUEUED_FILE_MOVES_LOG_CNT"; then
+            _retry_done=1; stalled=0; last_q=""; next_alert=$STALL_ALERT_AFTER
+            _cpu_was=""; _cpu_still=0; _cpu_busy=""; _fr_seen=""; _tw=0
+            continue
+          fi
+        fi
+        m="$m
+${_retry_done:+It had already been retried once. }Giving up: closing it, and the documents go back for a retry."
         alert_stuck "$m"
         ocrapp_quit
         err 158 "$m${NL}Still queued in '$QUEUED_FILE_MOVES_LOG':${NL}$(cat "$QUEUED_FILE_MOVES_LOG")"
@@ -2149,6 +2196,7 @@ closing it, and the documents go back for a retry."
       next_alert=$(( $stalled + $STALL_REALERT_EVERY ))
     fi
   done
+  alert_resolved "the queue emptied -- every document of this run went through${_retry_done:+, after one retry}"
 
 }
 
@@ -2198,11 +2246,8 @@ t_err_codes_unique() {
 #     fatal syntax error at parse time, so the documented option never worked.
 t_file_option() {
   _f="$T_TMP/filelist"; printf 'a\nb\n' > "$_f"
-  _flag="/var/lib/mine/${US%.*}.PARTx-ERRORED.flagfile"
-  _pre=""; [ -e "$_flag" ] && _pre=1
   # --part-1 --no-log parses --file, then stops at err 003 before doing work
-  _out="$("$0" --part-1 --no-log --file "$_f" 2>&1)"
-  [ -z "$_pre" ] && rm -f "$_flag"        # leave no residue we did not find
+  _out="$(MY_OCR_CONFIG="$T_TMP/sandbox.conf" "$0" --part-1 --no-log --file "$_f" 2>&1)"
   case "$_out" in
     *"syntax error"*) t_bad "--file parses (no arithmetic-expansion bug)" \
                             "$(printf '%s' "$_out" | head -1)";;
@@ -2324,7 +2369,7 @@ t_move_failed_to() {
     t_bad "MOVE_FAILED_TO defaults to '' (failed files stay put)" "changed default = behaviour change for hand use"
   fi
   # a typo must be caught at STARTUP, not during cleanup
-  _o="$("$0" --move-failed-to /nonexistent/quarantine --part-1 --no-log 2>&1)"
+  _o="$(MY_OCR_CONFIG="$T_TMP/sandbox.conf" "$0" --move-failed-to /nonexistent/quarantine --part-1 --no-log 2>&1)"
   case "$_o" in
     *"ERROR 131"*) t_ok "a bad --move-failed-to is refused up front (err 131)";;
     *)             t_bad "a bad --move-failed-to is refused up front (err 131)" \
@@ -2476,6 +2521,38 @@ do_status() {
     done
   else
     echo "${_st_pfx}QUEUE     empty"
+  fi
+
+  # What is left over from runs that are gone, each with its raw value. While a
+  # run is LIVE, its parts, its staging folder and its error flag are its own
+  # and not a problem; the rest are debris whatever is running.
+  _st_live=""; [ -n "$_st_p" ] && kill -0 "$_st_p" 2>/dev/null && _st_live=1
+  _st_app="$(pgrep -x "$OCRAPP_NAME" 2>/dev/null | xargs echo)"
+  _st_hp="$(ocrapp_all_pids | grep -vxF -e "${_st_app:-none}" | xargs echo)"
+  _st_hn="$(echo "$_st_hp" | awk '{print NF}')"
+  _st_lo=0
+  for _st_d in "$OCRAPP_DOCSTORE_BASE/$OCRAPP_BUNDLE_ID"*/Untitled.FR*; do [ -d "$_st_d" ] && _st_lo=$(( _st_lo + 1 )); done
+  _st_sf="$(stale_run_files | awk 'END{print NR+0}')"
+  _st_ef=0; [ -s "$PARTx_ERRORED_FLAGFILE" ] && _st_ef="$(awk 'END{print NR+0}' "$PARTx_ERRORED_FLAGFILE")"
+  _st_pa="$(run_parts_alive)"; _st_pn="$(echo "$_st_pa" | awk '{print NF}')"
+  # EMPTY staging is harmless -- every part-1/part-2 creates it, and the next
+  # hand-over reuses it; only one that still HOLDS documents is debris
+  _st_sd="none"; for _st_d in "$TMP_PRE_INP_PATH" "$S_PATH/${TMP_PRE_INP_PATH##*/}"; do
+    [ -d "$_st_d" ] && [ -n "$(ls -A "$_st_d" 2>/dev/null)" ] && _st_sd="$_st_d"; done
+  _st_bad=""
+  [ -z "$_st_app" ] && [ "$_st_hn" -gt 0 ] && _st_bad="$_st_bad; $_st_hn $OCRAPP_NAME helper(s) without the app -- the next run ends them"
+  [ -z "$_st_app" ] && [ "$_st_lo" -gt 0 ] && _st_bad="$_st_bad; a leftover $OCRAPP_NAME document -- the next run clears it if it is my-ocr's"
+  [ "$_st_sf" -gt 0 ] && _st_bad="$_st_bad; $_st_sf file(s) of runs that are gone -- '$US reset go'"
+  if [ -z "$_st_live" ]; then
+    [ "$_st_pn" -gt 0 ] && _st_bad="$_st_bad; part-1/part-2 of a run that is gone still at work -- the next run waits for it"
+    [ "$_st_ef" -gt 0 ] && _st_bad="$_st_bad; an error flag from a run that is gone -- '$US reset go'"
+    [ "$_st_sd" != none ] && _st_bad="$_st_bad; a staging folder with documents from a run that is gone -- '$US reset go'"
+  fi
+  _st_raw="helpers ${_st_hn}${_st_hp:+ ($_st_hp)}, leftover $_st_lo, stale files $_st_sf, error flag $_st_ef line(s), parts ${_st_pn}${_st_pa:+ ($_st_pa)}, staging $_st_sd"
+  if [ -n "$_st_bad" ]; then
+    echo "${_st_pfx}HEALTH    ATTENTION -- ${_st_bad#; }   [$_st_raw]"
+  else
+    echo "${_st_pfx}HEALTH    ok   [$_st_raw]"
   fi
 
   # What FineReader will ACTUALLY be told, read back out of the installed
@@ -2781,6 +2858,50 @@ print_open_cmd() { # $1 = file listing the paths
 # travel with the directory and are never touched -- this moves, never copies
 # or deletes. Returns 1 if either move fails, leaving the files wherever the
 # last successful move put them, which is always one of the two directories.
+# A stalled chunk gets ONE more try before it is given up: most stalls are
+# FineReader itself (a dialog, a hang), not the documents, and the same chunk
+# goes through on a fresh start. Put the machinery back to where the first
+# hand-over found it -- no app, no workflow step still running, no leftover
+# document, an empty lockfile -- and hand the same staging folder over again.
+# Only while NOTHING of the chunk has been filed: a second hand-over OCRs every
+# document in the folder, and one already filed would be done twice.
+# Prints what it did or why it could not; returns 0 when it handed over again.
+retry_stalled_chunk() { # $1 = documents this run handed over
+  _rt_q="$(awk 'END{print NR+0}' "$QUEUED_FILE_MOVES_LOG" 2>/dev/null)"
+  if [ "$_rt_q" != "$1" ]; then
+    echo "$$| >>> [trigger-OCR] no retry: $(( $1 - _rt_q )) of $1 document(s) already filed -- a second hand-over would OCR them again [queue $_rt_q/$1]"
+    return 1
+  fi
+  [ -d "$S_PATH/$COLLECT_INP_PATH" ] || {
+    echo "$$| >>> [trigger-OCR] no retry: the staged documents are not in '$S_PATH/$COLLECT_INP_PATH' any more"; return 1; }
+  ocrapp_quit
+  # the workflow run that carried the stalled attempt must be over, or its
+  # part-2 would act on the new one
+  _rt_w=0
+  while [ -n "$(run_parts_alive)" ] && [ "$_rt_w" -lt 30 ]; do sleep 1; _rt_w=$(( _rt_w + 1 )); done
+  _rt_pa="$(run_parts_alive)"
+  if [ -n "$_rt_pa" ]; then
+    echo "$$| >>> [trigger-OCR] no retry: part-1/part-2 of the stalled attempt still running after ${_rt_w}s (pid(s) $_rt_pa)"; return 1
+  fi
+  # what a part wrote while FineReader was being closed belongs to the attempt
+  # that is over -- log it, and do not let it end the retry
+  if [ -s "$PARTx_ERRORED_FLAGFILE" ]; then
+    echo "$$| >>> [trigger-OCR] the stalled attempt left an error, from closing $OCRAPP_NAME under it:"
+    sed "s/^/$$|      | /" "$PARTx_ERRORED_FLAGFILE"
+    : >"$PARTx_ERRORED_FLAGFILE"
+  fi
+  printf "" >"$OCRAPP_LOCKFILE" || { echo "$$| >>> [trigger-OCR] no retry: could not empty '$OCRAPP_LOCKFILE'"; return 1; }
+  printf "" >"$OCRAPP_STATEFILE"      # nothing of $OCRAPP_NAME is anyone else's now
+  ocrapp_reap_helpers
+  ocrapp_clear_stale_batch "$S_PATH"
+  if nudge_handover "$S_PATH/$COLLECT_INP_PATH" "$TMP_PRE_INP_PATH"; then
+    echo "$$| >>> [trigger-OCR] RETRY: handed the same $1 document(s) over again [$OCRAPP_NAME closed, workflow over after ${_rt_w}s, lockfile emptied]"
+    return 0
+  fi
+  echo "$$| >>> [trigger-OCR] no retry: could not re-make the hand-over -- the documents are in '$S_PATH/$COLLECT_INP_PATH' or '$TMP_PRE_INP_PATH'"
+  return 1
+}
+
 nudge_handover() { # $1 = staging dir inside the watched folder, $2 = a path outside it
   [ -d "$1" ] || return 1
   [ -e "$2" ] && { rmdir "$2" 2>/dev/null || return 1; }
@@ -4496,6 +4617,123 @@ t_version_clone() {
   fi
 }
 
+# A part that fails writes its error into the flag a LIVE run watches, and the
+# live run aborts on it (err 066). The suite started parts with the real flag:
+# 760 lines of test errors had piled up in it on horse, and a suite run on the
+# scan host during a real OCR would have ended that OCR.
+t_parts_sandboxed() {
+  _ps_real="$PARTx_ERRORED_FLAGFILE"
+  _ps_before="$(wc -c <"$_ps_real" 2>/dev/null | tr -d ' ')"
+  MY_OCR_CONFIG="$T_TMP/sandbox.conf" "$0" --move-failed-to /nonexistent/quarantine --part-1 --no-log >/dev/null 2>&1
+  _ps_after="$(wc -c <"$_ps_real" 2>/dev/null | tr -d ' ')"
+  if [ "$_ps_before" = "$_ps_after" ] && [ -s "$T_TMP/partx-errored.flag" ]; then
+    t_ok "a failing part started by the suite writes to the suite's flag, not the live one [live ${_ps_before:-absent} -> ${_ps_after:-absent} bytes]"
+  else
+    t_bad "a failing part started by the suite writes to the suite's flag, not the live one" "live flag ${_ps_before:-absent} -> ${_ps_after:-absent} bytes, sandbox flag $( [ -s "$T_TMP/partx-errored.flag" ] && echo written || echo empty)"
+  fi
+}
+
+t_has() { for _th_f in "$1"/*"$2"*; do [ -e "$_th_f" ] && return 0; done; return 1; } # $1 = dir, $2 = part of a name
+
+t_rt_env() { # the retry's world -- called INSIDE a subshell only
+  OCRAPP_PATH="$1/no-such-app.app"; OCRAPP_DOCSTORE_BASE="$1/docstore"
+  OCRAPP_STATEFILE="$1/lib/state"; TRASH_DIR="$1/trash"
+  COLLECT_INP_PATH="stage"; TMP_PRE_INP_PATH="$1/tmp-stage"
+  my_notify="$1/bin/notify"; STUCK_MARKER_DIR="$1/desk"
+}
+
+# Point 4: a stalled chunk is handed over ONCE more, with the machinery put
+# back first -- and never when a document of it was already filed, since the
+# second hand-over would OCR that one again. Point 5: an incident that ends
+# well says so in one mail and takes its markers off the Desktop.
+t_stall_retry() {
+  _rt="$T_TMP/retry"
+  _rt_world() {
+    rm -rf "$_rt"; mkdir -p "$_rt/lib" "$_rt/pub/stage" "$_rt/bin" "$_rt/trash" "$_rt/desk" "$_rt/docstore"
+    printf 'doc a\n' >"$_rt/pub/stage/a.#1.pdf"; printf 'doc b\n' >"$_rt/pub/stage/b.#1.pdf"
+    printf 'a\tA\n' >"$_rt/lib/files-2-move"; printf 'b\tB\n' >>"$_rt/lib/files-2-move"
+    printf '%s\n' "$_rt/pub/stage/a.#1.pdf" >"$_rt/lib/lock"
+    printf 'the stalled attempt\n' >"$_rt/lib/f1"
+    printf '#!/bin/sh\nprintf "%%s|" "$@" >>"%s/mails"; echo >>"%s/mails"\n' "$_rt" "$_rt" >"$_rt/bin/notify"
+    chmod +x "$_rt/bin/notify"
+  }
+  _rt_world
+  _rt_o="$(
+    t_reset_sandbox "$_rt"; t_rt_env "$_rt"
+    retry_stalled_chunk 2 >"$_rt/ok.out" 2>&1; echo "RC=$?"
+    [ -f "$_rt/pub/stage/a.#1.pdf" ] && [ -f "$_rt/pub/stage/b.#1.pdf" ] && echo "HANDED-OVER-IN-PLACE"
+    [ -s "$_rt/lib/lock" ] || echo "LOCK-EMPTIED"
+    [ -s "$_rt/lib/f1" ] || echo "FLAG-CLEARED"
+  )"
+  case "$_rt_o" in
+    *"RC=0"*HANDED-OVER-IN-PLACE*LOCK-EMPTIED*FLAG-CLEARED*) t_ok "retry: the same staged chunk is handed over again, lockfile emptied, the stalled attempt's error cleared";;
+    *) t_bad "retry: the same staged chunk is handed over again, lockfile emptied, the stalled attempt's error cleared" "$_rt_o // $(cat "$_rt/ok.out")";;
+  esac
+  # one of the two already filed: no second hand-over, nothing touched
+  _rt_world; printf 'b\tB\n' >"$_rt/lib/files-2-move"
+  _rt_o="$(
+    t_reset_sandbox "$_rt"; t_rt_env "$_rt"
+    retry_stalled_chunk 2 >"$_rt/part.out" 2>&1; echo "RC=$?"
+    [ -s "$_rt/lib/lock" ] && echo "LOCK-KEPT"
+  )"
+  case "$_rt_o" in
+    *"RC=1"*LOCK-KEPT*) t_ok "retry: refused once a document of the chunk is filed -- it would be OCRed twice";;
+    *) t_bad "retry: refused once a document of the chunk is filed" "$_rt_o // $(cat "$_rt/part.out")";;
+  esac
+  # both stall endings try it once, before their error, and only once
+  # shellcheck disable=SC2016  # matching literal source text
+  if awk '/^do_trigger_ocr\(\) \{/,/^\}/' "$0" \
+     | awk '/retry_stalled_chunk "\$QUEUED_FILE_MOVES_LOG_CNT"/{r++; if (!a) a=NR; else b=NR}
+            /err 128 /{e1=NR} /err 158 /{e2=NR} /if \[ -z "\$_retried" \]; then/{g++}
+            END{exit !(r == 2 && g == 2 && a < e1 && b < e2)}'; then
+    t_ok "retry: both stall endings (app gone, app stuck) retry once before their error"
+  else
+    t_bad "retry: both stall endings (app gone, app stuck) retry once before their error" "not wired as expected in do_trigger_ocr"
+  fi
+  # RESOLVED: one mail, markers to the Trash; nothing at all when nothing alerted
+  _rt_world
+  _rt_o="$(
+    t_reset_sandbox "$_rt"; t_rt_env "$_rt"
+    alert_resolved "quiet run" >/dev/null 2>&1
+    [ -s "$_rt/mails" ] && echo "MAILED-WITHOUT-INCIDENT"
+    alert_stuck "stalled" "my-ocr STUCK -- retrying" >/dev/null 2>&1
+    alert_resolved "the queue emptied" >"$_rt/res.out" 2>&1
+    t_has "$_rt/desk" STUCK || echo "MARKERS-OFF-DESKTOP"
+    t_has "$_rt/trash" STUCK && echo "MARKERS-IN-TRASH"
+    grep -c "my-ocr RESOLVED" "$_rt/mails" | sed 's/^/RESOLVED-MAILS=/'
+  )"
+  case "$_rt_o" in
+    *MAILED-WITHOUT-INCIDENT*) t_bad "resolved: nothing is sent when nothing alerted" "$_rt_o";;
+    *MARKERS-OFF-DESKTOP*MARKERS-IN-TRASH*"RESOLVED-MAILS=1"*) t_ok "resolved: ONE mail, and the incident's markers go to the Trash (nothing sent when nothing alerted)";;
+    *) t_bad "resolved: ONE mail, and the incident's markers go to the Trash" "$_rt_o // $(cat "$_rt/res.out")";;
+  esac
+  # shellcheck disable=SC2016  # matching literal source text
+  if awk '/^do_trigger_ocr\(\) \{/,/^\}/' "$0" | awk '/^  done$/{d=NR} /^  alert_resolved /{r=NR} END{exit !(d && r && d < r)}'; then
+    t_ok "resolved: a run that alerted and then finished sends it"
+  else
+    t_bad "resolved: a run that alerted and then finished sends it" "alert_resolved is not called after the wait loop"
+  fi
+}
+
+# Point 6: 'status' names what runs that are gone left behind, each with its
+# raw value -- and does not call an EMPTY staging folder debris: every part
+# creates one, and it is harmless.
+t_status_health() {
+  _sh="$T_TMP/health"; rm -rf "$_sh"; mkdir -p "$_sh/lib" "$_sh/pub" "$_sh/tmp-stage" "$_sh/docstore"
+  _sh_o="$( t_reset_sandbox "$_sh"; t_rt_env "$_sh"; do_status "" 2>&1 | grep '^HEALTH' )"
+  case "$_sh_o" in
+    "HEALTH    ok   ["*"staging none"*) t_ok "health: a clean world, and an EMPTY staging folder, read ok";;
+    *) t_bad "health: a clean world, and an EMPTY staging folder, read ok" "$_sh_o";;
+  esac
+  printf 'x ERROR 066 from a gone run\n' >"$_sh/lib/f1"; printf 'doc\n' >"$_sh/tmp-stage/a.pdf"
+  _sh_o="$( t_reset_sandbox "$_sh"; t_rt_env "$_sh"; do_status "" 2>&1 | grep '^HEALTH' )"
+  case "$_sh_o" in
+    "HEALTH    ATTENTION"*"error flag"*"staging folder with documents"*"error flag 1 line(s)"*"staging $_sh/tmp-stage"*)
+      t_ok "health: an error flag and a staging folder with documents are named, with their raw values";;
+    *) t_bad "health: an error flag and a staging folder with documents are named, with their raw values" "$_sh_o";;
+  esac
+}
+
 t_reset_log_last() {
   # the documents part of reset lives in reset_stranded(), shared with the
   # pre-flight repair -- the order has to hold there
@@ -5364,6 +5602,12 @@ t_stranded_not_failed() {
 do_run_tests() {
   echo "$US --run-tests   ($(head -1 "$0"))"
   T_TMP="$(mktemp -d /tmp/my-ocr.tests.XXXXXX)" || { echo "mktemp failed"; return 1; }
+  # A part-1/part-2 started by a test writes its error into the error flag a
+  # LIVE run watches -- where it aborts that run (err 066). Tests that start a
+  # part run it with this config, which moves the flag and the staging folder
+  # into the suite's own directory.
+  printf 'PARTx_ERRORED_FLAGFILE="%s"\nTMP_PRE_INP_PATH="%s"\n' \
+    "$T_TMP/partx-errored.flag" "$T_TMP/pre-staging" >"$T_TMP/sandbox.conf"
   t_shebang
   t_err_codes_unique
   t_dash_syntax
@@ -5373,6 +5617,9 @@ do_run_tests() {
   t_no_ocr_marker
   t_reveal_policy
   t_move_failed_to
+  t_parts_sandboxed
+  t_stall_retry
+  t_status_health
   t_wait_is_evidence_based
   t_mutex
   t_concurrency_state
