@@ -14,15 +14,15 @@ NL="
 # and is authoritative at runtime -- the deployed copy needs no git and no
 # repository. The build id is a hash of this file, so it is right even unstamped.
 SCRIPT_VERSION="v1.0"
-SCRIPT_COMMIT="32ac76d"           # rewritten by 'my-ocr stamp-version'
+SCRIPT_COMMIT="5cc4a95"           # rewritten by 'my-ocr stamp-version'
 # What git said when this build was stamped: 'git describe --tags --long' --
 # <nearest tag>-<commits since it>-g<short sha>. It says whether these bytes
 # ARE that release or work on top of it, on a machine with no git.
-SCRIPT_RELEASE="v1.0-49-g32ac76d"
+SCRIPT_RELEASE="v1.0-50-g5cc4a95"
 # The commit the stamped one sits on. SCRIPT_COMMIT itself is never pushed --
 # the amend replaces it -- so no other clone has it; its parent is always
 # there, and that is what proves a repository is this tool's own.
-SCRIPT_PARENT="f0e381a"
+SCRIPT_PARENT="61338d2"
 
 WHOAMI="$(/usr/bin/whoami)"
 [ "$USER" = "$WHOAMI" ] || err 126 "USER '$USER' ? != ? '$WHOAMI' WHOAMI"
@@ -1529,10 +1529,21 @@ $(cat "$QUEUED_FILE_MOVES_LOG")" \
     || echo "$$| >>> [trigger-OCR] WARNING: my-notify failed [$?] -- the alert may not have been delivered!"
 
   # ',,' floats it to the top of the Desktop listing, which is the point.
+  # ONE marker per incident: the first alert creates it, every later one of
+  # the same run adds its line, so the file reads as the incident's timeline.
+  if [ -n "$AS_MARKERS" ]; then
+    _as_f="${AS_MARKERS%%"$NL"*}"
+    if { echo; echo "$(date +%H:%M:%S) $_as_s"; echo "$_as_m"; } >> "$_as_f"; then
+      echo "$$|     added to marker '$_as_f'"
+    else
+      echo "$$|     WARNING: could not add to marker '$_as_f'"
+    fi
+    return 0
+  fi
   _as_f="$STUCK_MARKER_DIR/,,my-ocr.STUCK.$(date +%Y-%m-%d_%H%M.%S).txt"
-  if { echo "$_as_m"; echo; echo "still queued:"; cat "$QUEUED_FILE_MOVES_LOG"; } > "$_as_f"; then
+  if { echo "$(date +%H:%M:%S) $_as_s"; echo "$_as_m"; echo; echo "still queued:"; cat "$QUEUED_FILE_MOVES_LOG"; } > "$_as_f"; then
     echo "$$|     wrote marker '$_as_f'"
-    AS_MARKERS="$AS_MARKERS$_as_f$NL"
+    AS_MARKERS="$_as_f$NL"
   else
     echo "$$|     WARNING: could not write marker '$_as_f'"
   fi
@@ -1741,6 +1752,28 @@ fa_dispatcher_restart() {
   return 1
 }
 
+# A leftover FineReader killed EARLY names no path yet -- its batch file holds
+# fragments only -- but it already holds a COPY of each page source it was
+# handed (the '.source' files). When every one of them is byte-identical to a
+# document in this run's staging, the leftover holds nothing but our own
+# copies. Seen on the scan host: a stall killed FineReader seconds into a
+# document, the cleaner refused its leftover, and the retry sat on the
+# recovery dialog that leftover raised.
+leftover_sources_are_ours() { # $1 = leftover directory
+  [ -n "$COLLECT_INP_PATH" ] || return 1          # no staging of this run to compare with
+  _so_n=0
+  for _so_s in "$1"/*.source; do
+    [ -f "$_so_s" ] || continue
+    _so_m=""
+    for _so_d in "$S_PATH/$COLLECT_INP_PATH"/* "$TMP_PRE_INP_PATH"/*; do
+      [ -f "$_so_d" ] && cmp -s "$_so_s" "$_so_d" && { _so_m=1; break; }
+    done
+    [ -n "$_so_m" ] || return 1                   # one source that is not ours: not ours
+    _so_n=$(( _so_n + 1 ))
+  done
+  [ "$_so_n" -gt 0 ]
+}
+
 ocrapp_clear_stale_batch() { # $1 = staging prefix (nothing outside it is ours)
   _sb_stage="$1"
   # never touch a document while the app that owns it is running
@@ -1770,11 +1803,11 @@ ocrapp_clear_stale_batch() { # $1 = staging prefix (nothing outside it is ours)
     # '/' and '/Users' are directories. Hence: at least one path under staging
     # (it is ours), and no existing FILE outside it (nothing of yours is in it).
     _sb_paths="$(LC_ALL=C tr -c '[:print:]' '\n' <"$_sb_pac" | sed -n 's|^[^/]*\(/.*\)$|\1|p' | sort -u)"
-    if [ -z "$_sb_paths" ]; then
+    if [ -z "$_sb_paths" ] && ! leftover_sources_are_ours "$_sb_d"; then
       echo "$$| >>> [trigger-OCR] $OCRAPP_NAME: leftover '$_sb_d' names no source at all -- LEFT ALONE (nothing maps it to this tool)"
       continue
     fi
-    _sb_foreign=""; _sb_n=0; _sb_mine=0
+    _sb_foreign=""; _sb_n=0; _sb_mine=0; _sb_why=""
     while IFS= read -r _sb_p; do
       [ -n "$_sb_p" ] || continue
       _sb_n=$(( _sb_n + 1 ))
@@ -1790,12 +1823,16 @@ _EOSB_
       continue
     fi
     if [ "$_sb_mine" -eq 0 ]; then
-      echo "$$| >>> [trigger-OCR] $OCRAPP_NAME: leftover '$_sb_d' names no path under '$_sb_stage' -- LEFT ALONE (nothing maps it to this tool) [$_sb_n path(s)]"
-      continue
+      if leftover_sources_are_ours "$_sb_d"; then
+        _sb_why="its $_so_n page source(s) are byte-identical copies of this run's staged document(s), 0 file(s) of yours"
+      else
+        echo "$$| >>> [trigger-OCR] $OCRAPP_NAME: leftover '$_sb_d' names no path under '$_sb_stage' -- LEFT ALONE (nothing maps it to this tool) [$_sb_n path(s)]"
+        continue
+      fi
     fi
     if [ -n "$c_trash" ] && [ -x "$c_trash" ]; then
       if "$c_trash" -- "$_sb_d" >/dev/null 2>&1; then
-        echo "$$| >>> [trigger-OCR] $OCRAPP_NAME: cleared leftover document [$_sb_mine of $_sb_n path(s) from staging, 0 file(s) of yours] -- trashed '$_sb_d'"
+        echo "$$| >>> [trigger-OCR] $OCRAPP_NAME: cleared leftover document [${_sb_why:-$_sb_mine of $_sb_n path(s) from staging, 0 file(s) of yours}] -- trashed '$_sb_d'"
       else
         echo "$$| >>> [trigger-OCR] $OCRAPP_NAME: WARNING could not trash leftover '$_sb_d' -- its recovery dialog may block the run"
       fi
@@ -2123,7 +2160,7 @@ Retrying ONCE: the same documents are handed over again." "my-ocr STUCK -- retry
           continue
         fi
       fi
-      alert_stuck "$m${_retry_done:+ It had already been retried once.}"
+      alert_stuck "$m${_retry_done:+ It had already been retried once.}" "my-ocr STUCK -- gave up"
       err 128 "$m${NL}Still queued in '$QUEUED_FILE_MOVES_LOG':${NL}$(cat "$QUEUED_FILE_MOVES_LOG")"
     fi
 
@@ -2171,7 +2208,7 @@ Retrying ONCE: closing it and handing the same documents over again." "my-ocr ST
         fi
         m="$m
 ${_retry_done:+It had already been retried once. }Giving up: closing it, and the documents go back for a retry."
-        alert_stuck "$m"
+        alert_stuck "$m" "my-ocr STUCK -- gave up"
         ocrapp_quit
         err 158 "$m${NL}Still queued in '$QUEUED_FILE_MOVES_LOG':${NL}$(cat "$QUEUED_FILE_MOVES_LOG")"
       fi
@@ -2190,6 +2227,10 @@ ${_retry_done:+It had already been retried once. }Giving up: closing it, and the
       _as_msg="$OCRAPP_NAME [pid(s) $ocr_pids] is running but the queue has not moved for ${stalled}s. Still waiting; NOT releasing the lock."
       if [ -n "$_cpu_busy" ]; then
         echo "$$| >>> [trigger-OCR] $_as_msg -- it IS working [cpu ${_cpu_now}/100s total over $(ocrapp_all_pids | awk 'END{print NR+0}') process(es)], so no alert"
+      elif [ -n "$_retry_done" ]; then
+        # the incident is already announced (STUCK -- retrying); a notice is not
+        # a change of state, and the next mail is the outcome
+        echo "$$| >>> [trigger-OCR] $_as_msg -- after the retry; no new alert, the outcome will be mailed"
       else
         alert_stuck "$_as_msg"
       fi
@@ -4712,6 +4753,50 @@ t_stall_retry() {
     t_ok "resolved: a run that alerted and then finished sends it"
   else
     t_bad "resolved: a run that alerted and then finished sends it" "alert_resolved is not called after the wait loop"
+  fi  # A FineReader killed early leaves a document whose batch file names no path
+  # yet -- only its page sources, copies of what it was handed. Ours when every
+  # one is byte-identical to this run's staged document; anything else stays.
+  _rt_leftover() { # $1 = content of its page source
+    _rt_l="$_rt/docstore/com.abbyy.FineReaderPro12.00/Untitled.FR12.0"
+    rm -rf "$_rt/docstore"; mkdir -p "$_rt_l"
+    printf '\005/g\134' >"$_rt_l/_FRBatch.pac"; printf '%s\n' "$1" >"$_rt_l/{0003}.source"
+  }
+  printf '#!/bin/dash\nshift 2>/dev/null\nrm -rf "$@"\n' >"$_rt/bin/trash"; chmod +x "$_rt/bin/trash"
+  _rt_leftover "doc a"
+  _rt_o="$( t_reset_sandbox "$_rt"; t_rt_env "$_rt"; OCRAPP_BUNDLE_ID="com.abbyy.FineReaderPro"
+            ocrapp_clear_stale_batch "$S_PATH" 2>&1; [ -d "$_rt_l" ] || echo "LEFTOVER-CLEARED" )"
+  case "$_rt_o" in
+    *"byte-identical copies"*LEFTOVER-CLEARED*) t_ok "leftover: one holding only copies of this run's staged document is cleared, though it names no path";;
+    *) t_bad "leftover: one holding only copies of this run's staged document is cleared, though it names no path" "$_rt_o";;
+  esac
+  _rt_leftover "someone else's page"
+  _rt_o="$( t_reset_sandbox "$_rt"; t_rt_env "$_rt"; OCRAPP_BUNDLE_ID="com.abbyy.FineReaderPro"
+            ocrapp_clear_stale_batch "$S_PATH" 2>&1; [ -d "$_rt_l" ] && echo "LEFTOVER-KEPT" )"
+  case "$_rt_o" in
+    *"LEFT ALONE"*LEFTOVER-KEPT*) t_ok "leftover: one holding a page source that is NOT ours is left alone";;
+    *) t_bad "leftover: one holding a page source that is NOT ours is left alone" "$_rt_o";;
+  esac
+  # one marker per incident, holding its timeline
+  _rt_world
+  _rt_o="$(
+    t_reset_sandbox "$_rt"; t_rt_env "$_rt"
+    alert_stuck "first" "my-ocr STUCK" >/dev/null 2>&1
+    alert_stuck "second" "my-ocr STUCK -- retrying" >/dev/null 2>&1
+    alert_stuck "third" "my-ocr STUCK -- gave up" >/dev/null 2>&1
+    set -- "$_rt/desk"/*STUCK*; echo "MARKERS=$#"
+    grep -c "my-ocr STUCK" "$1" | sed 's/^/LINES=/'
+  )"
+  case "$_rt_o" in
+    *"MARKERS=1"*"LINES=3"*) t_ok "markers: ONE per incident, every alert of it added to that file";;
+    *) t_bad "markers: ONE per incident, every alert of it added to that file" "$_rt_o";;
+  esac
+  # after a retry, the 'queue has not moved' notice is not a new mail
+  # shellcheck disable=SC2016  # matching literal source text
+  _rt_blk="$(awk '/if \[ "\$stalled" -ge "\$next_alert" \]; then/,/next_alert=\$\(\( \$stalled/' "$0")"
+  if printf '%s\n' "$_rt_blk" | awk '/elif \[ -n "\$_retry_done" \]; then/{r=NR} /alert_stuck/{a=NR} END{exit !(r && a && r < a)}'; then
+    t_ok "mails: after a retry the not-moved notice is logged, not mailed -- the next mail is the outcome"
+  else
+    t_bad "mails: after a retry the not-moved notice is logged, not mailed" "the notice block mails regardless"
   fi
 }
 
