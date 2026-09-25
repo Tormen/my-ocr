@@ -13,16 +13,16 @@ NL="
 # deployed script cannot hide. SCRIPT_COMMIT is rewritten by 'stamp-version'
 # and is authoritative at runtime -- the deployed copy needs no git and no
 # repository. The build id is a hash of this file, so it is right even unstamped.
-SCRIPT_VERSION="v1.0"
-SCRIPT_COMMIT="d6b577a"           # rewritten by 'my-ocr stamp-version'
+SCRIPT_VERSION="v1.1"
+SCRIPT_COMMIT="85c7978"           # rewritten by 'my-ocr stamp-version'
 # What git said when this build was stamped: 'git describe --tags --long' --
 # <nearest tag>-<commits since it>-g<short sha>. It says whether these bytes
 # ARE that release or work on top of it, on a machine with no git.
-SCRIPT_RELEASE="v1.0-52-gd6b577a"
+SCRIPT_RELEASE="v1.0-53-g85c7978"
 # The commit the stamped one sits on. SCRIPT_COMMIT itself is never pushed --
 # the amend replaces it -- so no other clone has it; its parent is always
 # there, and that is what proves a repository is this tool's own.
-SCRIPT_PARENT="e75bdfd"
+SCRIPT_PARENT="e2d6012"
 
 WHOAMI="$(/usr/bin/whoami)"
 [ "$USER" = "$WHOAMI" ] || err 126 "USER '$USER' ? != ? '$WHOAMI' WHOAMI"
