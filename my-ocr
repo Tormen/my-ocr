@@ -14,15 +14,15 @@ NL="
 # and is authoritative at runtime -- the deployed copy needs no git and no
 # repository. The build id is a hash of this file, so it is right even unstamped.
 SCRIPT_VERSION="v1.1"
-SCRIPT_COMMIT="127ebb7"           # rewritten by 'my-ocr stamp-version'
+SCRIPT_COMMIT="7390e8c"           # rewritten by 'my-ocr stamp-version'
 # What git said when this build was stamped: 'git describe --tags --long' --
 # <nearest tag>-<commits since it>-g<short sha>. It says whether these bytes
 # ARE that release or work on top of it, on a machine with no git.
-SCRIPT_RELEASE="v1.1-1-g127ebb7"
+SCRIPT_RELEASE="v1.1-2-g7390e8c"
 # The commit the stamped one sits on. SCRIPT_COMMIT itself is never pushed --
 # the amend replaces it -- so no other clone has it; its parent is always
 # there, and that is what proves a repository is this tool's own.
-SCRIPT_PARENT="efde1db"
+SCRIPT_PARENT="61cc323"
 
 WHOAMI="$(/usr/bin/whoami)"
 [ "$USER" = "$WHOAMI" ] || err 126 "USER '$USER' ? != ? '$WHOAMI' WHOAMI"
@@ -75,6 +75,12 @@ FILELIST_CNT=0; # number of files in the FILELIST
   # The macOS process that turns "a file appeared in the watched folder" into a
   # workflow run.
   FA_DISPATCHER_NAME="FolderActionsDispatcher"
+  # Automator runs a THIRD-PARTY action -- FineReader's "Convert to PDF
+  # Document" is one -- only when third-party actions are enabled: a
+  # machine-wide setting (Automator > Third-Party Automator Actions..., admin
+  # password) that macOS records as this marker file, readable by any user.
+  AUTOMATOR_3PP_MARKER="/private/var/db/Scripting/.Automator3PPActions"
+  AUTOMATOR_3PP_HOWTO="open Automator > menu Automator > Third-Party Automator Actions... > enable (admin password)"
   # Where the application lives. setup refuses to wire a Folder Action to an
   # OCR app that is not installed: the failure would otherwise only surface on
   # the first real scan, long after setup said it was fine.
@@ -312,6 +318,17 @@ export_config_check() {
   case "$OCRAPP_SPLIT_FACING_PAGES" in 0|1) ;; *) err 172 "OCRAPP_SPLIT_FACING_PAGES='$OCRAPP_SPLIT_FACING_PAGES' -- must be 0 or 1 ($_ec_src)" ;; esac
   case "$OCRAPP_IMAGE_QUALITY_MRC" in 0|1|2) ;; *) err 161 "OCRAPP_IMAGE_QUALITY_MRC='$OCRAPP_IMAGE_QUALITY_MRC' -- must be 0 (Low), 1 (Balanced) or 2 (High); 3 makes FineReader abort ($_ec_src)" ;; esac
   case "$OCRAPP_IMAGE_QUALITY_NO_MRC" in 0|1|2) ;; *) err 173 "OCRAPP_IMAGE_QUALITY_NO_MRC='$OCRAPP_IMAGE_QUALITY_NO_MRC' -- must be 0 (Low), 1 (Balanced) or 2 (High); 3 makes FineReader abort ($_ec_src)" ;; esac
+}
+
+# Without third-party actions enabled, the Folder Action is refused before its
+# first step: nothing starts, nothing is logged, and every hand-over just waits
+# (the new scan host, 2026-09-30: four days of scans, then err 159). Prints the
+# raw value; 0 = enabled.
+automator_3pp_state() {
+  if [ -e "$AUTOMATOR_3PP_MARKER" ]; then
+    printf "marker '%s'\n" "$(head -c 8 "$AUTOMATOR_3PP_MARKER" 2>/dev/null)"; return 0
+  fi
+  echo "marker absent"; return 1
 }
 
 # The quality in force, and which key it came from -- printed side by side, so
@@ -2131,8 +2148,14 @@ $(ls -la "$S_PATH"|sed -e "s/^/${PFX}     | /")"
           nudge_handover "$S_PATH/$COLLECT_INP_PATH" "$TMP_PRE_INP_PATH" \
             || echo "$$| >>> [trigger-OCR] WARNING :: could not re-make the hand-over after the restart"
         elif [ "$_tw" -ge "$OCRAPP_TRIGGER_WAIT" ] && [ -n "$_fa_restarted" ]; then
-          m="$OCRAPP_NAME never started -- two hand-overs, then a dispatcher restart and a third, and the folder action fired none of them [${_fa_ev:-no restart evidence}].
+          m="$OCRAPP_NAME never started -- two hand-overs, then a dispatcher restart and a third, and the folder action fired none of them [${_fa_ev:-no restart evidence}]."
+          if _3p_raw="$(automator_3pp_state)"; then
+            m="$m
 Check that Folder Actions are enabled and that '$S_PATH' still has ours attached:  $US setup"
+          else
+            m="$m
+Third-party Automator actions are OFF, and then the workflow is refused before its first step -- $AUTOMATOR_3PP_HOWTO [$_3p_raw]"
+          fi
           alert_stuck "$m"
           err 159 "$m${NL}Still queued in '$QUEUED_FILE_MOVES_LOG':${NL}$(cat "$QUEUED_FILE_MOVES_LOG")"
         fi
@@ -2619,6 +2642,11 @@ do_status() {
   else
     echo "${_st_pfx}SPLIT     facing pages: $OCRAPP_NAME has '$_st_sp', config wants $OCRAPP_SPLIT_FACING_PAGES -- the next run sets it"
   fi
+  if _st_3p="$(automator_3pp_state)"; then
+    echo "${_st_pfx}AUTOMATOR third-party actions enabled   [$_st_3p]"
+  else
+    echo "${_st_pfx}AUTOMATOR third-party actions OFF -- $OCRAPP_NAME's step will be refused: $AUTOMATOR_3PP_HOWTO   [$_st_3p]"
+  fi
   _st_cf="$CONFIG_FILE"
   [ -n "$_st_cf" ] || _st_cf="none found -- built-in defaults ($US --create-config prints them)"
   echo "${_st_pfx}CONFIG    $_st_cf"
@@ -2667,7 +2695,7 @@ do_version() {
   _vd="$(git -c safe.directory='*' -C "$(_self_dir)" describe --tags --long 2>/dev/null)"
   # describe answers about WHERE this file sits, not about what it is: a copy
   # dropped in a foreign repo gets THAT repo's tags (/LINKS/global is one, and
-  # it holds the copies update-LINKS promotes). The stamped PARENT is the
+  # it holds the copies my-rollout promotes). The stamped PARENT is the
   # proof -- a repo that does not have it is not this tool's repo. Not
   # SCRIPT_COMMIT: that one only ever existed in the clone that stamped, so
   # every other checkout of the real repo was taken for a foreign one.
@@ -3934,6 +3962,11 @@ Try:   su - ${_su_gui:-<the console user>} -c '$US setup${1:+ $1}'"
   done
   if [ -n "$_su_auto" ]; then echo "    > Automator     OK   $_su_auto"
   else echo "    > Automator     MISSING"; _su_fail=1; fi
+  # Not a reason to skip the wiring -- it is right either way, and enabling the
+  # setting afterwards is all it takes -- but the run cannot work until then.
+  _su_3p=""
+  if _su_3s="$(automator_3pp_state)"; then echo "    > third-party   OK   Automator actions enabled [$_su_3s]"
+  else echo "    > third-party   OFF  -- the $OCRAPP_NAME step will be refused: $AUTOMATOR_3PP_HOWTO [$_su_3s]"; _su_3p=1; fi
 
   echo "  >> Directories"
   for _su_d in "$S_PATH" "$T_PATH" "$(dirname "$OCRAPP_LOCKFILE")"; do
@@ -3963,8 +3996,9 @@ Try:   su - ${_su_gui:-<the console user>} -c '$US setup${1:+ $1}'"
   fi
 
   echo
-  [ "$_su_fail" = "0" ] && echo " >>> preflight OK [0]" \
-                        || echo " >>> preflight INCOMPLETE [$_su_fail] -- fix the MISSING items above"
+  if [ "$_su_fail" != "0" ]; then echo " >>> preflight INCOMPLETE [$_su_fail] -- fix the MISSING items above"
+  elif [ -n "$_su_3p" ]; then echo " >>> wired, but NOT ready -- enable third-party Automator actions (see above)"
+  else echo " >>> preflight OK [0]"; fi
   echo
   do_status "     "
   return $_su_fail
@@ -4818,6 +4852,41 @@ t_status_health() {
       t_ok "health: an error flag and a staging folder with documents are named, with their raw values";;
     *) t_bad "health: an error flag and a staging folder with documents are named, with their raw values" "$_sh_o";;
   esac
+}
+
+# Third-party Automator actions: macOS refuses the workflow before its first
+# step when they are off, and NOTHING says so -- the new scan host lost four
+# days of scans that way. status and setup read the marker and name the fix.
+t_3p_marker() { AUTOMATOR_3PP_MARKER="$1"; } # INSIDE a subshell only
+t_automator_3pp() {
+  _3d="$T_TMP/3pp"; mkdir -p "$_3d"; printf 'a' >"$_3d/marker"
+  _3o="$( t_3p_marker "$_3d/marker"; automator_3pp_state; echo "RC=$?"; do_status "" 2>&1 | grep '^AUTOMATOR' )"
+  case "$_3o" in
+    *"marker 'a'"*"RC=0"*"AUTOMATOR third-party actions enabled   [marker 'a']"*) t_ok "third-party: the marker present reads as enabled, with its raw value";;
+    *) t_bad "third-party: the marker present reads as enabled, with its raw value" "$_3o";;
+  esac
+  _3o="$( t_3p_marker "$_3d/absent"; automator_3pp_state; echo "RC=$?"; do_status "" 2>&1 | grep '^AUTOMATOR' )"
+  case "$_3o" in
+    *"marker absent"*"RC=1"*"AUTOMATOR third-party actions OFF"*"Third-Party Automator Actions"*) t_ok "third-party: no marker reads as OFF, and status names the menu item that fixes it";;
+    *) t_bad "third-party: no marker reads as OFF, and status names the menu item that fixes it" "$_3o";;
+  esac
+  # setup still wires everything, but must not call itself OK
+  printf 'AUTOMATOR_3PP_MARKER="%s"\n' "$_3d/absent" >"$_3d/off.conf"
+  _3o="$(MY_OCR_CONFIG="$_3d/off.conf" "$0" setup 2>&1 </dev/null)"
+  case "$_3o" in
+    *"preflight OK"*) t_bad "third-party: with it OFF, setup does not say 'preflight OK'" "$(printf '%s' "$_3o" | grep -E 'third-party|>>> ')";;
+    *"third-party   OFF"*) t_ok "third-party: with it OFF, setup says so and does not say 'preflight OK'";;
+    *) t_bad "third-party: with it OFF, setup says so and does not say 'preflight OK'" "$(printf '%s' "$_3o" | grep -E 'third-party|>>> ')";;
+  esac
+  # and a run whose hand-overs never fire names it as the cause
+  # shellcheck disable=SC2016  # matching literal source text
+  if awk '/^do_trigger_ocr\(\) \{/,/^\}/' "$0" \
+     | awk '/never started -- two hand-overs/{n=NR} /automator_3pp_state/{c=NR} /AUTOMATOR_3PP_HOWTO/{h=NR} /err 159 /{e=NR}
+            END{exit !(n && c && h && e && n < c && c < h && h < e)}'; then
+    t_ok "third-party: 'never started' names the setting when it is OFF"
+  else
+    t_bad "third-party: 'never started' names the setting when it is OFF" "err 159 does not consult it"
+  fi
 }
 
 t_reset_log_last() {
@@ -5714,6 +5783,7 @@ do_run_tests() {
   t_parts_sandboxed
   t_stall_retry
   t_status_health
+  t_automator_3pp
   t_wait_is_evidence_based
   t_mutex
   t_concurrency_state
