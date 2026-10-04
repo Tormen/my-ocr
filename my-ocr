@@ -2280,13 +2280,13 @@ t_bad() { T_FAIL=$(( $T_FAIL + 1 )); printf '  FAIL  %s\n' "$1"
           [ -n "$2" ] && printf '        %s\n' "$2"; return 0; }
 
 # --- the shebang decides what ps shows, which cleanup() greps for
-t_shebang() {
+rt_shebang() {
   _sb="$(head -1 "$0")"
   [ "$_sb" = "#!/bin/dash" ] && t_ok "shebang is /bin/dash" \
                              || t_bad "shebang is /bin/dash" "got '$_sb'"
 }
 
-t_dash_syntax() {
+rt_dash_syntax() {
   if /bin/dash -n "$0" 2>/dev/null; then t_ok "parses as dash (dash -n)"
   else t_bad "parses as dash (dash -n)" "$(/bin/dash -n "$0" 2>&1 | head -1)"; fi
 }
@@ -2294,7 +2294,7 @@ t_dash_syntax() {
 # The code of an error names ONE source line: grep it, land on it. Two lines
 # sharing a code (028, 106, 138, 160 and 161 did) send the reader to the wrong
 # one. Commented-out calls count too, so a revived line collides with nothing.
-t_err_codes_unique() {
+rt_err_codes_unique() {
   grep -noE '\berr 0*[0-9]{3,5}( "|$)' "$0" | awk -F: '
     { split($2, a, " "); c = a[2] + 0; n[c]++; l[c] = l[c] " " $1; if (c > max) max = c }
     END { for (c in n) if (n[c] > 1) print "SHARED " c " at lines" l[c]; print "MAX " max }' > "$T_TMP/errcodes"
@@ -2309,7 +2309,7 @@ t_err_codes_unique() {
 
 # --- REGRESSION: '--file' used $(( )) (arithmetic) instead of $( ), which is a
 #     fatal syntax error at parse time, so the documented option never worked.
-t_file_option() {
+rt_file_option() {
   _f="$T_TMP/filelist"; printf 'a\nb\n' > "$_f"
   # --part-1 --no-log parses --file, then stops at err 003 before doing work
   _out="$(MY_OCR_CONFIG="$T_TMP/sandbox.conf" "$0" --part-1 --no-log --file "$_f" 2>&1)"
@@ -2325,7 +2325,7 @@ t_file_option() {
 # --- REGRESSION: cleanup() hard-coded '/bin/sh' when hunting its own
 #     Automator-launched children, so changing the shebang silently made it
 #     match nothing and it stopped killing them.
-t_cleanup_pattern_interpreter_agnostic() {
+rt_cleanup_pattern_interpreter_agnostic() {
   _stand="$T_TMP/my-ocr"
   printf '#!/bin/dash\nsleep 20\n' > "$_stand"; chmod 755 "$_stand"
   "$_stand" --part-1 & _pid=$!
@@ -2349,7 +2349,7 @@ t_cleanup_pattern_interpreter_agnostic() {
 }
 
 # --- CLAIMS AUDIT: --help must not promise behaviour the code does not have
-t_help_claims() {
+rt_help_claims() {
   _h="$("$0" --help 2>&1)"
   # every option --help lists must be accepted by the parser
   for _o in --part-1 --part-2 -F -V -D --log --no-log -f --file --test-mail; do
@@ -2363,7 +2363,7 @@ t_help_claims() {
 }
 
 # --- a marked file must never be OCRed, whoever hands it over
-t_no_ocr_marker() {
+rt_no_ocr_marker() {
   # the glob logic itself
   _hits=""
   for _n in "no-ocr-scan-x.pdf" "no-ocr-scan.pdf" "scan.pdf" "2026-01-01___scan.pdf"; do
@@ -2387,7 +2387,7 @@ t_no_ocr_marker() {
 }
 
 # --- the Finder must not pop open when nobody started this from a terminal
-t_reveal_policy() {
+rt_reveal_policy() {
   # part-1/part-2 are launched by AUTOMATOR and never have a tty, so the
   # decision cannot be a tty test there -- it must come from the flagfile.
   # the REVEAL DECISION itself, not merely the name appearing somewhere in
@@ -2425,7 +2425,7 @@ t_reveal_policy() {
 
 # --- REGRESSION: my-ocr must be able to quarantine what it could not OCR,
 #     so a caller never has to infer which files failed.
-t_move_failed_to() {
+rt_move_failed_to() {
   # default is "": current behaviour, files stay put (the default lives in
   # default_config_content(), unindented)
   if default_config_content | grep -qx 'MOVE_FAILED_TO=""'; then
@@ -2450,7 +2450,7 @@ t_move_failed_to() {
 
 # --- REGRESSION: the AUTOMATOR wait must never end on a clock. A timeout
 #     would release the lock while FineReader might still be running.
-t_wait_is_evidence_based() {
+rt_wait_is_evidence_based() {
   _w="$(awk '/### --trigger-ocr \(5\)/,/^  done$/' "$0")"
   _ok=1
   # it must consult whether the OCR app is actually running
@@ -2478,7 +2478,7 @@ t_wait_is_evidence_based() {
 # --- REGRESSION: the gate must be ATOMIC and must QUEUE, not refuse.
 #     The old "[ -e LOCK ] ... err 080; touch LOCK" was test-then-act: two
 #     callers could both pass it and both drive FineReader.
-t_mutex() {
+rt_mutex() {
   _acq="$(awk '/Take the OCR mutex and WAIT/,/Took the OCR mutex/' "$0")"
   case "$_acq" in
     *"until mkdir \"\$OCRAPP_MUTEX_DIR\""*) t_ok "the gate is mkdir (atomic test-and-set)";;
@@ -4018,7 +4018,7 @@ Try:   su - ${_su_gui:-<the console user>} -c '$US setup${1:+ $1}'"
 # --- a stalled OCR app: grinding, or waiting on a dialog? CPU time decides.
 # --- reset keeps its only evidence until it has dealt with the documents
 # --- a stranded file is removed only when BYTE-IDENTICAL to its document
-t_stranded_verdict() {
+rt_stranded_verdict() {
   _v="$T_TMP/verdict"; mkdir -p "$_v"
   t_mkpdf "$_v/filed.pdf" 2 FineReader "one two three"
   cp "$_v/filed.pdf" "$_v/same.#1.pdf"                       # a true copy
@@ -4065,7 +4065,7 @@ t_stranded_verdict() {
 
 # --- what reset keeps, it hands over as ONE command that opens it
 # --- the hand-over can be made AGAIN, and it moves documents, never loses them
-t_nudge() {
+rt_nudge() {
   _n="$T_TMP/nudge"; mkdir -p "$_n/watched/staging" "$_n/out"; rmdir "$_n/out"
   : >"$_n/watched/staging/doc.#1.pdf"; : >"$_n/watched/staging/two.#1.pdf"
   if nudge_handover "$_n/watched/staging" "$_n/out" \
@@ -4091,7 +4091,7 @@ t_nudge() {
 }
 
 # --- a staging dir left by a dead run: empty is junk, full is DOCUMENTS
-t_staging_sweep() {
+rt_staging_sweep() {
   _ss="$T_TMP/sweep"; mkdir -p "$_ss/in/staging"
   _o="$( S_PATH="$_ss/in"; COLLECT_INP_PATH=staging; WHAT=sweeptest
          PARTx_ERRORED_FLAGFILE="$_ss/flag"; self_heal 2>&1 )"
@@ -4111,7 +4111,7 @@ t_staging_sweep() {
   esac
 }
 
-t_open_cmd() {
+rt_open_cmd() {
   _oc="$T_TMP/opencmd"; mkdir -p "$_oc"
   printf '%s\n' "/a b/,ocr.out/x.#1.pdf" "/docs/,scans/x.pdf" >"$_oc/list"
   _o="$(print_open_cmd "$_oc/list")"
@@ -4147,7 +4147,7 @@ t_wf_gen() { # $1 dir, $2 OCRAPP_MRC, $3 QUALITY_MRC, $4 QUALITY_NO_MRC -> "mrc=
   printf 'mrc=%s quality=%s\n' "${_wg_v% *}" "${_wg_v#* }"
 }
 
-t_workflow_export() {
+rt_workflow_export() {
   _we_d="$T_TMP/wf-export"
   # the defaults: no MRC, and the no-MRC quality (Balanced)
   _we_v="$(t_wf_gen "$_we_d" "$OCRAPP_MRC" "$OCRAPP_IMAGE_QUALITY_MRC" "$OCRAPP_IMAGE_QUALITY_NO_MRC")"
@@ -4191,7 +4191,7 @@ t_workflow_export() {
   esac
 }
 
-t_trash_by_mv() {
+rt_trash_by_mv() {
   _tt_d="$T_TMP/trash-mv"; mkdir -p "$_tt_d/trash" "$_tt_d/in"
   _tt_o="$(
     TRASH_DIR="$_tt_d/trash"
@@ -4231,7 +4231,7 @@ t_trash_by_mv() {
   esac
 }
 
-t_config_file() {
+rt_config_file() {
   _tc_d="$T_TMP/config"; mkdir -p "$_tc_d"
   # Each default exists ONCE: in default_config_content(). A second assignment
   # of a setting before it -- the old defaults block -- is a copy that drifts.
@@ -4276,7 +4276,7 @@ t_config_file() {
   else t_bad "config: --create-config=<FILE> writes a new one" "not written"; fi
 }
 
-t_split_pref() {
+rt_split_pref() {
   # LIVE, against a THROW-AWAY preferences domain -- never FineReader's own
   _ts_dom="my-ocr.suite.$$"
   _ts_o="$(
@@ -4319,7 +4319,7 @@ t_split_pref() {
   esac
 }
 
-t_fa_restart() {
+rt_fa_restart() {
   # LIVE, with a stand-in for the dispatcher: a renamed 'sleep'. The real one
   # is never touched by the suite.
   _fr_d="$T_TMP/fa-restart"; mkdir -p "$_fr_d"
@@ -4367,7 +4367,7 @@ t_fa_restart() {
   fi
 }
 
-t_trap_term() {
+rt_trap_term() {
   # LIVE, with the script's OWN trap line: a TERMed run must reach cleanup().
   # TERM is what kill, pkill and launchd send; without it in the list every
   # TERMed run left its mutex, run files and a 'tail -f' behind.
@@ -4399,7 +4399,7 @@ t_reset_sandbox() { # $1 = sandbox root
   T_PATH="$1/out"; RESET_RETRY_TO="$1/retry"
 }
 
-t_reset_stable() {
+rt_reset_stable() {
   # LIVE, in a sandbox: the situation reset met on ada after a killed run -- a
   # staged copy byte-identical to its filed document, a Finder .DS_Store, and
   # the queue log that maps the one to the other. Three runs, in order:
@@ -4482,7 +4482,7 @@ t_pf_app() { # the stand-in OCR app and the wait -- called INSIDE a subshell onl
 }
 t_pf_coll() { COLLECT_INP_PATH="$1"; } # as trigger-OCR has it -- INSIDE a subshell only
 
-t_preflight_repair() {
+rt_preflight_repair() {
   # What a KILLed run leaves: its queue log and a staged copy of a document
   # already filed. The NEXT run holds the mutex (a live owner -- itself), so
   # 'reset' refuses; the pre-flight repair must not -- but only once nothing of
@@ -4633,7 +4633,7 @@ t_preflight_repair() {
 # A run removes what it creates: the errored flag was scheduled for cleanup only
 # when a part had written an error into it, so every SUCCESSFUL run left it
 # behind, empty -- and 'reset' right after any normal run was never empty.
-t_errflag_cleanup() {
+rt_errflag_cleanup() {
   # shellcheck disable=SC2016  # matching literal source text
   if awk '/^do_trigger_ocr\(\) \{/,/^\}/' "$0" \
      | awk '/^  schedule_for_cleanup "\$PARTx_ERRORED_FLAGFILE"$/{s=NR} /^  touch "\$PARTx_ERRORED_FLAGFILE"/{t=NR}
@@ -4651,7 +4651,7 @@ t_errflag_cleanup() {
 # proof is the stamped PARENT now. The stamp itself is recreated here -- the
 # real one runs this suite first -- and checked separately below. The case the
 # proof exists for must still hold: a copy in a foreign repo reports NOT its tags.
-t_version_clone() {
+rt_version_clone() {
   _vc="$T_TMP/vclone"; rm -rf "$_vc"; mkdir -p "$_vc/src" "$_vc/foreign"
   cp "$0" "$_vc/src/$US"
   (
@@ -4697,7 +4697,7 @@ t_version_clone() {
 # live run aborts on it (err 066). The suite started parts with the real flag:
 # 760 lines of test errors had piled up in it on horse, and a suite run on the
 # scan host during a real OCR would have ended that OCR.
-t_parts_sandboxed() {
+rt_parts_sandboxed() {
   _ps_real="$PARTx_ERRORED_FLAGFILE"
   _ps_before="$(wc -c <"$_ps_real" 2>/dev/null | tr -d ' ')"
   MY_OCR_CONFIG="$T_TMP/sandbox.conf" "$0" --move-failed-to /nonexistent/quarantine --part-1 --no-log >/dev/null 2>&1
@@ -4722,7 +4722,7 @@ t_rt_env() { # the retry's world -- called INSIDE a subshell only
 # back first -- and never when a document of it was already filed, since the
 # second hand-over would OCR that one again. Point 5: an incident that ends
 # well says so in one mail and takes its markers off the Desktop.
-t_stall_retry() {
+rt_stall_retry() {
   _rt="$T_TMP/retry"
   _rt_world() {
     rm -rf "$_rt"; mkdir -p "$_rt/lib" "$_rt/pub/stage" "$_rt/bin" "$_rt/trash" "$_rt/desk" "$_rt/docstore"
@@ -4838,7 +4838,7 @@ t_stall_retry() {
 # Point 6: 'status' names what runs that are gone left behind, each with its
 # raw value -- and does not call an EMPTY staging folder debris: every part
 # creates one, and it is harmless.
-t_status_health() {
+rt_status_health() {
   _sh="$T_TMP/health"; rm -rf "$_sh"; mkdir -p "$_sh/lib" "$_sh/pub" "$_sh/tmp-stage" "$_sh/docstore"
   _sh_o="$( t_reset_sandbox "$_sh"; t_rt_env "$_sh"; do_status "" 2>&1 | grep '^HEALTH' )"
   case "$_sh_o" in
@@ -4858,7 +4858,7 @@ t_status_health() {
 # step when they are off, and NOTHING says so -- the new scan host lost four
 # days of scans that way. status and setup read the marker and name the fix.
 t_3p_marker() { AUTOMATOR_3PP_MARKER="$1"; } # INSIDE a subshell only
-t_automator_3pp() {
+rt_automator_3pp() {
   _3d="$T_TMP/3pp"; mkdir -p "$_3d"; printf 'a' >"$_3d/marker"
   _3o="$( t_3p_marker "$_3d/marker"; automator_3pp_state; echo "RC=$?"; do_status "" 2>&1 | grep '^AUTOMATOR' )"
   case "$_3o" in
@@ -4889,7 +4889,7 @@ t_automator_3pp() {
   fi
 }
 
-t_reset_log_last() {
+rt_reset_log_last() {
   # the documents part of reset lives in reset_stranded(), shared with the
   # pre-flight repair -- the order has to hold there
   _rl="$(awk '/^reset_stranded\(\)/,/^\}/' "$0")"
@@ -4903,7 +4903,7 @@ t_reset_log_last() {
   fi
 }
 
-t_stall_recovery() {
+rt_stall_recovery() {
   _c="$(printf '  0:02.02\n' | cpu_from_ps)"
   if [ "$_c" = "202" ]; then t_ok "cpu: '0:02.02' is 202 hundredths"
   else t_bad "cpu: '0:02.02' is 202 hundredths" "got '$_c'"; fi
@@ -4985,7 +4985,7 @@ t_stall_recovery() {
   fi
 }
 
-t_bundle_pids() {
+rt_bundle_pids() {
   # LIVE: the recognition does not run in the process that carries the app's
   # name -- it runs in helper processes inside the same bundle. Counting only
   # the named one made a 25-page batch that was genuinely working look frozen,
@@ -5048,7 +5048,7 @@ t_bundle_pids() {
   rm -rf "$_bp"
 }
 
-t_counts_reconcile() {
+rt_counts_reconcile() {
   # the ordinary case: 5 handed over, 2 still queued -> 3 done
   _c="$(ocr_ok_cnt 5 2)"
   if [ "$_c" = "3" ]; then t_ok "counts: 5 handed to the OCR, 2 queued -> 3 OCRed"
@@ -5074,7 +5074,7 @@ t_counts_reconcile() {
   fi
 }
 
-t_ocrapp_quit() {
+rt_ocrapp_quit() {
   # it must be a no-op, and instant, when the app is not running at all
   _q_t0=$(date +%s)
   ( OCRAPP_NAME="no-such-process-xyzzy"; ocrapp_quit ) >/dev/null 2>&1
@@ -5100,7 +5100,7 @@ t_ocrapp_quit() {
   fi
 }
 
-t_stale_batch() {
+rt_stale_batch() {
   _sb_t="$T_TMP/stale-batch"; mkdir -p "$_sb_t/bin"
   # a stub trash, so a test never puts anything in the user's Trash
   printf '#!/bin/dash\nshift 2>/dev/null\nrm -rf "$@"\n' >"$_sb_t/bin/trash"
@@ -5186,7 +5186,7 @@ t_stale_batch() {
   fi
 }
 
-t_window_restore() {
+rt_window_restore() {
   _wr="$T_TMP/window-restore"; mkdir -p "$_wr"
   _o1="$( ocrapp_no_window_restore "$_wr/unset" 2>&1 )"
   _v1="$(/usr/bin/defaults read "$_wr/unset" ApplePersistenceIgnoreState 2>/dev/null)"
@@ -5212,7 +5212,7 @@ t_window_restore() {
   fi
 }
 
-t_concurrency_state() {
+rt_concurrency_state() {
   # 1. per-invocation scratch names
   if awk "/^ *PROVIDED_FILES_FILELIST=/" "$0" | grep -q '[$][$]'; then
     t_ok "PROVIDED_FILES_FILELIST is per-invocation"
@@ -5396,7 +5396,7 @@ _EOMK_
 # The result REPLACES the original and the original is trashed a moment
 # earlier, so this check is the only thing standing between a mangled OCR and
 # a lost document.
-t_verify_result() {
+rt_verify_result() {
   if [ -z "$c_pdfinfo" ] || [ ! -x "$c_pdfinfo" ]; then
     t_ok "result verification: skipped, no pdfinfo on this host"; return 0
   fi
@@ -5519,7 +5519,7 @@ t_verify_result() {
 
 # Tagging overwrites a document that is in no other danger, so it has to be
 # provably lossless: same pages, still sound, still recognisable afterwards.
-t_tag_in_place() {
+rt_tag_in_place() {
   if [ -z "$c_qpdf" ] || [ ! -x "$c_qpdf" ] || [ ! -x /usr/bin/python3 ]; then
     t_ok "tag in place: skipped, no qpdf/python3 on this host"; return 0
   fi
@@ -5560,7 +5560,7 @@ t_tag_in_place() {
   fi
 }
 
-t_status_and_setup() {
+rt_status_and_setup() {
   _pre_mutex=""; [ -d "$OCRAPP_MUTEX_DIR" ] && _pre_mutex=1
   _o="$("$0" --status 2>&1)"
   case "$_o" in
@@ -5607,7 +5607,7 @@ t_status_and_setup() {
 
 # --- --test-mail goes the STUCK alert's way, and a failure is not a pass.
 #     Runs a COPY of this file whose my_notify is a stub: no real mail, ever.
-t_test_mail() {
+rt_test_mail() {
   _d="$T_TMP/testmail"; mkdir -p "$_d"; _a="$_d/notify.args"
   cat >"$_d/my-notify.stub" <<'_EOSTUB_'
 #!/bin/dash
@@ -5669,7 +5669,7 @@ _EOSTUB_
 # broken: the queue entry it leaves on purpose tripped err 053 -> the errored
 # flagfile -> err 066 -> exit 1 -> my-scan's err 069; and the summary called a
 # page with nothing to OCR "1/1 files *FAILED* to be OCRed".
-t_refusal_reporting() {
+rt_refusal_reporting() {
   _rv="$(awk '/^do_part_2\(\)/,/^\}/' "$0")"
 
   if printf '%s' "$_rv" | grep -q 'REFUSED_FILES_LOG'; then
@@ -5739,7 +5739,7 @@ t_refusal_reporting() {
 
 # A finished OCR whose move failed is NOT a failure. Quarantining it filed
 # five good documents under FAILED and stranded their results (2026-09-18).
-t_stranded_not_failed() {
+rt_stranded_not_failed() {
   _cl="$(awk '/Every file that completed had its line deleted/,/quarantined in/' "$0")"
   if printf '%s' "$_cl" | grep -q 'out_fp'; then
     t_ok "quarantine: the out-path is consulted before calling a document failed"
@@ -5762,8 +5762,14 @@ t_stranded_not_failed() {
   fi
 }
 
+# A test defined but left out of the run list never runs -- silently.
+rt_run_list_is_complete() {
+  _g_def=$(grep -c '^rt_[a-z0-9_]*() *{' "$0")
+  if [ "$_g_def" = "$_rt_n" ]; then t_ok "every test function is in the run list"
+  else t_bad "every test function is in the run list ($_g_def defined, $_rt_n listed)"; fi
+}
+
 do_run_tests() {
-  echo "$US --run-tests   ($(head -1 "$0"))"
   T_TMP="$(mktemp -d /tmp/my-ocr.tests.XXXXXX)" || { echo "mktemp failed"; return 1; }
   # A part-1/part-2 started by a test writes its error into the error flag a
   # LIVE run watches -- where it aborts that run (err 066). Tests that start a
@@ -5771,49 +5777,70 @@ do_run_tests() {
   # into the suite's own directory.
   printf 'PARTx_ERRORED_FLAGFILE="%s"\nTMP_PRE_INP_PATH="%s"\n' \
     "$T_TMP/partx-errored.flag" "$T_TMP/pre-staging" >"$T_TMP/sandbox.conf"
-  t_shebang
-  t_err_codes_unique
-  t_dash_syntax
-  t_file_option
-  t_cleanup_pattern_interpreter_agnostic
-  t_help_claims
-  t_no_ocr_marker
-  t_reveal_policy
-  t_move_failed_to
-  t_parts_sandboxed
-  t_stall_retry
-  t_status_health
-  t_automator_3pp
-  t_wait_is_evidence_based
-  t_mutex
-  t_concurrency_state
-  t_verify_result
-  t_refusal_reporting
-  t_tag_in_place
-  t_stranded_not_failed
-  t_status_and_setup
-  t_test_mail
-  t_window_restore
-  t_stale_batch
-  t_ocrapp_quit
-  t_counts_reconcile
-  t_stall_recovery
-  t_bundle_pids
-  t_reset_log_last
-  t_reset_stable
-  t_preflight_repair
-  t_errflag_cleanup
-  t_version_clone
-  t_trap_term
-  t_fa_restart
-  t_workflow_export
-  t_config_file
-  t_split_pref
-  t_trash_by_mv
-  t_open_cmd
-  t_nudge
-  t_staging_sweep
-  t_stranded_verdict
+  # the tests, in order: one literal call each, in ONE list -- run twice:
+  # first _rt only counts (and returns 1, so no test runs), then it reports.
+  # TAP-style: "1..N" first, then "ok K - name" / "not ok K - name"
+  _rt_tests() {
+    _rt shebang && rt_shebang
+    _rt err_codes_unique && rt_err_codes_unique
+    _rt dash_syntax && rt_dash_syntax
+    _rt file_option && rt_file_option
+    _rt cleanup_pattern_interpreter_agnostic && rt_cleanup_pattern_interpreter_agnostic
+    _rt help_claims && rt_help_claims
+    _rt no_ocr_marker && rt_no_ocr_marker
+    _rt reveal_policy && rt_reveal_policy
+    _rt move_failed_to && rt_move_failed_to
+    _rt parts_sandboxed && rt_parts_sandboxed
+    _rt stall_retry && rt_stall_retry
+    _rt status_health && rt_status_health
+    _rt automator_3pp && rt_automator_3pp
+    _rt wait_is_evidence_based && rt_wait_is_evidence_based
+    _rt mutex && rt_mutex
+    _rt concurrency_state && rt_concurrency_state
+    _rt verify_result && rt_verify_result
+    _rt refusal_reporting && rt_refusal_reporting
+    _rt tag_in_place && rt_tag_in_place
+    _rt stranded_not_failed && rt_stranded_not_failed
+    _rt status_and_setup && rt_status_and_setup
+    _rt test_mail && rt_test_mail
+    _rt window_restore && rt_window_restore
+    _rt stale_batch && rt_stale_batch
+    _rt ocrapp_quit && rt_ocrapp_quit
+    _rt counts_reconcile && rt_counts_reconcile
+    _rt stall_recovery && rt_stall_recovery
+    _rt bundle_pids && rt_bundle_pids
+    _rt reset_log_last && rt_reset_log_last
+    _rt reset_stable && rt_reset_stable
+    _rt preflight_repair && rt_preflight_repair
+    _rt errflag_cleanup && rt_errflag_cleanup
+    _rt version_clone && rt_version_clone
+    _rt trap_term && rt_trap_term
+    _rt fa_restart && rt_fa_restart
+    _rt workflow_export && rt_workflow_export
+    _rt config_file && rt_config_file
+    _rt split_pref && rt_split_pref
+    _rt trash_by_mv && rt_trash_by_mv
+    _rt open_cmd && rt_open_cmd
+    _rt nudge && rt_nudge
+    _rt staging_sweep && rt_staging_sweep
+    _rt stranded_verdict && rt_stranded_verdict
+    _rt run_list_is_complete && rt_run_list_is_complete
+  }
+  _rt_n=0
+  _rt() { _rt_n=$((_rt_n + 1)); return 1; }
+  _rt_tests
+  echo "1..$_rt_n"
+  echo "# $US --run-tests   ($(head -n 1 "$0"))"
+  _rt_k=0; _rt_prev=""; _rt_bad=0
+  _rt() {   # closes the test before it, opens the next
+    if [ -n "$_rt_prev" ]; then
+      _rt_k=$((_rt_k + 1))
+      if [ "$T_FAIL" = "$_rt_bad" ]; then echo "ok $_rt_k - $_rt_prev"; else echo "not ok $_rt_k - $_rt_prev"; fi
+    fi
+    _rt_prev=$1; _rt_bad=$T_FAIL
+  }
+  _rt_tests
+  _rt ""
   rm -rf "$T_TMP"
   echo "  ----"
   printf '  %d passed, %d failed\n' "$T_PASS" "$T_FAIL"
