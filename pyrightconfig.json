@@ -1,0 +1,5 @@
+{
+  "include": ["my-ocr.py"],
+  "typeCheckingMode": "strict",
+  "pythonVersion": "3.9"
+}

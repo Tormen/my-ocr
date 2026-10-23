@@ -1,241 +1,134 @@
 # my-ocr
 
-Drives a single-instance OCR application (ABBYY FineReader) from the shell, and
-guarantees that only one OCR run exists at a time.
-
-Built for and verified against **ABBYY FineReader Pro for Mac 12.1.14**
-(`/Applications/FineReader.app`, bundle `com.abbyy.FineReaderPro`) -- a GUI-only
-application with no command line. **Together with [my-scan](../my-scan/) it is
-especially useful**: my-scan receives the scanner's delivery and files the
-result, my-ocr turns that FineReader into an unattended, scriptable OCR step.
-my-ocr is usable on its own from the shell; the OCR itself is not -- without
-that FineReader installed there is nothing to drive.
+Makes scanned PDFs and pictures searchable from the shell, with **DEVONthink**'s
+OCR (DEVONthink Pro 4 and its ABBYY FineReader add-on). Each document is
+replaced in place by a searchable PDF; the original goes to the Trash.
+**Together with [my-scan](../../sh/my-scan/) it is especially useful**: my-scan
+receives the scanner's delivery and files the result, my-ocr is its unattended
+OCR step. It works on its own just as well.
 
 ```sh
-my-ocr scan.pdf                  # OCR in place; blocks until it is our turn
+my-ocr scan.pdf                  # OCR in place; waits when another OCR is running
 printf '%s\n' a.pdf b.png | my-ocr
-my-ocr --file list.txt
+my-ocr --file list.txt --move-failed-to ~/failed
 ```
 
-Input may be **PDF, PNG, JPEG or TIFF** — a picture is turned into a searchable
-PDF, and counts as one page. Each file is replaced in place on success.
+Input may be **PDF, JPEG, PNG or TIFF**. A picture becomes a PDF of the same
+name beside it (never over an existing one).
 
-## Why it exists
+## What happens to one document
 
-FineReader on macOS has no command line. The only automation hook is an
-Automator action, and Automator drives it through a Folder Action: files land
-in an input folder, the application writes results to an output folder. That is
-a three-step round trip -- `--part-1`, the OCR action, `--part-2` -- and only
-one of them can be in flight, because there is one GUI application and one
-Automator wiring.
+1. **Checks.** Skipped and left where they are: documents already OCRed (their
+   PDF Producer contains `FineReader`), encrypted PDFs (listed at the end),
+   names matching `NO_OCR_FILENAME_PATTERNS`, folders, other file types, a file
+   named twice. `--force` OCRs already-OCRed documents again.
+2. **A copy goes to DEVONthink** -- never the original -- into a group of its
+   own, `/my-ocr` in the global Inbox. DEVONthink OCRs it, my-ocr exports the
+   result and deletes DEVONthink's record again.
+3. **The result is checked** while the original is still untouched:
+   - it parses as a PDF;
+   - its page count is **not lower** than the input's (more is fine: the OCR
+     may split a sheet it takes for two pages);
+   - `qpdf --check` passes -- qpdf walks every object and stream, where
+     `pdfinfo` reads only the page tree. Its exit is graded: 0 clean, 3
+     warnings only, anything else damage.
+4. **It is marked**: my-ocr writes `FineReader (my-ocr: OCR by DEVONthink/ABBYY)`
+   into the PDF Producer (DEVONthink leaves it empty). That mark is how
+   my-scan, and every later run, knows the document is done. The tag is a qpdf
+   JSON round trip -- the page content is copied through untouched -- and is
+   checked again before it is installed.
+5. **It takes the original's place.** The original is *copied* to the Trash
+   first, then the result is renamed over it in one step. The document is
+   never absent: a run killed in between leaves the original in place and a
+   spare copy in the Trash.
 
-my-ocr wraps that round trip in a blocking, synchronous call. Callers just run
-`my-ocr <files>` and wait; the queueing, the mutex and the Automator handshake
-are its problem, not theirs.
+Every document ends in exactly one of four outcomes, each reported:
 
-## The single-instance guarantee
+| outcome | what it means | where the document is |
+|---|---|---|
+| OCRed | the searchable PDF is in place | where it was |
+| no text | nothing to recognise -- a photograph, a blank page | a PDF original is **kept** and marked `FineReader (my-ocr: no text found -- original kept)`, so no later run OCRs it again; for a picture, the OCR's PDF |
+| REFUSED | the result failed the check -- the original was NOT replaced; you get a notification | `--move-failed-to` / `MOVE_FAILED_TO`, else where it was; the result is in the Trash, named `<name>.my-ocr-result.pdf` |
+| FAILED | DEVONthink could not OCR it | the same |
 
-A `mkdir` mutex, which is the atomic test-and-set in POSIX shell. Every caller
-queues at it rather than each having to arrange not to collide. A mutex whose
-owner is provably dead (`kill -0`) is broken automatically and never silently;
-a long OCR is not a crashed one, so a live owner is always waited for.
+No text is not a failure: the checks are the evidence that the OCR ran
+correctly, and a page with nothing on it is a finding about the document. It is
+reported on a line of its own, so that "forty of forty found nothing" -- a
+misconfigured OCR -- cannot hide in the success total.
 
-Concurrent runs overlap by design -- one queues while another works -- so every
-per-run file carries the pid of the run that owns it. That is what makes
-staleness decidable instead of guessed, and what lets a crashed run's leftovers
-be swept without touching a live one's.
+## When DEVONthink gets stuck
 
-## When FineReader gets stuck
-
-The OCR application is unmaintained; it will crash, hang, leave debris behind
-and sit on dialogs. my-ocr treats each of those as routine:
-
-- **Every run starts clean.** Right after taking the mutex, before it creates a
-  file of its own, a run looks for what a run that is gone left behind. While
-  that run's work is still going -- its Folder Action steps, or the OCR
-  application on its batch -- it waits. Then it repairs the rest the way
-  `reset go` would: the queue, and the staged copies its cleanup never removed.
-  A run releases the mutex only after its own shared files are gone.
-- **No launch onto a recovery dialog.** A half-built document the application
-  left behind is cleared before every launch -- but only when it is provably
-  my-ocr's: the paths it names lie in my-ocr's staging, or every page source in
-  it is a byte-identical copy of a document this run staged. Anything else is
-  left alone and reported.
-- **A stall is judged by CPU time.** A queue that does not move is not an
-  alarm while the application is measurably working, however long it takes.
-  Near-zero CPU while the queue stands still means it waits on a dialog.
-- **One retry.** A stalled chunk is handed over ONCE more: the application is
-  closed, the machinery is put back as the first hand-over found it, and the
-  same staged documents go in again. Only a second stall gives up, and the
-  documents go back as failed. There is no retry once a document of the chunk
-  has been filed, since a second hand-over would OCR it again.
-- **A hand-over that never fires** is made again once; if that fails too, the
-  Folder Actions dispatcher is restarted once, since it can wedge while every
-  check reports it healthy.
-- **One incident, one marker, a few mails.** Mails go out on changes of state
-  only -- `STUCK`, `STUCK -- retrying`, then `STUCK -- gave up` or `RESOLVED` --
-  and one marker file on the Desktop holds the incident's timeline. When it
-  resolves, the marker goes to the Trash.
-- **`status` shows the debris.** Its `HEALTH` line names helpers without the
-  application, a leftover document, files of runs that are gone, a non-empty
-  error flag, workflow steps of a run that is gone, and a staging folder that
-  still holds documents -- each with its raw value.
+- **One OCR at a time.** A `mkdir` mutex; a second run waits for its turn
+  (`MUTEX_TIMEOUT`). Only an owner that is provably gone (`kill -0`) is broken,
+  and never silently -- a long OCR is not a crashed one.
+- **One retry.** DEVONthink gets `OCR_TIMEOUT` seconds per document. Then
+  my-ocr quits it and hands it the same copy once more. A second time stops
+  the run: that document counts as FAILED, the ones after it are not touched,
+  and the exit code is 1.
+- **When DEVONthink cannot be reached at all** -- the macOS Automation consent
+  is missing, the app is gone -- the run stops at once and *nothing* is moved:
+  every document is still where it was, to be retried.
+- **One incident, one marker, a few mails.** `STUCK -- retrying`, then
+  `STUCK -- gave up` or `RESOLVED`: a notification and a mail each (through
+  `my-notify`), and one marker file on the Desktop holding the incident's
+  timeline. When it resolves, the marker goes to the Trash.
+- **Nothing is left behind.** Each run works in a folder of its own under
+  `STATE_DIR` (copies only) and removes it; a run killed outright leaves one
+  the next run removes. DEVONthink records a killed run left in `/my-ocr` are
+  deleted by the next run -- that group only, never another record.
 
 ## Commands
 
 ```sh
-my-ocr [FLAGS] [FILES]      OCR those files (default)
-my-ocr status               what is running, on which document, what is queued, HEALTH
-my-ocr setup [go]           generate the Automator workflow, bind the Folder Action
-my-ocr uninstall [go]       remove that wiring again
-my-ocr reset [go]           clean up after a crashed run; retry what was stranded
-my-ocr --version            version, commit and a build id of these exact bytes
-my-ocr --run-tests          the regression suite; starts no OCR
-my-ocr --test-mail          one test alert (notification + mail) the STUCK way
+my-ocr [OPTIONS] [FILES]    OCR them (the files from the command line, --file, else stdin)
+my-ocr status               is an OCR running, on which document; DEVONthink and its settings; HEALTH
+my-ocr reset [go]           clear what a killed run left: a mutex whose owner is gone, its work folder
+my-ocr --version            the version, git's describe string, a build id of these exact bytes
+my-ocr --run-tests [FILTER] the built-in tests (TAP); DEVONthink is a stub, nothing is OCRed
+my-ocr --test-mail          one alert (notification + mail) the way a STUCK alert goes
 ```
 
-`setup` and `uninstall` are dry runs unless given `go`. `reset` never deletes a
-document: anything stranded mid-flight is *moved* to `RESET_RETRY_TO` and the
-command to retry it is printed. It refuses while a run is live.
+`status` is read-only: it takes no lock and never starts DEVONthink. It reads
+DEVONthink's OCR settings from its preferences: languages, *Deskew* and *Page
+orientation* (a box at its default has no key, so no key = on). `reset` shows
+what it would do; `reset go` does it. A live run is never touched, and no
+document is ever part of a reset -- my-ocr replaces one only in a single
+rename.
+
+stdin is read only when no file was named any other way: from a script, a
+LaunchDaemon or ssh, stdin is an open pipe nobody writes to, and reading it
+would block for ever while holding the OCR mutex.
 
 ## Configuration
 
 `my-ocr --create-config` prints the default config; `--create-config <FILE>`
 writes it (never over an existing file). The first found of `$MY_OCR_CONFIG`,
 `--config <FILE>`, `/LINKS/default/my-ocr.conf`, `/LINKS/default/my-ocr`,
-`~/.my-ocr.conf`, `/etc/my-ocr.conf`, `/usr/local/etc/my-ocr.conf` is read.
-
-The printed text IS my-ocr's defaults: it loads that first and the file on top.
-So the file is optional, and one that holds only the lines it changes is
-complete. Every setting, with the reasons behind each default, is in the
-`--create-config` output:
+`~/.my-ocr.conf`, `/etc/my-ocr.conf`, `/usr/local/etc/my-ocr.conf` is read --
+as `KEY="value"` lines, never run. The printed text IS the defaults, so a file
+holding only the lines it changes is complete.
 
 | key | default | meaning |
 |---|---|---|
-| `S_PATH` | `~/Public/,ocr.in` | the folder the Folder Action watches |
-| `T_PATH` | `~/Public/,ocr.out` | where the OCR application writes its results |
-| `RESET_RETRY_TO` | `~/Public/,ocr.retry` | where `reset` moves stranded documents |
-| `MOVE_FAILED_TO` | `""` | where failed originals go; `""` = leave them in place |
-| `STUCK_MARKER_DIR` | `~/Desktop` | where the STUCK marker lands |
-| `OCR_LANGUAGES` | `German,English,French,GermanLuxembourg` | recognition languages |
-| `NO_OCR_FILENAME_PATTERNS` | `no-ocr-scan*` | filenames never OCRed |
-| `REVEAL_IN_FINDER` | `auto` | `auto` (terminal runs only), `always`, `never` |
-| `OCRAPP_MRC` | `0` | "Compress images using MRC" |
-| `OCRAPP_IMAGE_QUALITY_MRC` | `2` | image quality when MRC is on: 0 Low, 1 Balanced, 2 High |
-| `OCRAPP_IMAGE_QUALITY_NO_MRC` | `1` | image quality when MRC is off |
-| `OCRAPP_SPLIT_FACING_PAGES` | `0` | the OCR application's "Split facing pages" |
-| `OCRAPP_MUTEX_TIMEOUT` | `1800` | s a run queues for its turn |
-| `OCRAPP_TIMEOUT` | `1800` | s to wait for the OCR application, or for a dead run's batch |
-| `STALL_ALERT_AFTER` | `300` | s without progress before the first alert |
-| `STALL_REALERT_EVERY` | `3600` | s between further alerts |
-| `OCRAPP_IDLE_GIVEUP` | `120` | s of near-zero cpu while stalled before recovering; 0 = never |
-| `OCRAPP_IDLE_MAX_CPU_PER_MIN` | `3` | "near zero": s of cpu per minute |
-| `OCRAPP_TRIGGER_WAIT` | `60` | s without the OCR application before re-making the hand-over once; 0 = never |
-| `FA_RESTART_WAIT` | `10` | s to wait for a restarted Folder Actions dispatcher |
-| `OSASCRIPT_TIMEOUT` | `180` | s any osascript call may take |
+| `MOVE_FAILED_TO` | `""` | where REFUSED and FAILED documents go; `""` = they stay put |
+| `NO_OCR_FILENAME_PATTERNS` | `no-ocr-scan*` | file names never OCRed |
+| `REVEAL_IN_FINDER` | `auto` | `auto` (runs started from a terminal), `always`, `never` |
+| `OCR_TIMEOUT` | `600` | s DEVONthink gets for one document, before the one retry |
+| `MUTEX_TIMEOUT` | `1800` | s a run waits for its turn |
+| `STATE_DIR` | `/var/lib/mine/$USER/my-ocr` | the mutex and each run's work folder |
+| `LOGFILE` / `LOG` | `/var/log/mine/$USER/my-ocr.log` / `""` | the record of a run; `-l` keeps one for that run |
+| `STUCK_MARKER_DIR` | `$HOME/Desktop` | where the STUCK marker lands |
 
-The workflow carries `S_PATH`, `T_PATH` and the three export keys, so changing
-any of them needs `my-ocr setup go` again; `status` reports a MISMATCH for the
-export keys. "Split facing pages" is set by every run.
-
-`OCRAPP_MRC` and the two qualities are the export controls of the Automator step; the quality
-follows the MRC switch, so each mode carries its own. They are written into the
-workflow by `setup go` -- nothing changes them at run time -- and `status` reads
-them back out of the installed workflow and reports a MISMATCH when the config
-has changed since. A quality other than 0, 1 or 2 is refused: the Automator step
-offers only those three, and 3 makes the OCR application abort.
-
-MRC is off by default because, measured on ten real scans, it redrew the text as
-a 1-bit mask (visibly fuzzier), erased a QR code, and made the files larger; the
-recognised text is the same either way.
-
-"Split facing pages" is off because a document feeder delivers single sheets, so
-every split is a false positive. It is an application preference, so it is set
-at the start of every run (while the application is not running) and reported
-when it had to be changed.
-
-## Checking the result before it replaces the original
-
-The result replaces the original in place, and the original goes to the Trash a
-moment earlier -- so an unchecked bad result is a lost document. Before that
-happens my-ocr requires all of:
-
-- it parses as a PDF
-- its page count is **not lower** than the input's. More is fine: with
-  "Split facing pages" on, the OCR application cuts a sheet it believes holds
-  two pages in two.
-- its Producer names the OCR application -- proof the result is really its
-  output and not a passthrough or a stale file from an earlier run
-- `qpdf --check` passes. qpdf walks every object and stream; `pdfinfo` reads
-  only the trailer, catalogue and page tree, so a valid catalogue over damaged
-  content passes that and fails this. Its exit is graded: 0 clean, 3 warnings
-  only, 2 damage.
-**No text is NOT a refusal.** The checks above are the evidence that the OCR
-application ran correctly -- there is no exit code to read, so they are all the
-evidence there is. A page with nothing to recognise then yields no text, and
-that is a finding about the DOCUMENT (a photograph, a blank sheet), not a fault
-in the run. Such a result is **filed as done** like any other success, and
-reported on a line of its own, so that "forty of forty found nothing" -- a
-misconfigured OCR -- cannot hide inside the success total.
-
-**The ORIGINAL is kept, and tagged.** The OCR application's output for such a
-page is strictly worse -- one A3 photograph came back as 6.1 MB split across
-two A4 pages, cutting the picture in half, against 665 KB for the original. But
-the original carries no Producer, so a later run would OCR it again for ever.
-So my-ocr writes the Producer onto the original instead:
-
-    Producer: FineReader (my-ocr: no text found -- original kept)
-
-and discards the OCR output (to the Trash, recoverable). The tag is written
-with qpdf's JSON round-trip, which copies the page content through untouched --
-the file grows by the metadata alone, roughly 64 bytes -- and it is verified
-before it is installed: same page count, still sound under `qpdf --check`.
-Ghostscript cannot do this, as `pdfwrite` stamps its own `/Producer` over
-anything you set.
-
-If the input was a JPEG, PNG or TIFF there is no PDF original to tag, so the
-OCR application's PDF is kept instead, as it always was.
-
-Deliberately NOT checked: file size, which legitimately moves either way with
-the export settings (with MRC a much smaller result is the healthy outcome); and
-image counts, because MRC splits one scan image into mask/foreground/background
-layers.
-
-**A refusal is a clean rollback:** the bad result is trashed, the ORIGINAL is
-kept and moved to `--move-failed-to`, and you are notified with the reason and
-where the document now is.
-
-**A refusal is reported as REFUSED, not as FAILED** -- with the reason, per
-document. The two are different outcomes and call for different actions: a
-failure means the OCR could not run, a refusal means it ran and produced
-something unusable, most often because the page carries no text to find. A
-photograph of an object scanned on the flatbed refuses every time, and the
-honest report of it is "there was nothing to OCR", not "the file FAILED".
+Recognition languages and the auto-corrections are DEVONthink's own settings
+(Settings > OCR); `status` shows them.
 
 ## Requirements
 
-- macOS with the OCR application installed, exposing its Automator action
-- `pdfinfo` (poppler) and `convert` (ImageMagick) for validating input
-- A `trash` command, so nothing is deleted outright
-
-`setup` checks all of them and names anything missing -- including a helper that
-is merely *unset*, which is a capability that would otherwise fail at the first
-file needing it.
-
-## Notes
-
-- Files already carrying the OCR application's `Producer` tag are skipped unless
-  `--force`; encrypted PDFs are detected and listed rather than mangled.
-- Every run makes sure window restore is off for the OCR application
-  (`defaults write com.abbyy.FineReaderPro ApplePersistenceIgnoreState -bool
-  YES`, as the user running it). After a crash, macOS would otherwise ask at
-  the next launch whether to reopen its windows, and an unattended run would
-  wait on that dialog. It is written once and reported then; later runs find it
-  off and say nothing.
-- `--move-failed-to <DIR>` quarantines what could not be OCRed, so a caller does
-  not have to work out which files those were.
-- stdin is read only when no filenames were given another way -- otherwise a
-  caller with an open-but-idle pipe would block for ever holding the OCR lock.
-- The Automator step runs a shell from Automator's own list. `/bin/dash` is not
-  in it, and a workflow naming one it does not offer does nothing at all, with
-  no error anywhere.
+- macOS with DEVONthink Pro 4 and its ABBYY FineReader OCR add-on. The first
+  run asks for the macOS Automation consent to control DEVONthink -- answer it
+  once at the Mac, or allow it in System Settings > Privacy & Security >
+  Automation.
+- `pdfinfo`, `pdftotext` (poppler) and `qpdf`. my-ocr refuses to start without
+  them: a result nothing has checked never replaces an original.
+- `python3` 3.9 or later, standard library only.
+- `my-notify`, for the alerts.
