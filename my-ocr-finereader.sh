@@ -5273,7 +5273,13 @@ rt_concurrency_state() {
   # farm link /LINKS/bin/my-ocr, dirname "$0" is /LINKS/bin -- another repo, with
   # no tags -- and the check compared the tool's answer with a stranger's.
   _vd="$(_self_dir)"
-  if git -C "$_vd" rev-parse --git-dir >/dev/null 2>&1; then
+  # ...and only in the tool's OWN repository, proven the way --version proves
+  # it (the stamped parent commit is in it): a copy in a mirror without its own
+  # .git -- the container's py/my-ocr on ada -- otherwise compared the version
+  # with the container's tag 'pre-missing-feature' and failed every run.
+  if ! git -C "$_vd" cat-file -e "${SCRIPT_PARENT:-$SCRIPT_COMMIT}^{commit}" 2>/dev/null; then
+    t_ok "version check skipped (not this tool's own repository -- its tags are not its releases)"
+  elif git -C "$_vd" rev-parse --git-dir >/dev/null 2>&1; then
     _vnear="$(git -C "$_vd" describe --tags --abbrev=0 2>/dev/null)"
     if [ -z "$_vnear" ]; then
       t_ok "no release tag yet -- nothing for the version to name"
