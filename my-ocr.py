@@ -1211,6 +1211,9 @@ def cmd_status(s: Settings) -> int:
                    f"OCR add-on {st['add-on']}   [{DT_DEFAULTS}]")
     else:
         OUT.result(f"ENGINE    DEVONthink NOT INSTALLED at {EXT.dt_app} -- OCR cannot run (brew install --cask devonthink)")
+    # what my-ocr takes, as `file --brief` names it -- my-scan reads this line
+    # instead of keeping a list of its own, and takes nothing without it
+    OUT.result(f"TYPES     {', '.join(INPUT_TYPES)}")
     tools = {n: _tool(n) for n in ("pdfinfo", "pdftotext", "qpdf")}
     missing = [n for n, p in tools.items() if p is None]
     OUT.result("TOOLS     " + (f"MISSING {', '.join(missing)} -- brew install poppler qpdf" if missing else "pdfinfo, pdftotext, qpdf"))
@@ -1913,6 +1916,7 @@ def t_status(t: T) -> None:
     """my-scan reads the first line: '^OCR       BUSY' or idle."""
     rc, out, _ = t.ocr("status")
     t.check(rc == 0 and out.splitlines()[0] == "OCR       idle", f"idle: {out}")
+    t.check("TYPES     PDF, JPEG, PNG, TIFF" in out.splitlines(), f"the types my-scan takes from it: {out}")
     t.check(not (t.dir / "state").exists(), "status creates nothing")
     m = t.dir / "state" / "mutex"
     m.mkdir(parents=True)
