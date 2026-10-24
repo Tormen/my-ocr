@@ -122,6 +122,15 @@ holding only the lines it changes is complete.
 Recognition languages and the auto-corrections are DEVONthink's own settings
 (Settings > OCR); `status` shows them.
 
+## The FineReader engine: `my-ocr-finereader`
+
+`my-ocr-finereader.sh`, deployed as `my-ocr-finereader`, is the shell my-ocr
+v1.1 that drove ABBYY FineReader Pro 12 through an Automator Folder Action
+(`setup [go]`, `uninstall [go]`, `reset [go]`, `status`, its own
+`--run-tests`; `my-ocr-finereader --help`). It is kept for Macs where
+FineReader's Automator step works, and is called directly; the only change
+from v1.1 is its own name in the workflow it writes.
+
 ## Requirements
 
 - macOS with DEVONthink Pro 4 and its ABBYY FineReader OCR add-on. The first

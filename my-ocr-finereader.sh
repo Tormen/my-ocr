@@ -1,0 +1,6067 @@
+#!/bin/dash
+
+# 178 == highest used errCode
+
+US="${0##*/}";   # get filename without path
+
+NL="
+"
+. "/LINKS/default/my-cmdstrs" || { /LINKS/bin/my-notify -- "[$US] ERROR:" "FAILED [$?] TO ACCESS CMDSTRFILE. EXITING."; exit 1; }
+
+# --version identifies the exact BYTES being run, not just a hand-written
+# number: two copies that differ must never report the same string, so a stale
+# deployed script cannot hide. SCRIPT_COMMIT is rewritten by 'stamp-version'
+# and is authoritative at runtime -- the deployed copy needs no git and no
+# repository. The build id is a hash of this file, so it is right even unstamped.
+SCRIPT_VERSION="v1.1"
+SCRIPT_COMMIT="7390e8c"           # rewritten by 'my-ocr stamp-version'
+# What git said when this build was stamped: 'git describe --tags --long' --
+# <nearest tag>-<commits since it>-g<short sha>. It says whether these bytes
+# ARE that release or work on top of it, on a machine with no git.
+SCRIPT_RELEASE="v1.1-2-g7390e8c"
+# The commit the stamped one sits on. SCRIPT_COMMIT itself is never pushed --
+# the amend replaces it -- so no other clone has it; its parent is always
+# there, and that is what proves a repository is this tool's own.
+SCRIPT_PARENT="61cc323"
+
+WHOAMI="$(/usr/bin/whoami)"
+[ "$USER" = "$WHOAMI" ] || err 126 "USER '$USER' ? != ? '$WHOAMI' WHOAMI"
+
+#LOG=""
+LOG="/var/log/mine/${WHOAMI}/${US%.*}.log" # == LOGFILE
+AUTOMATOR_LOG="/var/log/mine/${WHOAMI}/${US%.*}.AUTOMATOR.log"
+STDOUT_FIFO="/var/log/mine/${WHOAMI}/${US%.*}.stdout.fifo"
+DBG_GOTTEN_FILES_FILELIST="/var/log/mine/${WHOAMI}/${US%.*}.DBG_got-files-list." # $WHAT will be appended
+DBG=""
+VRB=""
+#DBG=1
+FORCE_OCR=""
+RES_CAT_FILE="" # set to filepath if we should CAT a file at the end; Like this we can cat AFTER we restored the regular stdout
+FILELIST_PARAM="" # --file parameter
+FILELIST_CNT=0; # number of files in the FILELIST
+
+# for ALL parts:
+  my_notify="/LINKS/bin/my-notify"
+  c_touch="/usr/bin/touch" # needed by function touch()
+
+  # c_convert comes from /LINKS/default/my-cmdstrs, but that file differs per
+  # host -- on one machine it defines convert, on another it does not, and the
+  # JPEG/PNG health check then ran '' and died with 127 on an empty command.
+  # A declared capability must not depend on a config file being complete.
+  if [ -z "$c_pdfinfo" ] || [ ! -x "$c_pdfinfo" ]; then
+    for _cp in /opt/homebrew/bin/pdfinfo /usr/local/bin/pdfinfo /usr/bin/pdfinfo; do
+      [ -x "$_cp" ] && { c_pdfinfo="$_cp"; break; }
+    done
+  fi
+  # qpdf validates every object and stream, not just the trailer and page tree
+  # that pdfinfo reads -- which is exactly where a mangled OCR result hides.
+  if [ -z "$c_qpdf" ] || [ ! -x "$c_qpdf" ]; then
+    for _cq in /opt/homebrew/bin/qpdf /usr/local/bin/qpdf /usr/bin/qpdf; do
+      [ -x "$_cq" ] && { c_qpdf="$_cq"; break; }
+    done
+  fi
+  if [ -z "$c_pdftotext" ] || [ ! -x "$c_pdftotext" ]; then
+    for _ct in /opt/homebrew/bin/pdftotext /usr/local/bin/pdftotext /usr/bin/pdftotext; do
+      [ -x "$_ct" ] && { c_pdftotext="$_ct"; break; }
+    done
+  fi
+  if [ -z "$c_convert" ] || [ ! -x "$c_convert" ]; then
+    for _cc in /opt/homebrew/bin/convert /usr/local/bin/convert /usr/bin/convert; do
+      [ -x "$_cc" ] && { c_convert="$_cc"; break; }
+    done
+  fi
+
+  OCRAPP_NAME="FineReader"
+  # The macOS process that turns "a file appeared in the watched folder" into a
+  # workflow run.
+  FA_DISPATCHER_NAME="FolderActionsDispatcher"
+  # Automator runs a THIRD-PARTY action -- FineReader's "Convert to PDF
+  # Document" is one -- only when third-party actions are enabled: a
+  # machine-wide setting (Automator > Third-Party Automator Actions..., admin
+  # password) that macOS records as this marker file, readable by any user.
+  AUTOMATOR_3PP_MARKER="/private/var/db/Scripting/.Automator3PPActions"
+  AUTOMATOR_3PP_HOWTO="open Automator > menu Automator > Third-Party Automator Actions... > enable (admin password)"
+  # Where the application lives. setup refuses to wire a Folder Action to an
+  # OCR app that is not installed: the failure would otherwise only surface on
+  # the first real scan, long after setup said it was fine.
+  OCRAPP_PATH="/Applications/$OCRAPP_NAME.app"
+  # Its preferences domain: trigger-OCR turns window restore off there, so a
+  # crash cannot leave a "reopen its windows?" dialog blocking the next run.
+  OCRAPP_BUNDLE_ID="com.abbyy.FineReaderPro"
+  # Where it keeps its documents. A killed run leaves a half-built one here and
+  # the next launch offers to RECOVER it -- a second dialog, its own, that the
+  # window-restore setting does not touch. The BASE is a plain path -- it holds
+  # a space, so it must stay quoted at the use site; only the version suffix and
+  # the document name are globbed. Tests point the base at a temp directory.
+  OCRAPP_DOCSTORE_BASE="/Users/${WHOAMI}/Library/Application Support"
+  OCRAPP_PRODUCER_TAG="FineReader"
+  OCRAPP_OUTPUT_SUFFIX="pdf" # suffix used by OCRAPP on ocr'ed files
+
+  # PER-INVOCATION, hence the $$: two my-ocr processes overlap by design -- one
+  # queues on the mutex while the other runs -- and a SHARED name meant the
+  # holder's cleanup() deleted the waiter's input list. The waiter then woke up
+  # with no files and died in realpath "" (ERROR 059).
+  PROVIDED_FILES_FILELIST="/var/lib/mine/${WHOAMI}/${US%.*}.$$.filelist"
+  #AUTOMATOR_FILELIST="/var/lib/mine/${US%.*}.automator-filelist" <<< will be created by the AUTOMATOR script and then passed to --part-1/--part-2 via --file!
+
+  TMP_PRE_INP_PATH="/tmp/my-ocr.pre_,ocr.in_TMP-path" # == TMP_PATH, we first collect all files in, before moving this DIR into INP_PATH
+  # ^^ COLLECT_INP_PATH will be set to last_part_of_path of TMP_PRE_INP_PATH
+
+  TOTAL_FILES_CNT=0;
+  TOTAL_FILES2OCR_CNT=0;
+  ALREADY_OCRED_CNT=0;
+  WRONG_FILETYPE_CNT=0;
+  IGNORED_CNT=0;
+  ENCRYPTED_CNT=0;
+  ENCRYPTED_PDFS_FILELIST="/var/lib/mine/${WHOAMI}/${US%.*}.$$.encrypted-pdfs.filelist"  # per-invocation, see PROVIDED_FILES_FILELIST
+
+  ERR_CODE="" # will be set by function_err()
+
+# for BOTH   do_part_1 / --part-1   &&   do_part_2 / --part-2 :
+  NFY="" # <<< will only be used by --part-1 and --part-2 !! notify (display notification) on error (err())
+
+  IGNORE_PARTx_ERROR="" # 1 = ignore ERRORs occured in part-1/part-2, but keep going! -- this is helpful to debug
+
+  # FLAGFILES ARE *NOT* flagged with ${WHOAMI} - to be cross user active!:
+
+  OCRAPP_LOCKFILE="/var/lib/mine/${WHOAMI}/${US%.*}.$OCRAPP_NAME.lock" # == LOGFILE
+  WE_CREATED_OCRAPP_LOCKFILE="" # <<< used by cleanup()
+  # A SEPARATE, atomic mutex. OCRAPP_LOCKFILE cannot serve as one: it is also
+  # the 'placing-files' barrier AND the data file that part-1 fills and part-2
+  # rewrites. mkdir is the POSIX test-and-set; "[ -e ] && touch" is a race.
+  OCRAPP_MUTEX_DIR="/var/lib/mine/${WHOAMI}/${US%.*}.$OCRAPP_NAME.mutex"
+  WE_HOLD_OCRAPP_MUTEX=""    # <<< used by cleanup()
+  PARTx_ERRORED_FLAGFILE="/var/lib/mine/${US%.*}.PARTx-ERRORED.flagfile" # used by do_trigger_ocr_mode() to see if the partx errored out and we have to abort!
+  DBG_FLAGFILE="/var/lib/mine/${US%.*}.DBG.flagfile" # will be set, if called with --debug / -D in trigger-OCR do_trigger_ocr mode!
+  FORCE_FLAGFILE="/var/lib/mine/${US%.*}.FORCE.flagfile" # will be set, if called with --force / -f in trigger-OCR do_trigger_ocr mode!
+  # Set when trigger-OCR was run from a terminal. part-1/part-2 are launched by
+  # AUTOMATOR and so NEVER have a tty of their own -- they cannot tell an
+  # interactive run from a Folder Action, so trigger-OCR has to tell them.
+  INTERACTIVE_FLAGFILE="/var/lib/mine/${US%.*}.INTERACTIVE.flagfile"
+
+  OCRAPP_STATEFILE="/var/lib/mine/${US%.*}.$OCRAPP_NAME.pids" # == contains "" or the PID(s) of the OCRAPP already running, when --part-1 was called
+
+  # for do_health_check()
+  du_params="" #="-k"
+  du_unit_str="1/2 KB"
+
+# for do_part_1 / --part-1:
+  # for do_health_check()
+  S_EXPECTED_FILE_TYPE___REGEX="JPEG \|PDF \|PNG \|TIFF " # <<< matches the BEGINNING of 'file --brief ...'
+  S_HEALTH_CHECK___MAX_REPEAT="1"
+
+# for do_part_2 / --part-2:
+
+  # for do_health_check()
+  T_HEALTH_CHECK___MAX_REPEAT="1"
+  T_EXPECTED_FILE_TYPE___REGEX="PDF " # <<< matches the BEGINNING of 'file --brief ...'
+
+# for setup / the Automator workflow it generates:
+  WORKFLOW_DIR="/Users/${WHOAMI}/Library/Workflows/Applications/Folder Actions"
+  WORKFLOW_NAME="my-ocr.workflow"
+  # The workflow's shell steps MUST invoke this exact path: cleanup() finds its
+  # own children by matching "/LINKS/bin/my-ocr-finereader --part-N" in ps
+  # output, so a different path here would leave those children unkilled.
+  # setup checks it. (/LINKS/bin/my-ocr is the Python my-ocr, on DEVONthink.)
+  WORKFLOW_MY_OCR="/LINKS/bin/my-ocr-finereader"
+  # Shell for the workflow's Run Shell Script steps. This is NOT my-ocr's own
+  # shell -- it is the glue Automator runs, and Automator accepts ONLY the
+  # shells in its own list. /bin/dash is NOT one of them: the step then does
+  # nothing at all, with no error and nothing in any log, so the Folder Action
+  # looks dead. Automator offers exactly: /bin/bash /bin/csh /bin/ksh /bin/sh
+  # /bin/tcsh /bin/zsh /usr/bin/perl /usr/bin/ruby /usr/local/bin/python[3].
+  WORKFLOW_SHELL="/bin/zsh"
+
+  QUEUED_FILE_MOVES_LOG="/var/lib/mine/${US%.*}.$OCRAPP_NAME.files-2-move" # <<<< contains 2 TAB separated columns: {source}\t{target}
+  # A REFUSAL is not a FAILURE. The OCR ran; the verification gate judged the
+  # result unusable and rolled back. part-2 records those here (2 TAB separated
+  # columns: {original}\t{why}) so trigger-OCR's summary can say what actually
+  # happened instead of calling it "FAILED to be OCRed" -- which sends you
+  # hunting for a broken tool when the honest answer is "there was nothing to
+  # OCR on that page".
+  REFUSED_FILES_LOG="/var/lib/mine/${US%.*}.$OCRAPP_NAME.refused"
+  # Documents the OCR ran on and found no text in. They are FILED, like any
+  # other success -- this list exists so the summary can say so on its own
+  # line instead of hiding them inside the success total.
+  NOTEXT_FILES_LOG="/var/lib/mine/${US%.*}.$OCRAPP_NAME.notext"
+  # All files we got (via stdin and/or via command-line) that are not yet OCR-ed will have an entry in this file!
+
+# Every SETTING -- folders, languages, timeouts, the export -- has its one
+# default in default_config_content() below. What stays here is machinery: the
+# facts about FineReader and macOS the code depends on, and per-run state.
+
+##############################################################
+
+##############################################################
+#### CONFIG FILE
+#
+# Every setting's default is written ONCE, in default_config_content(): the
+# script loads that text at start-up, and main sources a config file on top.
+# So the file is OPTIONAL -- a host with none runs on the defaults -- and a file
+# holding only the lines it changes is complete.
+
+# The ONE list the search walks and every message about the search names, so the
+# two cannot drift apart. $<NAME>_CONFIG and --config come before it.
+config_search_paths() {
+  printf '%s\n' "${LINKS:-/LINKS}/default/${US%.*}.conf" "${LINKS:-/LINKS}/default/${US%.*}" \
+                "$HOME/.${US%.*}.conf" "/etc/${US%.*}.conf" "/usr/local/etc/${US%.*}.conf"
+}
+
+default_config_content() {
+  cat <<'_EOCONF_'
+# my-ocr configuration -- plain shell, sourced at start-up.
+#
+# Searched in this order, first found wins:
+#   $MY_OCR_CONFIG, --config <FILE>, /LINKS/default/my-ocr.conf,
+#   /LINKS/default/my-ocr, ~/.my-ocr.conf, /etc/my-ocr.conf,
+#   /usr/local/etc/my-ocr.conf
+# This text IS my-ocr's defaults: it loads it first, then your file on top.
+# So a config holding only the lines you change is complete; anything not set
+# here keeps the default printed by 'my-ocr --create-config'.
+
+# ---- folders ---------------------------------------------------------------
+# The Folder Action watches S_PATH; FineReader writes its results to T_PATH.
+# 'my-ocr setup go' wires the workflow to them -- run it again after a change.
+S_PATH="/Users/${WHOAMI}/Public/,ocr.in"
+T_PATH="/Users/${WHOAMI}/Public/,ocr.out"
+# Where 'reset' puts documents it finds stranded mid-flight. MOVED, never
+# deleted, so a reset is always undoable by looking in one folder.
+RESET_RETRY_TO="/Users/${WHOAMI}/Public/,ocr.retry"
+# "" = leave what could not be OCRed exactly where it is. A directory = move
+# it there, so a caller does not have to work out which files those were.
+MOVE_FAILED_TO=""
+# Where the STUCK marker file lands when an OCR stalls.
+STUCK_MARKER_DIR="/Users/${WHOAMI}/Desktop"
+
+# ---- what gets OCRed, and how ---------------------------------------------
+# Recognition languages, spelled as FineReader names them.
+OCR_LANGUAGES="German,English,French,GermanLuxembourg"
+# Filenames matching any of these shell patterns are skipped and left where
+# they are. "" = no marker, OCR everything.
+NO_OCR_FILENAME_PATTERNS="no-ocr-scan*"
+# Reveal the finished file in the Finder?
+#   auto   = only when the run was started from a terminal
+#   always = also for Folder Action / LaunchDaemon runs
+#   never  = not at all
+REVEAL_IN_FINDER="auto"
+
+# ---- how FineReader EXPORTS the PDF --------------------------------------
+# The two controls of the Automator step "Convert to PDF Document":
+# "Compress images using MRC" and "Image quality". 'my-ocr setup go' writes
+# them into the workflow; nothing changes them at run time, so after editing
+# these, run 'my-ocr setup go' again ('my-ocr status' says when it is due).
+#
+# Measured on ten real scans: MRC redraws the text as a 1-bit mask -- visibly
+# fuzzier -- erased a QR code outright, and made the files ~10% LARGER. The
+# recognised text is the same either way. So MRC is off by default.
+#   0 = off, 1 = on
+OCRAPP_MRC=0
+
+# Image quality, per MRC mode -- the quality follows the switch, so each mode
+# carries the one that suits it. 0 = Low, 1 = Balanced, 2 = High.
+# There is no 3: the Automator step offers only these three, and 3 makes
+# FineReader abort. setup refuses anything else, naming the key.
+OCRAPP_IMAGE_QUALITY_MRC=2        # with MRC, Low and Balanced looked worse still
+OCRAPP_IMAGE_QUALITY_NO_MRC=1     # Balanced kept the scan's own resolution
+
+# ---- FineReader's own preferences, enforced at every run ------------------
+# "Split facing pages": FineReader cuts what it takes for a two-page spread in
+# two. The scanner feeds single sheets, so every split is a false positive --
+# 3 of 10 test documents came back with extra half-pages.
+#   0 = off, 1 = on
+OCRAPP_SPLIT_FACING_PAGES=0
+
+# ---- waiting, and when to give up ----------------------------------------
+# All in seconds.
+# How long a run queues for its turn while another one has FineReader.
+OCRAPP_MUTEX_TIMEOUT=1800
+# How long part-1 and part-2 wait for FineReader to take and finish a batch --
+# and how long a new run waits for the batch of a run that died.
+OCRAPP_TIMEOUT=1800
+# A stall is NOT an abort: my-ocr never stops waiting while FineReader might
+# still work -- giving up would let a second FineReader start. These only
+# decide when to ALERT: first after STALL_ALERT_AFTER, then every
+# STALL_REALERT_EVERY.
+STALL_ALERT_AFTER=300
+STALL_REALERT_EVERY=3600
+# A stalled FineReader is grinding a huge scan (wait) or sitting on a dialog
+# nobody will click (recover). CPU time tells them apart. Measured on ada:
+# stuck on a dialog 0.3 s of cpu per minute, real OCR ~36 s per minute.
+# Below OCRAPP_IDLE_MAX_CPU_PER_MIN (s per minute) for OCRAPP_IDLE_GIVEUP
+# while the queue is stalled too = stuck, and it is recovered.
+# OCRAPP_IDLE_GIVEUP=0 disables that; my-ocr then waits for a person.
+OCRAPP_IDLE_GIVEUP=120
+OCRAPP_IDLE_MAX_CPU_PER_MIN=3
+# The hand-over starts the OCR only if the Folder Action FIRES, and once one
+# event went missing. No FineReader this long after the hand-over: make it
+# again, ONCE. 0 disables that.
+OCRAPP_TRIGGER_WAIT=60
+# How long to wait for launchd to bring up a new Folder Actions dispatcher
+# after a wedged one was restarted.
+FA_RESTART_WAIT=10
+# osascript has no timeout of its own, and the first System Events call from a
+# new caller raises a consent dialog ON THE CONSOLE -- nobody answers it over
+# ssh, so the wait is bounded.
+OSASCRIPT_TIMEOUT=180
+_EOCONF_
+}
+# The defaults, loaded from the one place they are written. main then sources a
+# config file, if one is found, on top -- so each default exists exactly once.
+eval "$(default_config_content)"
+
+# Refuse a value FineReader cannot take BEFORE it is written into a workflow:
+# a quality of 3 does not merely look wrong, it aborts the app. Both quality
+# keys are checked whichever mode is on, so a bad one cannot sit there waiting
+# for the day someone flips the switch.
+export_config_check() {
+  _ec_src="config: ${CONFIG_FILE:-none, built-in default}"
+  case "$OCRAPP_MRC" in 0|1) ;; *) err 160 "OCRAPP_MRC='$OCRAPP_MRC' -- must be 0 or 1 ($_ec_src)" ;; esac
+  case "$OCRAPP_SPLIT_FACING_PAGES" in 0|1) ;; *) err 172 "OCRAPP_SPLIT_FACING_PAGES='$OCRAPP_SPLIT_FACING_PAGES' -- must be 0 or 1 ($_ec_src)" ;; esac
+  case "$OCRAPP_IMAGE_QUALITY_MRC" in 0|1|2) ;; *) err 161 "OCRAPP_IMAGE_QUALITY_MRC='$OCRAPP_IMAGE_QUALITY_MRC' -- must be 0 (Low), 1 (Balanced) or 2 (High); 3 makes FineReader abort ($_ec_src)" ;; esac
+  case "$OCRAPP_IMAGE_QUALITY_NO_MRC" in 0|1|2) ;; *) err 173 "OCRAPP_IMAGE_QUALITY_NO_MRC='$OCRAPP_IMAGE_QUALITY_NO_MRC' -- must be 0 (Low), 1 (Balanced) or 2 (High); 3 makes FineReader abort ($_ec_src)" ;; esac
+}
+
+# Without third-party actions enabled, the Folder Action is refused before its
+# first step: nothing starts, nothing is logged, and every hand-over just waits
+# (the new scan host, 2026-09-30: four days of scans, then err 159). Prints the
+# raw value; 0 = enabled.
+automator_3pp_state() {
+  if [ -e "$AUTOMATOR_3PP_MARKER" ]; then
+    printf "marker '%s'\n" "$(head -c 8 "$AUTOMATOR_3PP_MARKER" 2>/dev/null)"; return 0
+  fi
+  echo "marker absent"; return 1
+}
+
+# The quality in force, and which key it came from -- printed side by side, so
+# 'quality 1' can always be traced to the line that asked for it.
+export_quality() { # sets EXPORT_Q (the value) and EXPORT_QK (the key it came from)
+  if [ "$OCRAPP_MRC" = "1" ]; then EXPORT_Q="$OCRAPP_IMAGE_QUALITY_MRC"; EXPORT_QK="OCRAPP_IMAGE_QUALITY_MRC"
+  else EXPORT_Q="$OCRAPP_IMAGE_QUALITY_NO_MRC"; EXPORT_QK="OCRAPP_IMAGE_QUALITY_NO_MRC"; fi
+}
+
+quality_name() { case "$1" in 0) echo Low;; 1) echo Balanced;; 2) echo High;; *) echo "?";; esac; }
+
+# Move a file into the Trash with mv -- 'trash' does not work on network shares
+# -- but NEVER onto a name that is already there. Moving onto it silently
+# destroyed the file trashed earlier under that name, and when that file
+# belonged to another user (the FTP scan user owns every original) the move was
+# refused outright: the document had been OCRed, and part-2 still died on this
+# last step (err 033, seen in production). A taken name gets a time suffix,
+# the way Finder does it. Leaves mv's own words in _tm_err when it fails.
+TRASH_DIR="$HOME/.Trash"
+trash_by_mv() { # $1 = file
+  _tm_b="${1##*/}"
+  case "$_tm_b" in
+    ?*.*) _tm_stem="${_tm_b%.*}"; _tm_ext=".${_tm_b##*.}" ;;
+    *)    _tm_stem="$_tm_b";      _tm_ext="" ;;
+  esac
+  _tm_t="$TRASH_DIR/$_tm_b"
+  if [ -e "$_tm_t" ] || [ -L "$_tm_t" ]; then
+    _tm_t="$TRASH_DIR/$_tm_stem $(date +%H-%M-%S)$_tm_ext"
+    if [ -e "$_tm_t" ] || [ -L "$_tm_t" ]; then _tm_t="$TRASH_DIR/$_tm_stem $(date +%H-%M-%S) $$$_tm_ext"; fi
+  fi
+  _tm_err="$(/bin/mv -- "$1" "$_tm_t" 2>&1)"
+}
+
+# What an installed workflow actually tells FineReader: "<mrc> <quality>", or
+# nothing. MRC is a BOOLEAN when setup wrote it and an INTEGER in the hand-built
+# workflow it replaced; plutil prints them as true/false and 1/0, and reading
+# digits only made a freshly set-up workflow look like no workflow at all.
+# Only a VALUE counts: each key also appears once more in the action's list of
+# parameter properties, as '=> {}', and matching that wiped the value it follows.
+workflow_export_values() { # $1 = document.wflow
+  /usr/bin/plutil -p "$1" 2>/dev/null | awk '
+    /"exportPdfUseMRC" => (true|false|0|1)$/ { m = ($3 == "true" || $3 == "1") ? 1 : 0 }
+    /"exportPdfImageQuality" => [0-9]+$/     { q = $3 }
+    END { if (m != "" && q != "") print m, q }'
+}
+
+usage() {
+  echo "usage: $0 [<FLAGS>] [--part-1|--part-2] [--] [FILES-TO-OCR]
+
+This script does an OCR recognition using $OCRAPP_NAME
+on files provided on stdin AND on FILES-TO-OCR provided on the commandline.
+You may use '--' to mark the end of parameters (e.g. useful in case you have
+a file called '--part-1' ;))
+
+// <FLAGS>:
+-h|--help OR (Without stuff on stdin and no parameter)     Show this text.
+-V|--verbose     Increases verbosity of output.
+-D|--debug       Even more verbosity by turning on debug output.
+--no-log|--log   Forces LOGGING the output of this script into LOG
+                 '$LOG' to be either /on/ or /off/, see LOGGING: below.
+-F|--force       Force (re)OCR of seemingly(*) already OCRed file
+                 (*) PDF has Producer TAG with value '$OCRAPP_PRODUCER_TAG'
+                 By default such files will be ignored; silently without --verbose.
+-f|--file <FILE> Read filenames to OCR (one per line) from <FILE>
+                 NOTE: stdin is read ONLY when no filenames were given on the
+                 command line and no --file was used. Otherwise my-ocr would
+                 block for ever on a pipe nobody closes (script, LaunchDaemon,
+                 ssh) -- while holding the OCR lock.
+--move-failed-to <DIR>
+                 Quarantine files that could NOT be OCRed into <DIR>.
+                 Default (\$MOVE_FAILED_TO empty): leave them where they are.
+--config <FILE>  Use this config. Otherwise the first found of: \$MY_OCR_CONFIG,
+                 $(config_search_paths | tr '\n' ' ')
+                 The file is optional: none found = the defaults --create-config
+                 prints, and a file needs only the lines it changes.
+--create-config [<FILE>]
+                 Print the default config, or write it to <FILE> (never over an
+                 existing one). Every setting, with its default and why -- e.g.:
+                   OCRAPP_MRC                   0/1  \"Compress images using MRC\"  (default 0)
+                   OCRAPP_IMAGE_QUALITY_MRC     0 Low, 1 Balanced, 2 High, with MRC (2)
+                   OCRAPP_IMAGE_QUALITY_NO_MRC  the same, without MRC            (1)
+                   OCRAPP_SPLIT_FACING_PAGES    0/1  FineReader's \"Split facing pages\" (0)
+                 The first three -- and S_PATH, T_PATH -- take effect with 'setup go';
+                 the last at every run.
+--version        Print version, the commit this file came from, and a build id
+                 taken from the file's own bytes -- so two copies that differ
+                 can never report the same string.
+stamp-version    Record the current commit into this file (run before deploying).
+--run-tests      Run the built-in regression tests and exit. Starts no OCR.
+--test-mail      Send ONE test alert the way a STUCK alert goes (my-notify:
+                 a notification plus a mail) and exit. Fails, with
+                 my-notify's exit status, when it cannot be sent.
+-S|--status OR status
+                 Print what my-ocr is doing (mutex, OCR app, queue), what runs
+                 that are gone left behind (HEALTH), the export and the config.
+                 Read-only: starts nothing and takes no lock. -V adds paths.
+setup [go] OR install [go]
+                 Check that everything my-ocr needs is installed and present,
+                 generate the Automator workflow, attach the Folder Action,
+                 and report. Dry-run unless 'go' is given.
+reset [go]       Put the MACHINERY back to clean after a crashed or killed run
+                 -- a mutex whose owner is gone, leftover per-run files, a
+                 stale lockfile -- and move any document stranded mid-flight
+                 to RESET_RETRY_TO so it can be RETRIED. Nothing is ever
+                 deleted, and a LIVE run is never interrupted.
+                 Dry-run unless 'go' is given.
+uninstall [go]   The inverse: detach OUR Folder Action script and remove the
+                 generated workflow. Another tool's script on the same folder
+                 is left alone, and no document, queue or folder is touched.
+                 Dry-run unless 'go' is given.
+
+The parameters '--part-1' / '--part-2' are used by AUTOMATOR in the process.
+So you won't need them.
+LOGGING: In these cases --log(ging) is turned on by DEFAULT !
+
+Without parameter '--part-1' or '--part-2' the script will trigger a manual OCR
+of the file provided on stdin.
+LOGGING: In this case --no-log(ging) is the DEFAULT.
+
+// WHAT HAPPENS DURING THE OCR PROCESS ?
+  > Without --part-1|--part-2 (== \"--trigger-ocr\"):
+     (0) If LOCKFILE '$OCRAPP_LOCKFILE' exists, we ask if we can remove. Otherwise we can't continue.
+         Now that LOCKFILE is gone, we create a fresh EMPTY LOCKFILE.
+     (1) Checks if OCRAPP '$OCRAPP_NAME' is already running and stores PIDS
+         in the '$OCRAPP_STATEFILE'.
+         Turns off window restore for '$OCRAPP_BUNDLE_ID' (once; a later run
+         finds it off and says nothing): after a crash macOS would otherwise ask
+         at the next launch whether to reopen its windows, and the run would
+         wait on a dialog nobody sees.
+     (2) Collect files to OCR by copying them into TMP_PATH '$TMP_PRE_INP_PATH':
+         {a} Read filenames provided on COMMANDLINE      (if applicable)
+         {b} Read filenames provided on stdin            (if applicable)
+         {c} Read filenames provided via --file <FILE>   (if applicable)
+         For all files we determined they are not yet OCRed there will be an entry in '$QUEUED_FILE_MOVES_LOG':
+         <original-filepath>\t<filepath-under-INP_PATH>\t<filepath-under-OUT_PATH>
+         The <final-filename(realpath)> will be determined by --part-2 using the <original-filepath>
+     (3) Initiating AUTOMATOR_LOG '$AUTOMATOR_LOG': AUTOMATOR will call this script with '--part-1' and '--part-2'.
+         In this file the output of these runs will be appended, so that we can receive the output here too!
+     (4) We write 'placing-files' into the LOCKFILE '$OCRAPP_LOCKFILE' to assure that
+         the copy we are about to issue is completed when part-1 is triggered by AUTOMATOR.
+         Copy all files we got for OCR (and that still need OCR) into TMP_PATH '$TMP_PRE_INP_PATH'.
+         Then we are moving the TMP_PATH into INP_PATH '$S_PATH'.
+         Then we empty the LOCKFILE '$OCRAPP_LOCKFILE', to assure part-1 (0) does not wait (any longer).
+     (5) Waiting for AUTOMATOR to be done. There is NO time limit while
+         '$OCRAPP_NAME' is still running: giving up would release the lock and
+         let a second '$OCRAPP_NAME' start. After '\$STALL_ALERT_AFTER' sec with no
+         progress you are alerted (notification + mail + a marker on the
+         Desktop), then every '\$STALL_REALERT_EVERY' sec. The wait ends by
+         itself only if '$OCRAPP_NAME' is NOT running, which is conclusive:
+         $US '--part-1' --> '$OCRAPP_NAME' --> $US '--part-2'
+
+  > From there via a FolderAction AUTOMATOR will be triggered to again call this script
+    but with the parameter '--part-1'.
+
+  > '--part-1': Does the following:
+     (0) Waits for max. $OCRAPP_TIMEOUT sec. while LOCKFILE '$OCRAPP_LOCKFILE' exists and is NOT empty.
+     (1) {a} Read filenames provided on stdin           (if applicable)
+         {b} Read filenames provided via --file <FILE>  (if applicable)
+         and verify that they reside within INP_PATH !
+         and writes the filenames (one per line) into LOCKFILE '$OCRAPP_LOCKFILE'.
+         This LOCKFILE serves as MUTEX lock to to avoid concurrent (multiple parallel) instances
+         of $OCRAPP_NAME (launched through this script).
+     (2) [hand-through of stdin] Simply writes the filenames as we got them back to stdout
+         This is needed by AUTOMATOR in order to trigger the next step:
+
+  > RUN of $OCRAPP_NAME!
+    The OCR-APP is expected to write the resuling OCRed files to:
+    OUT_PATH='$T_PATH'
+    using the file suffix '$OCRAPP_OUTPUT_SUFFIX'
+    # Important: Other than the suffix OCR-APP shall NOT change filenames, when writing to OUT_PATH !!
+    AUTOMATOR will then trigger again this script, but this time with parameter '--part-2'.
+
+  > '--part-2': Does the following:
+     (0) Read filenames from stdin
+     (1) Wait max. $OCRAPP_TIMEOUT sec. that all files are treated by $OCRAPP_NAME
+         {a} check using filenames from OCRAPP_LOCKFILE (== files received on stdin with --part-1)
+         {b} check using filenames we received          (== files received on stdin with --part-2)
+     (2) Remove MUTEX LOCK we set in --part-1 '$OCRAPP_LOCKFILE'
+     (3) Kill $OCRAPP_NAME if this script started it
+     (4) If an entry for the OCRed file in '$QUEUED_FILE_MOVES_LOG' exists, trash the original (non-ocred file) and move ocred file instead
+     (5) Reveal (last) scanned file in Finder
+     (6) [hand-through of stdin] Output all OCRed files to stdout
+
+// EXAMPLES:
+To trigger an ocr of some file(s), you simply call:
+
+    # By default this implies a --no-log, so output will be printed to stdout:
+    $US \"<FILENAME>\"
+    echo \"<FILENAME>\"| $US
+    echo \"<FILENAME>\" >FL; $US --file FL
+
+    # --debug  :: extra debug output
+    # --log    :: instead of to cli the output is written to LOG '$LOG'
+    $0 --debug --log \"<FILENAME1>\" \"<FILENAME2>\"
+    printf \"<FILENAME1>\\\n<FILENAME2>\\\n\"| $0 --debug --log
+    printf \"<FILENAME1>\\\n<FILENAME2>\\\n\">FL && $0 --debug --log --file FL && rm FL
+
+ENCRYPTED files will be detected and listed. They will be ignored by this script if they end with ___encrypted.[pP][dD][fF]!
+'pdf-decrypt' creates those for you (and the file without the ___encrypted gets decrypted).
+Then you can decide if you leave them or if you want to remove them.
+";
+
+exit;
+}
+
+
+# One file to clean up per line; '$WHAT' is appended. The $$ is essential: two
+# trigger-OCR instances overlap by design (one queues on the mutex while the
+# other runs), and keyed by MODE alone they shared ONE registry -- so the first
+# to finish deleted the second's files, and the second then died on an input
+# list that was no longer there. Per-mode is not unique enough; per-run is.
+CLEANUP_FILELIST_FILE="/var/log/mine/${US%.*}.$$.CLEANUP-FILELIST.log"
+CLEANUP_PIDS=""
+CLEANUP_DONE=""
+schedule_for_cleanup() {
+  [ -z "$PFX" ] && PFX="$$| "
+  [ -z "$WHAT" ] && err 090
+  while [ $# -gt 0 ]; do
+    arg="$1"; shift;
+    case "$arg" in
+      [1-9][0-9]*) [ -e "$arg" ] && err 060 "Ambiguous call to schedule_for_cleanup(): arg '$arg' is a number (--> CLEANUP_PIDS) /AND/ is a file (--> CLEANUP_FILES) ?!"
+                   CLEANUP_PIDS="$CLEANUP_PIDS $arg"
+                   [ $DBG ] && echo "${PFX}Appended '$arg' to CLEANUP_PID.";
+                   ;;
+      *) #[ -e "$arg" ] || err 071 "Ambiguous call to schedule_for_cleanup(): File '$arg' does not exist --> Nothing to cleanup ?!"
+         # ^^ we allow to schedule cleanup of non-existing files
+                   if [ -s "$CLEANUP_FILELIST_FILE.$WHAT" ]; then
+                     # check if we already have this file:
+                     grep -qFx "$arg" "$CLEANUP_FILELIST_FILE.$WHAT" && return
+                     echo "$arg">>"$CLEANUP_FILELIST_FILE.$WHAT" || err 029 "Failed appending '$arg' to CLEANUP_FILELIST '$CLEANUP_FILELIST_FILE.$WHAT'."
+                   else
+                     echo "$arg">"$CLEANUP_FILELIST_FILE.$WHAT" || err 007 "Failed creating CLEANUP_FILELIST '$CLEANUP_FILELIST_FILE.$WHAT' with '$arg'."
+                   fi
+                   [ $DBG ] && echo "${PFX}Appended '$arg' to CLEANUP_FILELIST_FILE.";
+                   ;;
+    esac
+  done
+}
+cleanup() { local rc=$?;
+  [ $CLEANUP_DONE ] && return;
+  [ $DBG ] && echo && echo "$$| CLEANUP! ($rc) [$*]" \
+           || exec 2>/dev/null # don't show errors if NOT in DBG mode
+
+  # 080 (legacy) and 129 both mean: we never got the lock. Touch nothing --
+  # tearing down now would disturb whichever instance DOES hold it.
+  if [ "$ERR_CODE" = "080" ] || [ "$ERR_CODE" = "129" ]; then
+    [ $DBG ] && echo "$$| CLEANUP :: NOTHING done as we do not want to interfere with already running instance of my-ocr (as OCRAPP_LOCKFILE exists)."
+    exit $rc;
+  fi
+
+  if [ -n "$CLEANUP_PIDS" ]; then
+    [ $DBG ] && echo "$$| CLEANUP :: Now killing these pids '$CLEANUP_PIDS'"
+    for a in $CLEANUP_PIDS; do
+      kill -9 "$a" && { [ $DBG ] && echo "$$|     > Killed pid '$a'"; :; } \
+                   || echo "$$|     > FAILED [$?]: kill -9 '$a'"
+    done
+    CLEANUP_PIDS=;
+  fi
+
+  if [ -s "$CLEANUP_FILELIST_FILE.$WHAT" ]; then
+    [ $DBG ] && echo "$$| CLEANUP :: Now removing according to CLEANUP_FILELIST..."
+    #echo && echo "$$| CLEANUP :: CLEANUP_FILELIST_FILE: $( cat "$CLEANUP_FILELIST_FILE.$WHAT" )"
+    cat "$CLEANUP_FILELIST_FILE.$WHAT"|while read a; do
+      [ ! -e "$a" ] && continue; # already gone
+      #[ $DBG ] && {  echo "$$|      '$a'"; continue; }
+      rm -f "$a" && { [ $DBG ] && echo "$$|      - '$a' - Removed."; :; } \
+                 || echo "$$|      - '$a' - FAILED [$?] to 'rm -f'!" #  <<<   [ ! $DBG ]
+    done
+  fi
+
+  if [ -e "$CLEANUP_FILELIST_FILE.$WHAT" ]; then
+    a="$CLEANUP_FILELIST_FILE.$WHAT"; rm -f "$a" && { [ $DBG ] && echo "$$|      - '$a' - Removed."; :; } \
+                 || echo "$$|      - '$a' - FAILED [$?] to 'rm -f'!" #  <<<   [ ! $DBG ]
+  fi
+
+  if [ "$WHAT" = "trigger-OCR" ]; then
+    [ -n "$WE_HOLD_OCRAPP_MUTEX" ] && close_ocrapp_if_ours
+
+    # Only clean those up if we are the MAIN process (WHAT == 'trigger-OCR'):
+    for a in "$TMP_PRE_INP_PATH" "$S_PATH/$COLLECT_INP_PATH"; do
+      [ -d "$a" ] || continue
+      # never the watched folder itself: an rm -Rf there takes documents with it
+      is_watched_folder "$a" && { echo "$$|      - '$a' is the WATCHED folder -- refused to remove it"; continue; }
+      rm -Rf "$a/" && { [ $DBG ] && echo "$$|      - '$a' - Removed."; :; } \
+                   || echo "$$|      - '$a/' - FAILED [$?] to 'rm -Rf'!" #  <<<   [ ! $DBG ]
+    done
+
+    if [ $WE_CREATED_OCRAPP_LOCKFILE ]; then
+      [ $DBG ] && echo "$$| CLEANUP :: As we created OCRAPP_LOCKFILE, we will kill any '--part-1' or '--part-2' instances of this script!"
+      for a in 1 2; do
+        # Match ANY interpreter: 'ps' shows whatever the shebang names, so
+        # hard-coding it made this silently match nothing the moment the
+        # shebang changed -- and cleanup would stop killing its own children.
+        w="[^ ]* /LINKS/bin/my-ocr-finereader --part-$a" # <<< this is how AUTOMATOR launches us
+        pids="$(pgrep -f "^$w")"
+        if [ -n "$pids" ]; then
+          pkill -f "^$w" && echo "$$|      * '$w' [pid(s) $pids] -- Killed them on the way out :)" \
+                         || echo "$$|      * '$w' [pid(s) $pids] -- FAILED to kill them!"
+        else
+          [ $DBG ] && echo "$$|      * '$w' seems not to be running.";
+        fi
+      done
+    fi
+
+    CLEANUP_DONE=1
+
+    # This means: LOCKFILE found. Here we do NOT want to pollute the output with statistics related to already running my-ocr instance !!
+
+    printf "\n###############################################################\n"
+
+    PFX="$$|>RESULT<| "
+    printf "${PFX}Got %4d files in total:\n${PFX}  > %4d files already OCRed.\n${PFX}  > %4d files with invalid file-type (NOT %s)\n${PFX}  > %4d files ignored (e.g. dirs, *___encrypted.[pP][dD][fF])\n${PFX}  > %4d files encrypted (see below).\n" "$TOTAL_FILES_CNT" "$ALREADY_OCRED_CNT" "$WRONG_FILETYPE_CNT" "$S_EXPECTED_FILE_TYPE___REGEX" "$IGNORED_CNT" "$ENCRYPTED_CNT"
+
+    if   [ -s "$QUEUED_FILE_MOVES_LOG" ]; then
+      left_cnt=$(( $(cat "$QUEUED_FILE_MOVES_LOG"|wc -l) + 0 ));
+      refused_cnt=0
+      [ -s "$REFUSED_FILES_LOG" ] && refused_cnt=$(( $(cat "$REFUSED_FILES_LOG"|wc -l) + 0 ));
+      [ "$refused_cnt" -gt "$left_cnt" ] && refused_cnt="$left_cnt"
+      failed_cnt=$(( left_cnt - refused_cnt ));
+
+      # REFUSED first, and with the reason: it is the outcome a person has to
+      # act on, and the action differs from a failure's. "1/1 files *FAILED* to
+      # be OCRed" for a page that simply carries no text is a lie about which
+      # part of the system went wrong.
+      if [ "$refused_cnt" -gt 0 ]; then
+        printf "${PFX}\n${PFX}--> %4d/$TOTAL_FILES2OCR_CNT result(s) REFUSED -- the OCR ran, the result was not usable:\n" "$refused_cnt"
+        while IFS="$(printf '\t')" read -r _rf _rw; do
+          [ -n "$_rf" ] || continue
+          printf "${PFX}      - \"%s\"\n${PFX}        %s\n" "$_rf" "$_rw"
+        done <"$REFUSED_FILES_LOG"
+        printf '%s        The original was KEPT, not replaced; the OCR result went to the Trash.\n' "$PFX"
+      fi
+      if [ "$failed_cnt" -gt 0 ]; then
+        _rtmp="$(mktemp /tmp/my-ocr.refused.XXXXXX)"
+        cut -f1 "$REFUSED_FILES_LOG" >"$_rtmp" 2>/dev/null
+        _flist="$(cut -f1 "$QUEUED_FILE_MOVES_LOG" | grep -vFxf "$_rtmp" | sed -e 's/.*/                  "&"/')"
+        if [ "$left_cnt" -gt "$TOTAL_FILES2OCR_CNT" ]; then
+          # more queued than this run handed over: "2/0 *FAILED*" would blame
+          # this run for documents it never saw.
+          printf "${PFX}\n${PFX}--> %4d file(s) still queued, from a run that is gone (not this run's):\n%s\n" "$failed_cnt" "$_flist"
+        else
+          printf "${PFX}\n${PFX}--> %4d/$TOTAL_FILES2OCR_CNT files *FAILED* to be OCRed:\n%s\n" "$failed_cnt" "$_flist"
+        fi
+        rm -f "$_rtmp"
+      fi
+      _okc="$(ocr_ok_cnt "$TOTAL_FILES2OCR_CNT" "$left_cnt")"
+      case "$_okc" in
+        MISMATCH*)
+          printf "${PFX}\n${PFX}--> COUNT MISMATCH: %d file(s) went to the OCR this run, but %d are still queued (%d refused, %d failed).\n${PFX}    '%s' holds %s line(s) that cannot be from this run -- '%s reset go' clears them.\n" \
+            "$TOTAL_FILES2OCR_CNT" "$left_cnt" "$refused_cnt" "$failed_cnt" "$QUEUED_FILE_MOVES_LOG" "${_okc#MISMATCH }" "$US" ;;
+        *)
+          printf "${PFX}\n${PFX}--> %4d/$TOTAL_FILES2OCR_CNT files were SUCCESSFULLY OCRed.\n" "$_okc" ;;
+      esac
+        # Every file that completed had its line deleted, so what is left here
+        # IS the failure list -- and the originals are untouched, because only
+        # a successful OCR trashes them. So they can be quarantined.
+        if [ -n "$MOVE_FAILED_TO" ] && [ -d "$MOVE_FAILED_TO" ]; then
+          moved_cnt=0
+          # heredoc, not 'cut | while': a pipe runs the loop in a subshell and
+          # moved_cnt would come back 0.
+          stranded_cnt=0
+          # Field 3 is where the OCR result was to be collected. If it EXISTS,
+          # the OCR finished and only the move failed -- calling that a failure
+          # files a finished document under FAILED and strands its result. Five
+          # documents went that way when FineReader died mid-round (2026-09-18);
+          # their results sat in the out-path with up to 96805 characters of
+          # text while the originals were quarantined as "*FAILED*".
+          while IFS="$(printf '\t')" read -r ff _sf out_fp _rest; do
+            [ -z "$ff" ] && continue
+            [ -e "$ff" ] || continue
+            if [ -n "$out_fp" ] && [ -e "$out_fp" ]; then
+              stranded_cnt=$(( stranded_cnt + 1 ))
+              printf '%s      - NOT a failure: %s\n' "$PFX" "$ff"
+              printf '%s        the OCR finished; its result was never filed:\n' "$PFX"
+              printf '%s          %s\n' "$PFX" "$out_fp"
+              continue
+            fi
+            ft="$MOVE_FAILED_TO/${ff##*/}"
+            [ -e "$ft" ] && ft="$MOVE_FAILED_TO/$(date +%Y-%m-%d_%H%M.%S)___${ff##*/}"
+            if /bin/mv -- "$ff" "$ft"; then
+              moved_cnt=$(( $moved_cnt + 1 ))
+              printf "${PFX}      - quarantined: '%s' -> '%s'\n" "$ff" "$ft"
+            else
+              printf "${PFX}      - FAILED to move '%s' -> '%s' !\n" "$ff" "$ft"
+            fi
+          done <<_EOMF_
+$(cat "$QUEUED_FILE_MOVES_LOG")
+_EOMF_
+          printf "${PFX}      (%d failed file(s) quarantined in '%s')\n" "$moved_cnt" "$MOVE_FAILED_TO"
+          [ "$stranded_cnt" -gt 0 ] && \
+            printf '%s      (%s document(s) NOT quarantined: the OCR finished, the move did not)\n' \
+                   "$PFX" "$stranded_cnt"
+        fi
+    elif [ -e "$QUEUED_FILE_MOVES_LOG" ]; then
+      [ $TOTAL_FILES2OCR_CNT -gt 0 ] && printf "\n${PFX}--> %4d/$TOTAL_FILES2OCR_CNT files were SUCCESSFULLY OCRed :))\n" "$TOTAL_FILES2OCR_CNT"
+    else
+      printf "\nERROR QUEUED_FILE_MOVES_LOG neither non-empty, nor existant?! Should not be.\n"
+    fi
+    # Counted as OCRed, because it was -- but on a line of its own. One
+    # photograph among forty is unremarkable; forty out of forty means the OCR
+    # application is misconfigured (wrong language, recognition switched off),
+    # and that is only visible if this number is not folded into the total.
+    if [ -s "$NOTEXT_FILES_LOG" ]; then
+      notext_cnt=$(( $(cat "$NOTEXT_FILES_LOG"|wc -l) + 0 ))
+      printf "${PFX}       of which %4d had NO TEXT to find -- nothing to OCR on the page:\n%s\n" \
+             "$notext_cnt" "$(sed -e 's/.*/                  "&"/' "$NOTEXT_FILES_LOG")"
+      printf '%s       (filed as done. The ORIGINAL was kept and tagged as %s output, so a\n' "$PFX" "$OCRAPP_NAME"
+      printf '%s        later run knows it has been through OCR and will not repeat it.)\n' "$PFX"
+    fi
+    rm -f "$QUEUED_FILE_MOVES_LOG" "$REFUSED_FILES_LOG" "$NOTEXT_FILES_LOG"
+
+    if [ -s "$ENCRYPTED_PDFS_FILELIST" ]; then
+      printf "\n${PFX}Found the following $ENCRYPTED_CNT ENCRYPTED file(s). Please decrypt manually and come back:\n\n'$ENCRYPTED_PDFS_FILELIST'\n";
+      cat "$ENCRYPTED_PDFS_FILELIST"|sed -e 's/.*/   "&"/' || echo "ERROR: FAILED [$?] to 'cat \"$ENCRYPTED_PDFS_FILELIST\"'. Should not be."
+      printf "\nENCRYPTED files will be ignored by this script if they end with ___encrypted.[pP][dD][fF].\n'pdf-decrypt' creates those for you (and the file without the ___encrypted gets decrypted).\nThen you can decide if you leave them or if you want to remove them.\n"
+    fi
+
+    # The mutex goes LAST. Everything above works on files every run shares --
+    # the staging directories, the queue log -- and released first, the next
+    # run took its turn, created its own, and this cleanup deleted them.
+    # A DIRECTORY, so it cannot go through schedule_for_cleanup ('rm -f').
+    if [ $WE_HOLD_OCRAPP_MUTEX ]; then
+      rm -f "$OCRAPP_MUTEX_DIR/owner"; rmdir "$OCRAPP_MUTEX_DIR" 2>/dev/null \
+        && { [ $DBG ] && echo "$$|      - '$OCRAPP_MUTEX_DIR' - Mutex released."; :; } \
+        || echo "$$|      - '$OCRAPP_MUTEX_DIR' - FAILED to release the mutex!"
+    fi
+  fi
+
+  exit $rc; # return does not suffice
+}
+
+
+
+# returns 0 = yes(success)  AND  1 = no(failed)
+getOK() { local _ASKSTRING=$1;
+  local _a="";
+  while [ 1 ]; do
+    printf "$_ASKSTRING";
+    read _a <&1;
+    case "$_a" in
+      [yY]|[yY][eE][sS]|[zZ]|[zZ][eE][sS]) return 0;;
+      [nN]|[nN][oO]|[nN][oO][nN]) return 1;;
+    esac
+    sleep 0.5
+  done;
+}
+
+
+
+touch() {
+  $c_touch "$1" || err 065 "touch(): $c_touch '$1' FAILED [$?]"
+  chown :my-system "$1" || err 068 "touch(): chown chown :my-system '$1' FAILED [$?]"
+  chmod g+w,o-rwx "$1" || err 069 "touch(): chmod g+w,o-rwx '$1' FAILED [$?]"
+  return 0
+}
+
+
+err() { ERR_CODE="$1"; [ -z "$2" ] && local msg="Please fix." || local msg="$2"; [ -z "$3" ] && local exitCode=1 || local exitCode="$3";
+  #echo "$$|DBG: err() WHAT='$WHAT'"
+  case "$WHAT" in part-1|part-2) # if --part-1 | --part-2  --> (i) NFY     --> (ii) create PARTx_ERRORED_FLAGFILE (for do_trigger_ocr() to find)!
+    if [ $NFY ]; then
+      (echo "$$|"; echo "$$|LAUNCHING: \"$my_notify\" -- \"with below ERROR $ERR_CODE\"") 1>&2
+      "$my_notify" -- "ERROR $ERR_CODE [$exitCode]:" "$msg"
+    fi
+    echo "$$|$( date +"%Y-%m-%d_%H%M.%S") [$WHAT] ERROR $ERR_CODE [$exitCode]: $msg" >>"$PARTx_ERRORED_FLAGFILE" \
+    || ( echo "$$|"; echo "$$|err() :: FAILED [$?] TO Create FLAGFILE '$PARTx_ERRORED_FLAGFILE'" ) 1>&2;;
+  esac
+  ( echo "$$|"; echo "$$|$( date +"%Y-%m-%d_%H%M.%S") [$WHAT] ERROR $ERR_CODE [$exitCode]: $msg" ) 1>&2
+  exit $exitCode;
+}
+
+
+# USED BY   do_part_1 / --part-1   and   do_part_2 / --part-2    and    do_trigger_ocr / trigger-OCR
+# EXPECTED_FILE_TYPE___REGEX can be set to "" to disable the file-type check (using 'file')
+# EXPECTED_PATH can be set to "" to disable double-checking the PATH-portion of INP_FP
+# INP_FILE_TYPE___SHORT is OPTIONAL and only necessary if EXPECTED_FILE_TYPE___REGEX == ""
+do_health_check() { INP_FP="$1"; EXPECTED_FILE_TYPE___REGEX="$2"; HEALTH_CHECK___MAX_REPEAT="$3"; EXPECTED_PATH="$4"; INP_FILE_TYPE___SHORT="$5"
+  # The ___REGEX will be matched to the BEGINNING of the output of file --brief $INP_FP: 'PDF document, version 1.3'
+
+  [ $DBG ] && echo "${PFX}do_health_check(): INP_FP = '$INP_FP'" \
+           && echo "${PFX}                   EXPECTED_FILE_TYPE___REGEX='$EXPECTED_FILE_TYPE___REGEX'" \
+           && echo "${PFX}                   HEALTH_CHECK___MAX_REPEAT='$HEALTH_CHECK___MAX_REPEAT', EXPECTED_PATH='$EXPECTED_PATH'"
+
+  if [ ! -e "$INP_FP" ]; then [ $DBG ] && echo "${PFX}do_health_check(): FAILED!"; err 001 "File '$INP_FP' (INP_FP) not found!"; fi
+
+  if [ -n "$EXPECTED_PATH" ]; then
+    INP_FN="${INP_FP##*/}"
+    #[ $DBG ] && echo "${PFX}'$INP_FP'" && echo "$$|    ~ '$EXPECTED_PATH/$INP_FN'"
+    if [ "$INP_FP" != "$EXPECTED_PATH/$INP_FN" ]; then
+       [ $DBG ] && echo "${PFX}do_health_check(): FAILED!"
+       err 004 "Should not happen: '$INP_FP' != '$EXPECTED_PATH/$INP_FN'"
+    fi
+  fi
+
+  INP_SIZE="$(du $du_params "$INP_FP"|cut -f1)"
+  [ $DBG ] && echo "${PFX}do_health_check() '$INP_FP' == $INP_SIZE $du_unit_str"
+
+  local cmd_str=""
+  local inp_file_health=""
+  for trial in $(seq $HEALTH_CHECK___MAX_REPEAT); do
+    [ $DBG ] && echo "${PFX}do_health_check() [trial $trial/$HEALTH_CHECK___MAX_REPEAT]:"
+
+    # check file type of INP_FP:
+    if [ -n "$EXPECTED_FILE_TYPE___REGEX" ]; then
+      cmd_str="file --brief \"$INP_FP\""; INP_FILE_TYPE="$(file --brief "$INP_FP")"; rc=$?
+      if [ $rc -ne 0 ] || echo "$INP_FILE_TYPE"|grep -qv "^$EXPECTED_FILE_TYPE___REGEX"; then
+        printf "\n  > WARNING :: FAILED [$rc] to match expected file type:\n  > expected '$EXPECTED_FILE_TYPE___REGEX' ( = BEGINNING of file type)\n  > got      '$INP_FILE_TYPE' (file --brief \$INP_FP)\n--> Sleep 1 + Retrying!\n"
+        sleep 1; continue
+      fi
+      INP_FILE_TYPE___SHORT="$(echo "$INP_FILE_TYPE"|cut -f1 -d' ')"; rc=$?
+      [ $DBG ] && echo "${PFX} > File /type/ check, found '$INP_FILE_TYPE___SHORT' ($cmd_str)... PASSED!"
+    fi
+
+    # check health of INP_FP:
+    case "$INP_FILE_TYPE___SHORT" in
+      JPEG|PNG|TIFF)  [ -n "$c_convert" ] && [ -x "$c_convert" ] \
+                   || err 152 "Cannot health-check '$INP_FILE_TYPE___SHORT': no 'convert' found (c_convert='$c_convert'). Install ImageMagick or set c_convert. PDFs are unaffected."
+                 cmd_str="'$c_convert' '$INP_FP -print 'Size: %wx%h\\\\n' null:";;
+      PDF)   inp_file_health="ok";
+             [ $DBG ] && echo "${PFX} > PDF -> file /health/ check (pdfinfo) already done (see above Producer/Encrypted) and... PASSED!"
+             break;;
+      *)     err 122 "Invalid INP_FILE_TYPE___SHORT '$INP_FILE_TYPE___SHORT' for '$INP_FP'. Should not be.";;
+    esac
+    if [ $DBG ]; then                                            # <<<< to KEEP stderr of healthcheck-command
+      if [ -n "$LOG" ]; then exec 5>>"$LOG" || err 056; else exec 5>&1 || err 034; fi
+      [ $DBG ] && echo "${PFX} > File /health/ check ($cmd_str) [keeping stderr]:"
+    else                                                         # <<<< to THROW AWAY stderr of healthcheck-command
+      exec 5>/dev/null || err 045;
+      [ $DBG ] && echo "${PFX} > File /health/ check ($cmd_str) [without stderr]:"
+    fi
+    case "$INP_FILE_TYPE___SHORT" in
+      JPEG|PNG|TIFF)  inp_file_health="$("$c_convert" "$INP_FP" -print 'Size: %wx%h\n' null: 2>&5 )"; rc=$?;;
+      #PDF)   inp_file_health="$("$c_pdfinfo" "$INP_FP" 2>&5 )"; rc=$?;;
+    esac
+    if [ -n "$inp_file_health" ]; then
+      [ $DBG ] && echo "$inp_file_health"|sed -e "s/^/${PFX}   | /"
+      if [ $rc -eq 0 ]; then
+        [ $DBG ] && echo "${PFX} > File /health/ check ($cmd_str)... PASSED!"
+        break;
+      fi
+    fi
+
+    printf "\n  > WARNING :: FAILED [$rc] to verify file health:\n  > cmd_str \"$cmd_str\"\n  > got output-length=${#inp_file_health}: '$inp_file_health'\n--> Sleep 1 + Retrying!\n"
+    # FAILED --> reset inp_file_health for final check after for-loop !
+    inp_file_health=""; sleep 1
+  done
+  [ -z "$inp_file_health" ] && echo "${PFX}do_health_check(): LOOP FAILED!" && err 008 "($cmd_str) FAILED!"
+  [ $VRB ] && echo "${VRBPFX}do_health_check(): PASSED! ($INP_SIZE $du_unit_str) (found '$INP_FILE_TYPE___SHORT')"
+
+  return 0
+}
+
+
+do_part_1() {
+
+  ### --part-1 (0)
+  [ $VRB ] && echo "$$| >>> [part-1] (0) MUTEX LOCK to avoid concurrent $OCRAPP_NAME instances."
+
+  ### --part-1 (0) {a}
+  [ $DBG ] && echo "$$|  ~~ [part-1] (0) {a} MAKE SURE THAT LOCKFILE '$OCRAPP_LOCKFILE' exists and is empty"
+  PFX="$$|   ~ [part-1] (0) {a} "
+  [ -e "$OCRAPP_LOCKFILE" ] || err 064 "We should not be called with 'part-1' without an empty OCRAPP_LOCKFILE '$OCRAPP_LOCKFILE' created by calling my-ocr."
+  if [ -s "$OCRAPP_LOCKFILE" ]; then
+    echo "$$| >>> [part-1] Found OCRAPP LOCKFILE '$OCRAPP_LOCKFILE'!"
+    echo "$$|              QUEUED_FILE_MOVES_LOG '$QUEUED_FILE_MOVES_LOG':
+$(cat "$QUEUED_FILE_MOVES_LOG"|sed -e "s/.*/$$|              | '&'/")"
+
+#    [ $DBG ] && echo "${PFX}FOUND LOCKFILE '$OCRAPP_LOCKFILE' !"
+    touch "$OCRAPP_LOCKFILE" || err 070 "Failed '$OCRAPP_LOCKFILE' (OCRAPP_LOCKFILE: touch, chmod :my-system, chown g-w,o-rwx)"
+
+    echo "$$| >>> [part-1] Entering LOCKFILE '$OCRAPP_LOCKFILE' loop for '${OCRAPP_TIMEOUT}' sec ..."
+    [ $DBG ] && echo "$$|              Wait until LOCKFILE '$OCRAPP_LOCKFILE' vanishes or (exists and is not empty anymore)."
+    "$my_notify" -- "PART-1 -- WARNING" "Entering LOCKFILE loop for '${OCRAPP_TIMEOUT}' sec ..."
+    local i_max=$(( $OCRAPP_TIMEOUT * 1 ));
+    local i=1; while [ -s "$OCRAPP_LOCKFILE" -a $i -le $i_max ]; do
+           [ $DBG ] && echo "${PFX}timeout-counter='$i' / '$i_max', sleep 1 ..."
+           [ $(( $i % 300 )) -eq 0 ] && m="Still in LOCKFILE LOOP for max. further '$(( $i_max - $i ))' sec ..." && echo "${PFX} ... $m" && "$my_notify" -- "PART-1 -- WARNING" "$m"
+           sleep 1; i=$(( $i + 1 )); done
+    [ "$i" -gt "$OCRAPP_TIMEOUT" ] && err 011 "TIMEOUT waiting for $OCRAPP_NAME!"
+    echo "${PFX}Done with LOCKFILE loop.";
+  fi
+
+  ### --part-1 (1) {a}
+  [ $DBG ] && echo "$$| ~~~ [part-1] (1) Collecting files from (a) stdin, (b) from cli ('$FILELIST_PARAM'), (c) from '$COLLECT_INP_PATH'"
+  [ $DBG ] && echo "$$| ~~~ [part-1] (1)  > Loop over all files: (i)  Healthcheck or FAIL after $S_HEALTH_CHECK___MAX_REPEAT trials"
+  [ $DBG ] && echo "$$| ~~~ [part-1] (1)  > Loop over all files: (ii) Hand-through of filename > '$OCRAPP_LOCKFILE'"
+  touch "$OCRAPP_LOCKFILE" || err 031 "Failed '$OCRAPP_LOCKFILE' (OCRAPP_LOCKFILE: touch, chmod :my-system, chown g-w,o-rwx)"
+  got_special_dir=0;
+  #
+  # <STDIN>
+  if [ ! -t 0 ]; then # only if we have something to read from stdin:
+    PFX="$$|   ~ [part-1] (1) {a} "
+    VRBPFX="$$|  >  [part-1] (1) {a} "
+    [ $DBG ] && echo "$$|  ~~ [part-1] (1) {a} Reading from stdin..."
+    stdin_cnt=0; while read arg; do
+      echo; echo "MUHKUH $WHAT.stdin.$stdin_cnt: '$arg'"; echo; echo "$arg"|hexdump -v -b -c >/tmp/hexdump.$WHAT.stdin.$stdin_cnt; echo
+      if [ -d "$arg" ]; then
+        [ $DBG ] && echo "$$| >>> [$WHAT]    > Got DIRECTORY '$fp'"
+        if [ "$arg" = "$S_PATH/$COLLECT_INP_PATH" ]; then
+          got_special_dir=$(( $got_special_dir + 1 ));
+          [ $DBG ] && echo "${PFX}Ignoring $got_special_dir. special directory TMP_PATH '$S_PATH/$COLLECT_INP_PATH' (S_PATH/COLLECT_INP_PATH)!"
+          continue
+        else
+          err 104 "We should not get a directory ('$arg') from stdin when called with --part-1!"
+        fi
+      fi
+      stdin_cnt=$(( $stdin_cnt + 1 ));
+      prepare_file_for_ocr "$arg" "$stdin_cnt" "$S_PATH";
+    done
+    [ $got_special_dir -gt 1 ] && err 105 "got_special_dir='$got_special_dir'. Should be either 0 or 1, but not more than 1. Should not be."
+    [ $got_special_dir -eq 0 -a $stdin_cnt -eq 0 ] && err 063 "got_special_dir='$got_special_dir' && stdin_cnt='$stdin_cnt'. Should not be."
+    [ $DBG ] && echo "${PFX}Got '$stdin_cnt' files from stdin."
+    TOTAL_FILES_CNT=$(( $TOTAL_FILES_CNT + $stdin_cnt ));
+  fi
+  #
+  # <FILELIST_PARAM>
+  if [ -s "$FILELIST_PARAM" ]; then
+    PFX="$$|   ~ [part-1] (1) {b} "
+    VRBPFX="$$|  >  [part-1] (1) {b} "
+    [ $DBG ] && echo "$$|  ~~ [part-1] (1) {b} Reading from --file '$FILELIST_PARAM'..."
+    files_cnt=0; while read arg; do files_cnt=$(( $files_cnt + 1 )); prepare_file_for_ocr "$arg" "$files_cnt" "$S_PATH"; done<<_EOF_
+$(cat "$FILELIST_PARAM")
+_EOF_
+    [ $files_cnt -ne $FILELIST_CNT ] && err 092
+    [ $DBG ] && echo "${PFX}Got '$FILELIST_CNT' from --file '$FILELIST_PARAM'."
+    TOTAL_FILES_CNT=$(( $TOTAL_FILES_CNT + $files_cnt ));
+  fi
+  #
+  # <SPECIAL_DIR>   "$S_PATH/$COLLECT_INP_PATH"    (TMP_PATH):
+  if [ $got_special_dir -eq 1 ]; then
+    special_dir="$S_PATH/$COLLECT_INP_PATH"
+    [ -d "$special_dir" ] || err 111
+    files_cnt=0; while read arg; do files_cnt=$(( $files_cnt + 1 )); prepare_file_for_ocr "$special_dir/$arg" "$files_cnt" "$special_dir"; done<<_EOF_
+$(ls -1 "$special_dir/")
+_EOF_
+    [ $DBG ] && echo "${PFX}Got '$FILELIST_CNT' from the TMP_PATH within INP_PATH: '$special_dir'."
+    TOTAL_FILES_CNT=$(( $TOTAL_FILES_CNT + $files_cnt ));
+  fi
+
+  [ -s "$OCRAPP_LOCKFILE" ] || err 010 "Failed to fill LOCKFILE '$OCRAPP_LOCKFILE' (it's empty?!)";
+  [ $TOTAL_FILES_CNT -eq 0 ] && err 015 "TOTAL_FILES_CNT='$TOTAL_FILES_CNT'. Should not be."
+
+  [ $VRB ] && echo "$$| >>> [part-1] Got $TOTAL_FILES_CNT file(s) and wrote them into '$OCRAPP_LOCKFILE'"
+
+  ### --part-1 (2)
+  PFX="$$|   ~ [part-1] (2) "
+  [ $VRB ] && echo "$$| >>> [part-1] (2) Write filenames unchanged to stdout, to trigger '$OCRAPP_NAME' (via Automator):
+$( cat "$OCRAPP_LOCKFILE"|sed -e "s/.*/${PFX}   > '&'/" )"
+  #echo; echo "MUHKUH OCRAPP_LOCKFILE='$OCRAPP_LOCKFILE':"; cat "$OCRAPP_LOCKFILE"|hexdump -v -b -c >/tmp/hexdump.$WHAT.OCRAPP_LOCKFILE; echo
+  #cat "$OCRAPP_LOCKFILE"|sed -e 's/^[^[:space:]][^[:space:]]*[[:space:]][[:space:]]*//' # get 2nd column (of 'shasum -a 512' output == filenames)
+  #RES_CAT_FILE="$OCRAPP_LOCKFILE" # simply contains the list of files we received
+  cat "$OCRAPP_LOCKFILE" >&3
+
+#  [ $DBG ] && echo "$$| ~~~ [part-1] [END] ls -la S_PATH '$S_PATH':
+#$( ls -la "$S_PATH" )"
+#  [ $DBG ] && echo "$$| ~~~ [part-1] [END] ls -la T_PATH '$T_PATH':
+#$( ls -la "$T_PATH" )"
+
+}
+  
+
+do_part_2() {
+
+#  echo "$$| ~~~ [part-2] [BEGIN] ls -la S_PATH '$S_PATH':
+#$( ls -la "$S_PATH" )"
+#  echo "$$| ~~~ [part-2] [BEGIN] ls -la T_PATH '$T_PATH':
+#$( ls -la "$T_PATH" )"
+
+  : >"$REFUSED_FILES_LOG" 2>/dev/null   # this round's refusals, not the last one's
+  : >"$NOTEXT_FILES_LOG"  2>/dev/null   # ...and this round's no-text findings
+  touch "$QUEUED_FILE_MOVES_LOG" || err 041 "Failed '$QUEUED_FILE_MOVES_LOG' (QUEUED_FILE_MOVES_LOG: touch, chmod :my-system, chown g-w,o-rwx)"
+
+  ############################################################################################################
+  ### --part-2 (0)
+  total_cnt=0;
+  [ $VRB ] && x="(0) " || x=""; PFX="$$|   ~ [$WHAT] ${x}"
+  if [ ! -t 0 ]; then # only if we have something to read from stdin:
+    [ -n "$VRB$DBG" ] && echo "$$| >>> [$WHAT] (0) Reading from stdin..."
+    stdin_cnt=0; while read arg; do
+      #echo; echo "MUHKUH $WHAT.stdin.$stdin_cnt: '$arg'"; echo; echo "$arg"|hexdump -v -b -c >/tmp/hexdump.$WHAT.stdin.$stdin_cnt; echo
+      stdin_cnt=$(( $stdin_cnt + 1));
+      [ -e "$arg" ] || err 087 "Provided file #$stdin_cnt '$arg', should be a file, but it does not seem to exist. Please fix."
+      [ $DBG ] && echo "${PFX}   > Got #$stdin_cnt from stdin '$arg'"
+      echo "$arg\t" >> "$PROVIDED_FILES_FILELIST" || err 072 "Failed appending '$arg' to PROVIDED_FILES_FILELIST '$PROVIDED_FILES_FILELIST'"
+    done
+    total_cnt=$(( $total_cnt + $stdin_cnt ));
+    [ $DBG ] && echo "${PFX}Got '$stdin_cnt' files from stdin. total_cnt='$total_cnt'"
+  fi
+
+  if [ -s "$FILELIST_PARAM" ]; then
+    [ -n "$VRB$DBG" ] && echo "$$| >>> [$WHAT] (0) Reading from --file '$FILELIST_PARAM'..."
+    cat "$FILELIST_PARAM" >> "$PROVIDED_FILES_FILELIST" || err 091 "Failed [$?] appending --file to PROVIDED_FILES_FILELIST '$PROVIDED_FILES_FILELIST'";
+    total_cnt=$(( $total_cnt + $FILELIST_CNT ));
+    [ $DBG ] && echo "${PFX}Got '$FILELIST_CNT' from --file '$FILELIST_PARAM'. total_cnt='$total_cnt'"
+  fi
+
+  [ $DBG ] && echo "${PFX}PROVIDED_FILES_FILELIST '$PROVIDED_FILES_FILELIST':
+$(cat "$PROVIDED_FILES_FILELIST"|sed -e "s/.*/${PFX}   > '&'/")"
+  [ -s "$PROVIDED_FILES_FILELIST" ] || err 026 "[$WHAT] Problem with '$OCRAPP_NAME' ?! Got no files on stdin [PROVIDED_FILES_FILELIST empty?! // total_cnt='$total_cnt']. Should not be."
+  [ $total_cnt -eq 0 ] && err 097 "[$WHAT] We got no files to OCR (total_cnt='$total_cnt'). Should not be."
+
+  ############################################################################################################
+  ### --part-2 (1) {a}
+  [ $DBG ] && x="(1) {a} " || x=""; PFX="$$|   ~ [part-2] ${x}"
+  VRBPFX="$$|  >  [part-2] ${x}"
+  [ $VRB ] && echo "$$| >>> [part-2] (1) Wait max. '${OCRAPP_TIMEOUT}' sec. that all files received by part-1 are treated by $OCRAPP_NAME"
+
+  [ $DBG ] && echo "$$|  ~~ [part-2] ${x}Check using filenames from LOCKFILE '$OCRAPP_LOCKFILE' (== files received on stdin with --part-1)"
+  [ -s "$OCRAPP_LOCKFILE" ] || err 075 "We should not be called with 'part-2' without a OCRAPP_LOCKFILE '$OCRAPP_LOCKFILE' (created by 'my-ocr' and filled by 'part-1')."
+  [ -e "$OCRAPP_LOCKFILE" ] || err 016 "LOCKFILE '$OCRAPP_LOCKFILE' NOT FOUND! part-2 expects this!?"
+  [ -s "$OCRAPP_LOCKFILE" ] || err 021 "Empty (filelist in) LOCKFILE '$OCRAPP_LOCKFILE'. Should not be :("
+  [ $DBG ] && echo "${PFX}FOUND LOCKFILE '$OCRAPP_LOCKFILE' !"
+
+  #"$my_notify" -- "PART-2 -- WARNING" "Entering $OCRAPP_NAME loop for '${OCRAPP_TIMEOUT}' sec ..."
+  if [ $DBG ]; then
+    echo "$$|  ~~ [part-2] ${x}Loop over all files: Determine new_fn of <file> as expected OUTPUT file (in T_PATH '$T_PATH' with suffix '$OCRAPP_OUTPUT_SUFFIX')"
+    echo "$$|  ~~ [part-2] ${x}Loop over all files: (i) Check if new_fn exists. If NO: WARNING, FAIL after loop // If YES:"
+    echo "$$|  ~~ [part-2] ${x}Loop over all files:     (ii)  Healthcheck passed? If YES: Continue // If NO: WARNING, FAIL after loop"
+    echo "$$|  ~~ [part-2] ${x}Loop over all files:     (iii) Append '\t_OK_\t<new_fn>' to OCRAPP_LOCKFILE line of <file>."
+  fi
+
+### #XXX START: 2020-06-10_1346 BUG of FineReader Automator Module with character encoding (see Mail to support)
+      printf "">"$PROVIDED_FILES_FILELIST" || err 124 "Failed emptying PROVIDED_FILES_FILELIST '$PROVIDED_FILES_FILELIST'"
+### #XXX END: 2020-06-10_1346 BUG of FineReader Automator Module with character encoding (see Mail to support)
+
+  PFX="$PFX   "
+  local i_max=$(( $OCRAPP_TIMEOUT * 1 ));
+  local OK_cnt=0;
+  local i=1; while [ $OK_cnt -lt $total_cnt -a $i -le $i_max ]; do
+    [ $(( $i % 300 )) -eq 0 ] && m="Still in $OCRAPP_NAME LOOP for max. further '$(( $i_max - $i ))' sec ..." && echo "${PFX} ... $m" && "$my_notify" -- "PART-2 -- WARNING" "$m"
+
+    # (re)determine $need_to_find # <<< Note: OCRAPP_NAME shall NOT change filenames!
+    while read fp; do
+      fn="${fp##*/}";
+      fn_without_suffix="${fn%.*}"
+      new_fp="$T_PATH/$fn_without_suffix.$OCRAPP_OUTPUT_SUFFIX"
+      [ $DBG ] && echo "${PFX}${NL}${PFX}> Got fp='$fp'${NL}${PFX}  new_fp='$new_fp'"
+
+      if [ ! -e "$new_fp" ]; then
+        [ $DBG ] && printf "${PFX}   (i) !! WARNING  ::  Did NOT find '$fn' in '$T_PATH'!\n${PFX}   '$new_fp'\n"
+        continue; # <<< we keep WAITING for the file in the outer $i loop until TIMEOUT!
+      fi
+      #[ $DBG ] && echo "${PFX}   (i) Found '$fn' in '$T_PATH'!"
+
+      do_health_check "$new_fp" "$T_EXPECTED_FILE_TYPE___REGEX" "$T_HEALTH_CHECK___MAX_REPEAT" "$T_PATH"; rc=$?
+      if [ $rc -eq 0 ]; then
+        [ $DBG ] && echo "${PFX}   (ii) PASSED do_health_check()"
+        s1="_OK_"; s2="$(echo "$new_fp"|sed -e 's/&/\\&/g')" # escape the & (as otherwise it would be replaced by the match
+### #XXX START: 2020-06-10_1346 BUG of FineReader Automator Module with character encoding (see Mail to support)
+        echo "$new_fp\t" >> "$PROVIDED_FILES_FILELIST" || err 125 "Failed appending '$arg' to PROVIDED_FILES_FILELIST '$PROVIDED_FILES_FILELIST'"
+### #XXX END: 2020-06-10_1346 BUG of FineReader Automator Module with character encoding (see Mail to support)
+      else
+        printf "${PFX}   (ii)  !! WARNING  ::  FAILED [$rc] to do_health_check() -- hopefully this gets fixed later\n";
+        #s1="FAILED"; s2="do_health_check()";
+        continue # in the hope that this is just a temporary problem
+      fi
+
+      sed -i "" -e "s|^$fp$|$fp	$s1	$s2|" "$OCRAPP_LOCKFILE" || err 086 "Failed [$?] to run sed on OCRAPP_LOCKFILE: 'sed -i \"\" -e \"s|^$fp$|$fp	$s1	$s2|\" \"$OCRAPP_LOCKFILE\"'. Should not happen."
+      [ $DBG ] && echo "${PFX}   (iii) UPDATED entry in OCRAPP_LOCKFILE for fp='$fp': '$(cat "$OCRAPP_LOCKFILE"|grep "^$fp\t")'"
+      OK_cnt=$(( $OK_cnt + 1 ));
+
+    done <<_EOF_
+$(cat "$OCRAPP_LOCKFILE"|grep -v "\t_OK_\t")
+_EOF_
+
+    [ $DBG ] && echo "${PFX}Timeout-counter='$i' / '$i_max', sleep 1, (updated) OCRAPP_LOCKFILE:
+$(cat "$OCRAPP_LOCKFILE"|sed -e "s/.*/${PFX}   > '&'/")"
+    sleep 1; i=$(( $i + 1 ));
+  done
+  [ "$i" -gt "$OCRAPP_TIMEOUT" ] && err 012 "TIMEOUT waiting for $OCRAPP_NAME to finish all files!"
+
+  t_notOK="$(cat "$OCRAPP_LOCKFILE"|grep -v "\t_OK_\t")"; [ -z "$t_notOK" ] && t_ok_cnt=0 || t_notOK_cnt=$(( $(echo "$t_notOK"|wc -l) + 0 ));
+  t_total_cnt="$(( $(cat "$OCRAPP_LOCKFILE"|wc -l) + 0 ))";
+  [ -n "$t_notOK" ] && err 123 "Not all files listed in OCRAPP_LOCKFILE could be found and verified as valid $OCRAPP_OUTPUT_SUFFIX files.${NL}   > '$total_cnt' entries in OCRAPP_LOCKFILE${NL}   > '$t_notOK_cnt' entries that are NOT OK:${NL}${NL}:$t_notOK{$NL}Should not happen.${NL}${NL}OCRAPP_LOCKFILE='$OCRAPP_LOCKFILE'${NL}$(cat "$OCRAPP_LOCKFILE")${NL}"
+
+  [ $DBG ] && echo "${PFX}Done with $OCRAPP_NAME loop.";
+
+  ############################################################################################################
+  ### --part-2 (1) {b}
+  [ $VRB ] && x="(1) {b} " || x=""; PFX="$$|   ~ [part-2] ${x}"
+  #echo; echo "MUHKUH OCRAPP_LOCKFILE='$OCRAPP_LOCKFILE':"; cat "$OCRAPP_LOCKFILE"|hexdump -v -b -c >/tmp/hexdump.$WHAT.OCRAPP_LOCKFILE; echo
+  #echo; echo "MUHKUH PROVIDED_FILES_FILELIST='$PROVIDED_FILES_FILELIST':"; cat "$PROVIDED_FILES_FILELIST"|hexdump -v -b -c >/tmp/hexdump.$WHAT.PROVIDED_FILES_FILELIST; echo
+  [ $DBG ] && echo "$$|  ~~ [part-2] ${x}Check list of new_fn from OCRAPP_LOCKFILE and compare with stdin_filelist..."
+  while read fp; do
+    t="$(sed -n "\|	_OK_	$fp$|p" "$OCRAPP_LOCKFILE")"; if [ -z "$t" ]; then
+      t="/tmp/${US}.$$.OCRAPP_LOCKFILE"; cp "$OCRAPP_LOCKFILE" "$t";
+      err 088 "Failed [$?] to find the file /we/ in $WHAT got from stdin in the OCRAPP_LOCKFILE:${NL}${NL}      sed -n \"\\|	_OK_	$fp\$|p\" \"$t\"${NL}Should not happen.${NL}${NL}We copied the OCRAPP_LOCKFILE to \"$t\" for you to investigate.${NL}"
+    fi
+    #awk -v XX="$fp" 'BEGIN{FS="\t";FOUND=0;}{if ($3 == XX) { FOUND=1; exit 0;};}END{if (FOUND) exit 0; else exit 1;}' "$OCRAPP_LOCKFILE" || err 174 "Failed [$?] to find the file /we/ in $WHAT got from stdin in the OCRAPP_LOCKFILE:${NL}${NL}      awk -v XX=\"$fp\" 'BEGIN{FS=\"\\t\";FOUND=0;}{if (\$3 == XX) { FOUND=1; exit 0;};}END{if (FOUND) exit 0; else exit 1;}' OCRAPP_LOCKFILE${NL}Should not happen.${NL}${NL}OCRAPP_LOCKFILE='$OCRAPP_LOCKFILE'${NL}$(cat "$OCRAPP_LOCKFILE")${NL}"
+    sed -i "" -e "\|	_OK_	$fp$|d" "$OCRAPP_LOCKFILE" || err 013 "Failed [$?] to run remove line ending with fp '$fp' (file /we/ in $WHAT got from stdin) from OCRAPP_LOCKFILE:${NL}${NL}     sed -i \"\" -e \"\\|	_OK_	$fp$|d\" \"$OCRAPP_LOCKFILE\"${NL}Should not happen.${NL}${NL}OCRAPP_LOCKFILE='$OCRAPP_LOCKFILE'${NL}$(cat "$OCRAPP_LOCKFILE")${NL}"
+  done <<_EOF_
+$(cat "$PROVIDED_FILES_FILELIST")
+_EOF_
+  [ $DBG ] && echo "${PFX}Found all files from stdin (as new_fn) within OCRAPP_LOCKFILE. Good :)"
+
+  [ -s "$OCRAPP_LOCKFILE" ] && err 025 "Got more files in the OCRAPP_LOCKFILE than we got on stdin. Should not be.${NL}List of files we got in addition to all files on stdin in OCRAPP_LOCKFILE:${NL}${NL}'$OCRAPP_LOCKFILE'${NL}$(cat "$OCRAPP_LOCKFILE")${NL}"
+  [ $DBG ] && echo "${PFX}Got not MORE files in OCRAPP_LOCKFILE (than the ones from stdin). Good :)"
+  # at this point *ALL* the files from OCRAPP_LOCKFILE should match *ALL* the files we got from stdin (PROVIDED_FILES_FILELIST)
+  [ $VRB ] && echo "$$| >>> [part-2] (1) Done with Loop: Checked that all files from LOCKFILE '$OCRAPP_LOCKFILE' are done and that they matched all the files we got on stdin."
+
+  ############################################################################################################
+  ### --part-2 (2)
+  # OCRAPP_LOCKFILE exists and is EMPTY now! <<< see [ -s "$OCAPP_LOCKFILE" ] above.
+  [ $VRB ] && x="(2) " || x=""; PFX="$$|   ~ [part-2] ${x}"
+  rm -f "$OCRAPP_LOCKFILE" || {
+    echo "$$| >>> [part-2] ${x}FAILED to remove LOCKFILE '$OCRAPP_LOCKFILE' set in part-1"
+    err 017 "Failed removing '$OCRAPP_LOCKFILE'";
+  }
+  [ $VRB ] && echo "$$| >>> [part-2] ${x}Removed LOCKFILE '$OCRAPP_LOCKFILE' set in part-1"
+  echo "$$| >>> [part-2] Got $total_cnt files from stdin, all health checked --> removed '$OCRAPP_LOCKFILE'"
+
+  ############################################################################################################
+  ### --part-2 (3)
+  ocrapp_pids="$(cat "$OCRAPP_STATEFILE")" || err 023 "Failed to read OCRAPP_STATEFILE '$OCRAPP_STATEFILE'"
+  [ $VRB ] && x="(3) " || x=""; PFX="$$|   ~ [part-2] ${x}"
+  if [ -z "$ocrapp_pids" ]; then
+    ocrapp_pids="$(pgrep -x "$OCRAPP_NAME")"
+    if [ -z "$ocrapp_pids" ]; then
+      echo "$$| >>> [part-2] ${x}$OCRAPP_NAME is not running anymore --> Nothing to do :)"
+    else
+      echo "$$| >>> [part-2] ${x}$OCRAPP_NAME was NOT running when part-1 was called --> closing it (pid(s) $ocrapp_pids)"
+      ocrapp_quit
+    fi
+  else
+    echo "$$| >>> [part-2] ${x}$OCRAPP_NAME was already running when part-1 was called --> We leave it be."
+  fi
+
+  ############################################################################################################
+  ### --part-2 (4)
+  [ $VRB ] && x="(4) " || x=""; PFX="$$|   ~ [part-2] ${x}"
+  [ $DBG ] && echo "${PFX}Checking QUEUED_FILE_MOVES_LOG '$QUEUED_FILE_MOVES_LOG'..."
+  if [ -s "$QUEUED_FILE_MOVES_LOG" ]; then # file exists AND size > 0 !
+
+    local queued_cnt=$(( $(cat "$QUEUED_FILE_MOVES_LOG"|wc -l) ));
+    [ $DBG ] && echo "${PFX}... exists and contains $queued_cnt entries:
+$(cat "$QUEUED_FILE_MOVES_LOG"|sed -e "s/.*/${PFX}       | '&'/")"
+
+    local moved_cnt=0;
+    local ocred_cnt=0;
+    VERIFY_REFUSED_CNT=0;
+    [ $DBG ] && echo "${PFX}Going through PROVIDED_FILES_FILELIST to find matches within the QUEUED_FILE_MOVES_LOG..."
+    while read ocred_fp; do
+      ocred_cnt=$(( $ocred_cnt + 1 ));
+      #                     fp      S_fp    T_fp      fp_realpath
+      orig_fp="$(sed -n "s|^[^	]*	[^	]*	$ocred_fp	||p" "$QUEUED_FILE_MOVES_LOG")"
+      orig_fp_without_last_suffix="${orig_fp%.*}"
+      result_fp="$orig_fp_without_last_suffix.$OCRAPP_OUTPUT_SUFFIX"
+
+      [ -z "$orig_fp" ] && err 074 "File $ocred_cnt '$ocred_fp': Unable to find entry in QUEUED_FILE_MOVES_LOG:
+$(cat "$QUEUED_FILE_MOVES_LOG"|sed -e "s/.*/${PFX}       | '&'/")
+Should not be."
+      [ $DBG ] && echo "${PFX}   file #$ocred_cnt: Found corresponding orig filename '$orig_fp'"
+
+      [ -e "$orig_fp" ] || err 058 "FAILED to locate file \"$orig_fp\" (pwd='$(pwd)'). Should not be."
+
+      # Check BEFORE anything is trashed or overwritten: from here on the
+      # original is destroyed, so this is the last moment it can be saved.
+      if ! verify_ocr_result "$ocred_fp" "$orig_fp"; then
+        VERIFY_REFUSED_CNT=$(( VERIFY_REFUSED_CNT + 1 ))
+        echo "$$| >>> [$WHAT] REFUSING the result for '${orig_fp##*/}': $VERIFY_WHY"
+
+        # CLEAN ROLLBACK. Three things, in this order:
+        #   1. the bad result is TRASHED -- not left in the out-path where the
+        #      next run would trip over it, but recoverable if I judged wrong
+        #   2. the ORIGINAL is kept, and quarantined so it does not sit in the
+        #      queue looking pending. It is the document; the result is spoil.
+        #   3. the user is TOLD -- a silently refused document is the same as
+        #      a lost one, and only a person can decide to rescan.
+        _vo_dest="the queue"
+        if [ -n "$c_trash" ] && [ -x "$c_trash" ]; then
+          if "$c_trash" -- "$ocred_fp" >/dev/null 2>&1; then
+            echo "$$| >>> [$WHAT]   bad result trashed (recoverable): '${ocred_fp##*/}'"
+          else
+            echo "$$| >>> [$WHAT]   WARNING :: could not trash the bad result '$ocred_fp'"
+          fi
+        else
+          echo "$$| >>> [$WHAT]   WARNING :: no trash command -- bad result left at '$ocred_fp'"
+        fi
+
+        if [ -n "$MOVE_FAILED_TO" ]; then
+          mkdir -p "$MOVE_FAILED_TO" 2>/dev/null
+          _vo_q="$MOVE_FAILED_TO/${orig_fp##*/}"
+          [ -e "$_vo_q" ] && _vo_q="$MOVE_FAILED_TO/$(date +%Y-%m-%d_%H%M.%S)___${orig_fp##*/}"
+          if mv -- "$orig_fp" "$_vo_q" 2>/dev/null; then
+            echo "$$| >>> [$WHAT]   ORIGINAL rolled back and quarantined -> '$_vo_q'"
+            _vo_dest="$MOVE_FAILED_TO"
+          else
+            echo "$$| >>> [$WHAT]   WARNING :: could not quarantine '$orig_fp' -- it stays put"
+          fi
+        else
+          # the CLI case: no quarantine folder was given, so say where it IS
+          echo "$$| >>> [$WHAT]   ORIGINAL kept, unchanged: '$orig_fp'"
+          _vo_dest="${orig_fp%/*}"
+        fi
+
+        [ -x "$my_notify" ] && "$my_notify" -- \
+          "[my-ocr] OCR REFUSED: ${orig_fp##*/}" \
+          "$VERIFY_WHY
+
+The original was NOT replaced -- it is in:
+  $_vo_dest
+
+The OCR result was discarded (to the Trash). The document has to be
+looked at, and probably scanned again." >/dev/null 2>&1
+
+        # The queue entry STAYS: the original was not replaced, and
+        # trigger-OCR's summary still has to quarantine and report it. What it
+        # must not do is call this a failure -- hence the separate record.
+        printf '%s\t%s\n' "$orig_fp" "$VERIFY_WHY" >>"$REFUSED_FILES_LOG" 2>/dev/null
+        continue
+      fi
+
+      # Accepted, but the page held nothing to recognise -- so the DOCUMENT is
+      # the original, and the OCR application's output is spoil. Tag the
+      # original instead, keep it, and discard that output.
+      #
+      # Only when the input was itself a PDF: 'orig_fp = result_fp' is exactly
+      # that test. A JPEG/PNG/TIFF has no PDF to tag, so there the OCR
+      # application's PDF is the only candidate and is kept, as before.
+      if [ -n "$VERIFY_NOTEXT" ]; then
+        if [ "$orig_fp" = "$result_fp" ] && tag_as_ocred "$orig_fp"; then
+          echo "$$| >>> [$WHAT] no text found in '${orig_fp##*/}' -- nothing to OCR on this page."
+          echo "$$| >>> [$WHAT]   ORIGINAL kept and tagged as $OCRAPP_PRODUCER_TAG output, so a later"
+          echo "$$| >>> [$WHAT]   run knows it has been through OCR. The result is discarded:"
+          if [ -n "$c_trash" ] && [ -x "$c_trash" ]; then
+            if "$c_trash" -- "$ocred_fp" >/dev/null 2>&1; then
+              echo "$$| >>> [$WHAT]   result trashed (recoverable): '${ocred_fp##*/}'"
+            else
+              echo "$$| >>> [$WHAT]   WARNING :: could not trash the result '$ocred_fp'"
+            fi
+          else
+            echo "$$| >>> [$WHAT]   WARNING :: no trash command -- result left at '$ocred_fp'"
+          fi
+          printf '%s\n' "$orig_fp" >>"$NOTEXT_FILES_LOG" 2>/dev/null
+          last_file="$orig_fp"   # the tagged original is what to reveal; without
+                                 # this, part-2 ends with no last_file and raises
+                                 # err 035 on a run that did the right thing
+          sed -i "" -e "\|	$orig_fp$|d" "$QUEUED_FILE_MOVES_LOG" \
+            || err 019 "Failed to dequeue '$orig_fp' after tagging it in place."
+          moved_cnt=$(( moved_cnt + 1 ));
+          continue
+        fi
+        # Could not tag (not a PDF original, or the tagger refused): keep the
+        # OCR application's output, which at least carries the Producer tag.
+        echo "$$| >>> [$WHAT] no text found in '${orig_fp##*/}' -- nothing to OCR on this page;"
+        echo "$$| >>> [$WHAT]   keeping the OCR result instead${TAG_WHY:+ ($TAG_WHY)}."
+        printf '%s\n' "$orig_fp" >>"$NOTEXT_FILES_LOG" 2>/dev/null
+      fi
+
+      if [ "$orig_fp" = "$result_fp" ]; then # ... we trash BEFORE we move (in order to make place for the move)!
+        # TRASH does NOT work on NETWORK SHARES !
+        #[ $DBG ] && echo "${PFX}   --> \"$c_trash\" -- \"$orig_fp\"(==orig_fp)"
+        #"$c_trash" -- "$orig_fp" || err 175 "FAILED to \"$c_trash\" -- \"$orig_fp\""
+
+        [ $DBG ] && echo "${PFX}   --> \"/bin/mv\" -- \"$orig_fp\"(==orig_fp) $TRASH_DIR/"
+        trash_by_mv "$orig_fp" || err 033 "FAILED to move \"$orig_fp\" into the Trash: $_tm_err"
+      fi
+
+#XXX FIXME: seen in the wild (2020): part-2 aborted with ERROR 078 because
+# result_fp already existed, so the OCRed file could not be moved onto it.
+# Reproduce by OCRing a file whose target name is already taken.
+
+      # result_fp should NOT exist! <<< important e.g. if orig_fp == .jpg --> result_fp == .pdf
+      [ -e "$result_fp" ] && err 078 "Found result file '$result_fp'. So we could not move '$ocred_fp' onto it. Strange, because we trashed '$orig_fp'. Please fix!"
+
+      [ $DBG ] && echo "${PFX}   --> mv -- \"$ocred_fp\"(==ocred_fp) \"$result_fp\"(==result_fp)"
+      mv -- "$ocred_fp" "$result_fp" || err 036 "Failed to mv -- \"$ocred_fp\" \"$result_fp\""
+      last_file="$result_fp" # <<< in preparation of next step: The file to REVEAL IN FINDER.
+
+      if [ "$orig_fp" != "$result_fp" ]; then # ... if they did NOT match, then we trash NOW as we already did move the OCRed file in place!
+        #[ $DBG ] && echo "${PFX}   --> \"$c_trash\" -- \"$orig_fp\"(==orig_fp)"
+        #"$c_trash" -- "$orig_fp" || err 176 "FAILED to \"$c_trash\" -- \"$orig_fp\""
+
+        [ $DBG ] && echo "${PFX}   --> \"/bin/mv\" -- \"$orig_fp\"(==orig_fp) ~/.Trash/"
+        "/bin/mv" -- "$orig_fp" ~/.Trash/ || err 079 "FAILED to \"/bin/mv\" -- \"$orig_fp\" ~/.Trash/"
+      fi
+
+      # remove the queued file-move
+      [ $DBG ] && echo "${PFX}   --> Update QUEUED_FILE_MOVES_LOG '$QUEUED_FILE_MOVES_LOG'"
+      sed -i "" -e "\|	$orig_fp$|d" "$QUEUED_FILE_MOVES_LOG" || err 002 "Failed to remove line ending with '$orig_fp	' from QUEUED_FILE_MOVES_LOG '$QUEUED_FILE_MOVES_LOG':
+$(cat "$QUEUED_FILE_MOVES_LOG"|sed -e "s/.*/${PFX}       | '&'/")"
+
+      moved_cnt=$(( $moved_cnt + 1 ));
+    done <<_EOF_
+$(cat "$PROVIDED_FILES_FILELIST")
+_EOF_
+    local new_queued_cnt=$(( $(cat "$QUEUED_FILE_MOVES_LOG"|wc -l) ));
+    [ $new_queued_cnt -eq 0 ] && tmp=" -- all files queued for move done :)" || tmp=". !!! STILL $new_queued_cnt files LEFT in queue for move:
+$(cat "$QUEUED_FILE_MOVES_LOG"|sed -e "s/^/${PFX}       | /")"
+    echo "$$| >>> [part-2] ${x}Moved $moved_cnt /of/ $ocred_cnt just OCRed files${tmp}"
+    if [ "${VERIFY_REFUSED_CNT:-0}" -gt 0 ]; then
+      echo "$$| >>> [part-2] ${x}REFUSED $VERIFY_REFUSED_CNT result(s): the original was kept, not replaced."
+      echo "$$| >>> [part-2] ${x}  The OCR result was discarded (to the Trash); the original was kept."
+    fi
+
+    # Refused results leave their queue entry ON PURPOSE (see above), so the
+    # queue being non-empty is only wrong for entries that are NOT refusals.
+    # Treating an expected outcome as an error is what made one refused page
+    # raise ERROR 053 -> PARTx_ERRORED_FLAGFILE -> ERROR 066 -> my-ocr exit 1,
+    # and my-scan report a working pipeline as broken.
+    _refused_cnt=0
+    [ -s "$REFUSED_FILES_LOG" ] && _refused_cnt=$(( $(cat "$REFUSED_FILES_LOG"|wc -l) + 0 ))
+    [ $new_queued_cnt -le $_refused_cnt ] || err 053 "QUEUED_FILE_MOVES_LOG *should* be EMPTY at this point${tmp}
+
+QUEUED_FILE_MOVES_LOG should have been created by trigger-OCR / do_trigger_ocr.
+And thus now at the end of part-2 we should have moved back all files --> queue empty!"
+
+  else
+    echo "$$| >>> [part-2] ${x}No files queued to be moved."
+    last_file="$(cat "$PROVIDED_FILES_FILELIST"|sort|tail -n 1)" || err 022 "Failed to determine last_file from PROVIDED_FILES_FILELIST '$PROVIDED_FILES_FILELIST':
+$(cat "$PROVIDED_FILES_FILELIST"|sed -e "s/.*/${PFX}   > '&'/")"
+  fi
+
+  ############################################################################################################
+  # DEPENDENCY: $last_file was ALREADY set in step (4) !!!
+  ### --part-2 (5)
+  [ $VRB ] && x="(5) " || x=""; PFX="$$|   ~ [part-2] ${x}"
+  [ -z "$last_file" ] && err 035 "Failed to determine last_file from PROVIDED_FILES_FILELIST '$PROVIDED_FILES_FILELIST':
+$(cat "$PROVIDED_FILES_FILELIST"|sed -e "s/.*/${PFX}   > '&'/")"
+  [ ! -e "$last_file" ] && err 037 "Last file '$last_file' from PROVIDED_FILES_FILELIST '$PROVIDED_FILES_FILELIST' NOT found. Should not be :(    PROVIDED_FILES_FILELIST:
+$(cat "$PROVIDED_FILES_FILELIST"|sed -e "s/.*/${PFX}   > '&'/")"
+  #[ $DBG ] && echo "${PFX}Revealing '$last_file' in Finder..."
+  # Opening a Finder window is right when you asked for this at a prompt, and
+  # wrong when a Folder Action fired it while nobody is at the machine.
+  case "$REVEAL_IN_FINDER" in
+    never)  [ $DBG ] && echo "${PFX}REVEAL_IN_FINDER=never -- not revealing '$last_file'.";;
+    always) open -R "$last_file" || err 028 "Failed to reveal '$last_file' in Finder"
+            echo "$$| >>> [part-2] ${x}Revealed '$last_file' in Finder.";;
+    *)      if [ -e "$INTERACTIVE_FLAGFILE" ]; then
+              open -R "$last_file" || err 168 "Failed to reveal '$last_file' in Finder"
+              echo "$$| >>> [part-2] ${x}Revealed '$last_file' in Finder."
+            else
+              echo "$$| >>> [part-2] ${x}Not revealing '$last_file': no terminal started this run."
+            fi;;
+  esac
+
+  ############################################################################################################
+  ### --part-2 (6)
+  [ $VRB ] && x="(6) " || x=""; PFX="$$|   ~ [part-2] ${x}"
+  for a in $DBG_FLAGFILE $FORCE_FLAGFILE $INTERACTIVE_FLAGFILE $OCRAPP_STATEFILE; do
+    rm -f "$a" && { [ $DBG ] && echo "${PFX}   - '$a' - Removed."; :; } \
+               || err 024 "FAILED to rm -f '$a'"
+  done
+  [ $VRB ] && echo "$$| >>> [part-2] ${x}[hand-through of stdin] Output simply the filenames as we got them to stdout"
+
+  #RES_CAT_FILE="$PROVIDED_FILES_FILELIST" # simply contains the list of files we received
+  cat "$PROVIDED_FILES_FILELIST" >&3
+  return 0
+}
+
+
+# used by --part-1 and --trigger-ocr
+prepare_file_for_ocr() { local fp="$1"; local cnt="$2";  local expected_path="$3" # $3 will be handed through to do_health_check()
+
+  [ -n "$cnt" ] && cnt="#$cnt " || err 119
+
+  if [ -d "$fp" ]; then # ignore directories :)
+    IGNORED_CNT=$(( $IGNORED_CNT + 1 ));
+    [ -n "$DBG$VRB" ] && echo "$$| >>> [$WHAT]    > Got ${cnt}'$fp' :: Directory --> we'll silently IGNORE it (#$IGNORED_CNT)."
+    return;
+  fi
+
+  # A filename marker means "do not OCR this" -- honoured HERE so that no
+  # caller can OCR a file that was explicitly marked, and so that the file is
+  # left exactly where it is rather than being copied into the OCR queue.
+  for _pat in $NO_OCR_FILENAME_PATTERNS; do
+    # shellcheck disable=SC2254  # a config-supplied glob, deliberately unquoted
+    case "${fp##*/}" in
+      $_pat) IGNORED_CNT=$(( $IGNORED_CNT + 1 ));
+             echo "$$| >>> [$WHAT]    > Got ${cnt}'$fp' :: matches NO_OCR_FILENAME_PATTERNS ('$_pat') --> NOT OCRing it, leaving it where it is (#$IGNORED_CNT)."
+             return;;
+    esac
+  done
+
+  fn="${fp##*/}";
+  fn_last_suffix="${fn##*.}"        # eg .gz in .tar.gz
+
+  if [ $DBG ]; then echo "$fn" >> "$DBG_GOTTEN_FILES_FILELIST$WHAT" || err 100; fi
+
+  # We need real_fp for entry in QUEUED_FILE_MOVES_LOG) !
+  real_fp="$( "$c_realpath" "$fp" )" || err 059 "FAILED [$?] to run '\"$c_realpath\" \"$fp\"' (pwd='$(pwd)'). Should not be."
+
+  # check file type of INP_FP:
+  cmd_str="file --brief \"$real_fp\""; INP_FILE_TYPE="$(file --brief "$real_fp")" || err 117; [ -z "$INP_FILE_TYPE" ] && err 118;
+  INP_FILE_TYPE___SHORT="$(echo "$INP_FILE_TYPE"|cut -f1 -d' ')" || err 120; [ -z "$INP_FILE_TYPE___SHORT" ] && err 121;
+  [ $DBG ] && echo "${PFX}Running: echo \"$INP_FILE_TYPE\"|grep -qv \"^$S_EXPECTED_FILE_TYPE___REGEX\""
+  echo "$INP_FILE_TYPE"|grep -qv "^$S_EXPECTED_FILE_TYPE___REGEX" && {
+    [ -n "$VRB$DBG" ] && t=", but expected $S_EXPECTED_FILE_TYPE___REGEX." || t=""
+    echo "$$| >>> [$WHAT]    > Got $cnt'$fp' :: Unusable type '$INP_FILE_TYPE___SHORT'$t"
+    [ $DBG ] && echo "${PFX}(file-type '$INP_FILE_TYPE')"
+    WRONG_FILETYPE_CNT=$(( $WRONG_FILETYPE_CNT + 1 ));
+    return;
+  }
+  #[ $DBG ] && echo "${PFX} > File /type/ check, found '$INP_FILE_TYPE___SHORT' ($cmd_str)... PASSED!"
+  #
+
+  if [ "$WHAT" = "trigger-OCR" ]; then
+    case "$fn_last_suffix" in [pP][dD][fF]) 
+      pdfinfo="$( [ $DBG ] || exec 2>/dev/null; "$c_pdfinfo" "$fp")" || err 062 "Failed to run '$c_pdfinfo' '$fp'"
+      prod="$( echo "$pdfinfo"|grep "^Producer:"|sed -n 's/^Producer:[[:space:]]*//p' )"
+      encr="$( echo "$pdfinfo"|grep "^Encrypted:"|sed -n 's/^Encrypted:[[:space:]]*//p' )"
+      [ "$encr" = "no" ] && encrypted="" && details=" (Producer: '$prod', unencrypted)" || { encrypted=1; details=" (Producer: '$prod', encrypted[$encr])"; }
+      ;;
+      *) details="";;
+    esac
+  else
+    details=""
+  fi
+  [ $VRB ] && echo "$$| >>> [$WHAT]    > Got file $cnt'$fp'$details"
+  [ $DBG ] && echo "${PFX}      --> pdfinfo:$NL$(echo "$pdfinfo"|sed -e "s/^/$PFX             | /")" \
+           && echo "${PFX}      --> real_fp == '$real_fp'" \
+           && echo "${PFX}      --> '$DBG_GOTTEN_FILES_FILELIST$WHAT': #$(( $(cat "$DBG_GOTTEN_FILES_FILELIST$WHAT"|wc -l) + 0 )) lines (files)."
+
+  [ -e "$real_fp" ] || err 073 "Did NOT find realpath '$real_fp' (of provided filename '$fp')."
+
+  case "$WHAT" in
+    part-1)
+      cut -f2 "$QUEUED_FILE_MOVES_LOG"|grep -qFx "$real_fp"  || err 112 "Did NOT find PDF file '$real_fp' (realpath of '$fp') (in 2nd tab-separated column = S_fp) of QUEUED_FILE_MOVES_LOG:${NL}${NL}'$QUEUED_FILE_MOVES_LOG':${NL}$(cat "$QUEUED_FILE_MOVES_LOG")${NL}${NL}Should not be."
+
+      #do_health_check "$real_fp" "$S_EXPECTED_FILE_TYPE___REGEX" "$S_HEALTH_CHECK___MAX_REPEAT" "$expected_path" # <<< Don't do it here as it's done with trigger-OCR !!
+      #echo; echo "MUHKUH echo fp='$fp':"; echo "$fp"|hexdump -v -b -c >/tmp/hexdump.$WHAT.fp.2.echo; echo
+      #echo; echo "MUHKUH printf fp='$fp':"; printf "%s\n" "$fp"|hexdump -v -b -c >/tmp/hexdump.$WHAT.fp.2.printf; echo
+      echo "$fp" >>"$OCRAPP_LOCKFILE" || err 014 "Failed to echo fp '$fp' into \"$OCRAPP_LOCKFILE\"' (OCRAPP_LOCKFILE)."
+      ;;
+    trigger-OCR)
+      if [ $encrypted ]; then
+        if echo "$fn"|grep -q "___encrypted.[pP][dD][fF]$"; then
+          IGNORED_CNT=$(( $IGNORED_CNT + 1 ));
+          [ -n "$DBG$VRB" ] && echo "${VRBPFX}File encrypted, but ends with '___encrypted[pP][dD][fF]'. So we'll silently IGNORE it (#$IGNORED_CNT)."
+          return
+        fi
+        [ -n "$DBG$VRB" ] && echo "${VRBPFX}WARNING: File encrypted. We'll collect it in '$ENCRYPTED_PDFS_FILELIST' and IGNORE it (#$ENCRYPTED_CNT)!"
+        echo "$real_fp">>"$ENCRYPTED_PDFS_FILELIST"
+        ENCRYPTED_CNT=$(( $ENCRYPTED_CNT + 1 ));
+        return
+      fi
+
+      # CONTAINS, not equals: a document tagged in place reads
+      # "FineReader (my-ocr: no text found -- original kept)". verify_ocr_result
+      # has always asked this question as a contains-match; the two sites
+      # disagreed, and an exact match here would re-OCR every tagged document
+      # for ever.
+      if case "$prod" in *"$OCRAPP_PRODUCER_TAG"*) true ;; *) false ;; esac; then
+        [ $DBG ] && echo "${PFX}      File was already OCRed by Producer '$OCRAPP_PRODUCER_TAG' !!"
+        if [ $FORCE_OCR ]; then
+          [ $VRB ] && echo "${VRBPFX}WARNING: File already OCRed. But due to --force parameter, we'll RE-OCR!"
+        else
+          [ $VRB ] && echo "${VRBPFX}WARNING: File already OCRed. Without --force parameter, we'll IGNORE it!"
+          ALREADY_OCRED_CNT=$(( $ALREADY_OCRED_CNT + 1 ));
+          return
+        fi
+      fi
+
+      # 2nd parameter == EXPECTED_FILE_TYPE___REGEX : as we checked already above we set that to "" here!
+      do_health_check "$fp" "" "$S_HEALTH_CHECK___MAX_REPEAT" "$expected_path" "$INP_FILE_TYPE___SHORT" || err 030 "Failed to run do_health_check(). Should not be."
+
+      fn_without_last_suffix="${fn%.*}" # eg wihout .gz in bla.tar.gz
+
+      # as we stripped off the PATH, $fn might exist multiple times --> we'll add a counter to ANY file under ;)
+      local _i=1; while [ 1 ]; do S_fn_base="$fn_without_last_suffix.#$_i"; [ ! -e "$TMP_PRE_INP_PATH/$S_fn_base.$fn_last_suffix" ] && break; _i=$(( $_i + 1 )); done
+
+      # Determine the entries in QUEUED_FILE_MOVES_LOG:
+      #   <original filename ($fp)>\t<filename-under,ocr.in>\t<filename-under,ocr.out>\t<final-filename(realpath)>
+      S_fp="$S_PATH/$COLLECT_INP_PATH/$S_fn_base.$fn_last_suffix" # <<< "../$COLLECT_INP_PATH/.." as we will move TMP_PATH (TMP_PRE_INP_PATH) into S_PATH to trigger --part-1
+      T_fp="$T_PATH/$S_fn_base.$OCRAPP_OUTPUT_SUFFIX"
+
+      [ $DBG ] && echo "${PFX}      --> S_fp='$S_fp'" \
+               && echo "${PFX}      --> T_fp='$T_fp'";
+
+      new_entry="$fp\t$S_fp\t$T_fp\t$real_fp"
+
+      if grep -q "^$new_entry$" "$QUEUED_FILE_MOVES_LOG"; then
+        err 102 "'$new_entry' is already in QUEUED_FILE_MOVES_LOG '$QUEUED_FILE_MOVES_LOG'. Should not be."
+      elif grep -q "\t$real_fp$" "$QUEUED_FILE_MOVES_LOG"; then
+        err 103 "Duplicate PDF input file found! ('\\t$real_fp\$' (== realpath of '$fp') is already in QUEUED_FILE_MOVES_LOG '$QUEUED_FILE_MOVES_LOG'). Should not be."
+      else
+        echo "$new_entry">>"$QUEUED_FILE_MOVES_LOG" || err 038 "FAILED [$?] to append '$new_entry' to QUEUED_FILE_MOVES_LOG '$QUEUED_FILE_MOVES_LOG'. Should not be."
+        [ $DBG ] && echo "${PFX}   ~ Appended '$new_entry' to QUEUED_FILE_MOVES_LOG '$QUEUED_FILE_MOVES_LOG'."
+      fi
+
+      cp "$real_fp" "$TMP_PRE_INP_PATH/$S_fn_base.$fn_last_suffix" || err 032 "Failed to copy '$real_fp' to TMP_PATH '$TMP_PRE_INP_PATH/$S_fn_base.$fn_last_suffix' (TMP_PRE_INP_PATH/S_fn_base.fn_last_suffix).$NL${NL}ls TMP_PRE_INP_PATH:${NL}$(ls -la "$TMP_PRE_INP_PATH/"|sed -e "s/^/    | /")$NL${NL}Should not be."
+
+      TOTAL_FILES2OCR_CNT=$(( $TOTAL_FILES2OCR_CNT + 1 ));
+      ;;
+
+     *) err 096;;
+  esac
+}
+
+
+# The one way an alert leaves my-ocr, shared by alert_stuck and --test-mail so
+# that a passing test says something about the real alerts. ONE my-notify call
+# does both a notification and a mail; '--mail' ends the '--' parameter list.
+# stderr is NOT redirected: if my-notify cannot alert, that belongs in the log
+# -- it is the one failure we must not lose. Returns my-notify's exit status.
+send_alert() { # $1 = subject, $2 = notification text, $3 = mail body
+  "$my_notify" -- "$1" "$2" --mail "$1" "$3"
+}
+
+# Three channels, because each one alone can be missed: a notification for
+# whoever is at the machine, a mail for whoever is not, and a file on the
+# Desktop that is still there tomorrow.
+# Every alert of a run belongs to ONE incident: STUCK, then RETRYING, then
+# either FAILED (the run ends with an error) or RESOLVED (see alert_resolved).
+# AS_MARKERS collects this run's marker files, so a resolved incident can take
+# its markers off the Desktop again.
+AS_MARKERS=""
+alert_stuck() { _as_m="$1"; _as_s="${2:-my-ocr STUCK}"
+  echo "$$| >>> [trigger-OCR] !!! $_as_m"
+
+  # $(cat ...) is the portable slurp; $(<file) yields an EMPTY string in dash.
+  send_alert "$_as_s" "$_as_m" "$_as_m
+
+still queued in '$QUEUED_FILE_MOVES_LOG':
+$(cat "$QUEUED_FILE_MOVES_LOG")" \
+    || echo "$$| >>> [trigger-OCR] WARNING: my-notify failed [$?] -- the alert may not have been delivered!"
+
+  # ',,' floats it to the top of the Desktop listing, which is the point.
+  # ONE marker per incident: the first alert creates it, every later one of
+  # the same run adds its line, so the file reads as the incident's timeline.
+  if [ -n "$AS_MARKERS" ]; then
+    _as_f="${AS_MARKERS%%"$NL"*}"
+    if { echo; echo "$(date +%H:%M:%S) $_as_s"; echo "$_as_m"; } >> "$_as_f"; then
+      echo "$$|     added to marker '$_as_f'"
+    else
+      echo "$$|     WARNING: could not add to marker '$_as_f'"
+    fi
+    return 0
+  fi
+  _as_f="$STUCK_MARKER_DIR/,,my-ocr.STUCK.$(date +%Y-%m-%d_%H%M.%S).txt"
+  if { echo "$(date +%H:%M:%S) $_as_s"; echo "$_as_m"; echo; echo "still queued:"; cat "$QUEUED_FILE_MOVES_LOG"; } > "$_as_f"; then
+    echo "$$|     wrote marker '$_as_f'"
+    AS_MARKERS="$_as_f$NL"
+  else
+    echo "$$|     WARNING: could not write marker '$_as_f'"
+  fi
+}
+
+# The incident is over and nothing is left to do: ONE mail that says so, and
+# this run's markers go to the Trash -- a marker is there to be acted on, and a
+# resolved one only teaches you to ignore the next. Nothing when nothing alerted.
+alert_resolved() { # $1 = what ended it
+  [ -n "$AS_MARKERS" ] || return 0
+  _ar_n=0; _ar_left=""
+  while IFS= read -r _ar_f; do
+    [ -n "$_ar_f" ] || continue
+    if trash_by_mv "$_ar_f"; then _ar_n=$(( _ar_n + 1 )); else _ar_left="$_ar_left '$_ar_f'"; fi
+  done <<_EOAR_
+$AS_MARKERS
+_EOAR_
+  _ar_m="RESOLVED: $1 [$_ar_n marker(s) moved to the Trash${_ar_left:+; could not move:$_ar_left}]"
+  echo "$$| >>> [trigger-OCR] $_ar_m"
+  send_alert "my-ocr RESOLVED" "$_ar_m" "$_ar_m" \
+    || echo "$$| >>> [trigger-OCR] WARNING: my-notify failed [$?] -- the RESOLVED mail may not have been delivered!"
+  AS_MARKERS=""
+}
+
+# Nobody watches FineReader while my-ocr drives it. After a crash, macOS asks at
+# the next launch whether to reopen its windows, and until someone answers,
+# FineReader does nothing and the run waits on it. With window restore off for
+# the app there is no such dialog. Read first, write only when it differs, so
+# the run after a run changes nothing and prints nothing.
+ocrapp_no_window_restore() {  # <defaults domain>
+  _nw_was="$(/usr/bin/defaults read "$1" ApplePersistenceIgnoreState 2>/dev/null)" || _nw_was="unset"
+  [ "$_nw_was" = "1" ] && return 0
+  /usr/bin/defaults write "$1" ApplePersistenceIgnoreState -bool YES \
+    || err 157 "defaults write '$1' ApplePersistenceIgnoreState -bool YES"
+  echo "$$| >>> [trigger-OCR] $OCRAPP_NAME: window restore off (was: $_nw_was)"
+}
+
+# FineReader's "Split facing pages" (ImportSplitFacingPages), set to what the
+# config says -- the Automator step has no control for it and inherits the
+# app's preference. Enforced at EVERY run, so a change made in FineReader's own
+# preferences is put back, and said so. Only while FineReader is NOT running: a
+# running app writes its own value back when it quits, and reads it at launch.
+ocrapp_split_facing_pages() {  # <defaults domain>
+  case "$OCRAPP_SPLIT_FACING_PAGES" in 0) _sf_want=0;; 1) _sf_want=1;; *) export_config_check;; esac
+  _sf_was="$(/usr/bin/defaults read "$1" ImportSplitFacingPages 2>/dev/null)" || _sf_was="unset"
+  [ "$_sf_was" = "$_sf_want" ] && return 0
+  if pgrep -x "$OCRAPP_NAME" >/dev/null 2>&1; then
+    echo "$$| >>> [trigger-OCR] $OCRAPP_NAME is running -- split facing pages stays '$_sf_was' this run (config wants $_sf_want)"
+    return 0
+  fi
+  [ "$_sf_want" = "1" ] && _sf_b=YES || _sf_b=NO
+  /usr/bin/defaults write "$1" ImportSplitFacingPages -bool "$_sf_b" \
+    || err 167 "defaults write '$1' ImportSplitFacingPages -bool $_sf_b"
+  [ "$_sf_want" = "1" ] && _sf_s=on || _sf_s=off
+  echo "$$| >>> [trigger-OCR] $OCRAPP_NAME: split facing pages $_sf_s (was: $_sf_was) [OCRAPP_SPLIT_FACING_PAGES=$_sf_want]"
+}
+
+# The OTHER dialog. ocrapp_no_window_restore silences macOS's "reopen windows?";
+# this clears what makes FineReader ask its own "recover the Untitled document?".
+# Both block an unattended run for ever, and a kill -- including my-ocr's own
+# recovery from a stuck run -- is what creates them.
+#
+# The call is decided at BATCH level because that is the only level the evidence
+# exists at: _FRBatch.pac names the source of every page, while nothing inside a
+# page directory says where it came from. So the document goes only when EVERY
+# /Users/ path it references lies under my-ocr's own staging -- then it is this
+# tool's unfinished work and nobody loses anything. A single foreign path, or a
+# batch file that cannot be read, means a person may have opened a document
+# here: say so and leave it. The dialog then blocks the run and the operator is
+# told why, which is the better failure -- deleting someone's pages on a guess
+# is not recoverable, a blocked run is.
+# What THIS run got OCRed. The classes must add up to what this run handed to
+# the OCR -- and they can fail to: left_cnt is read from the queue log, which
+# still holds the lines of a run that DIED, so the subtraction goes negative and
+# the summary printed "-2/0 files were SUCCESSFULLY OCRed". That is not a count,
+# it is a contradiction, and the code had both halves in hand to notice it.
+# Prints the count, or "MISMATCH <n>" with how many queued lines cannot be ours.
+ocr_ok_cnt() { # $1 = handed to the OCR this run, $2 = still queued
+  if [ "$2" -gt "$1" ]; then printf 'MISMATCH %s\n' "$(( $2 - $1 ))"
+  else printf '%s\n' "$(( $1 - $2 ))"; fi
+}
+
+# Total CPU time the OCR app has consumed, in whole seconds, across all its
+# pids. "ps -o time" is a CUMULATIVE counter, unlike "%cpu" which on BSD is a
+# decaying average and reads 0.0 for an app that was busy moments ago -- the
+# average would call a working app idle. A counter that does not advance is
+# evidence; an average is a guess.
+# Reads "ps -o time=" lines on stdin (MM:SS.ss or HH:MM:SS) and prints the
+# total in HUNDREDTHS of a second. Hundredths, not seconds: an app doing a
+# little work every minute would hold the same whole-second value for a while
+# and look frozen, and calling a working app frozen is the expensive mistake.
+cpu_from_ps() {
+  awk -F: '{ n=NF; s=0; m=1; for (i=n; i>0; i--) { s += $i * m; m *= 60 } t += s }
+           END { printf "%d\n", (t*100)+0.5 }'
+}
+
+# EVERY process of the OCR app, not only the one that carries its name: the
+# recognition itself runs in separate helper processes inside the same bundle
+# ('FineExec'), and while those grind at 100% the named process sits idle. The
+# match is anchored at the bundle path so a command line that merely MENTIONS
+# it -- a grep, an ssh, this script's own diagnostics -- is not counted.
+#
+# The optional quote is not cosmetic: FineReader launches its helpers with an
+# argv[0] that BEGINS with a literal '"', so a match anchored at the bare path
+# finds none of them. That shipped once, because the test spawned its helper
+# through a symlink and so never reproduced the quoting the real app uses.
+ocrapp_all_pids() {
+  { pgrep -x "$OCRAPP_NAME" 2>/dev/null
+    [ -n "$OCRAPP_PATH" ] && pgrep -f "^[\"']?$OCRAPP_PATH/" 2>/dev/null
+  } | sort -un
+}
+
+ocrapp_cpu_secs() {
+  _cs_p="$(ocrapp_all_pids | tr '\n' ',' | sed 's/,$//')"
+  [ -n "$_cs_p" ] || { printf '0\n'; return 0; }
+  ps -o time= -p "$_cs_p" 2>/dev/null | cpu_from_ps
+}
+
+# CLOSE the OCR app, do not kill it. 'pkill' sends SIGTERM, and a Cocoa app
+# does not run its quit path on a signal: macOS records an ABNORMAL exit, so
+# the user gets "FineReader quit unexpectedly", the half-built document is left
+# behind, and the NEXT launch stops on a recovery dialog nobody answers. In
+# other words my-ocr's own tidy-up planted the thing that blocks its next run.
+# An AppleScript 'quit' runs the app's real shutdown: documents are closed, no
+# crash is recorded, nothing is left to recover.
+#
+# Escalation, because a hung app must not block the queue for ever: quit ->
+# TERM -> KILL, each given time to work, and EVERY step past the first says so,
+# since those are the ones that leave a dialog behind.
+ocrapp_quit() {
+  _q_p="$(pgrep -x "$OCRAPP_NAME" 2>/dev/null | xargs echo)"
+  [ -n "$_q_p" ] || return 0
+  osa_run <<_EOQUIT_ >/dev/null 2>&1
+tell application id "$OCRAPP_BUNDLE_ID" to quit
+_EOQUIT_
+  _q_w=0
+  while [ "$_q_w" -lt 20 ]; do
+    pgrep -x "$OCRAPP_NAME" >/dev/null 2>&1 || {
+      echo "$$| >>> [$WHAT] closed $OCRAPP_NAME (pid(s) $_q_p) -- quit cleanly after ${_q_w}s"
+      return 0
+    }
+    sleep 1; _q_w=$(( _q_w + 1 ))
+  done
+  echo "$$| >>> [$WHAT] WARNING :: $OCRAPP_NAME (pid(s) $_q_p) did not answer 'quit' in ${_q_w}s -- sending TERM (this leaves a crash dialog)"
+  pkill -x "$OCRAPP_NAME" 2>/dev/null
+  _q_w=0
+  while [ "$_q_w" -lt 10 ]; do
+    pgrep -x "$OCRAPP_NAME" >/dev/null 2>&1 || {
+      echo "$$| >>> [$WHAT] $OCRAPP_NAME ended on TERM"; ocrapp_reap_helpers; return 0; }
+    sleep 1; _q_w=$(( _q_w + 1 ))
+  done
+  echo "$$| >>> [$WHAT] WARNING :: $OCRAPP_NAME (pid(s) $_q_p) survived TERM -- sending KILL"
+  pkill -9 -x "$OCRAPP_NAME" 2>/dev/null
+  ocrapp_reap_helpers
+  return 0
+}
+
+# The bundle's helper processes do NOT go away with their parent: two 'FineExec'
+# processes outlived a TERMed app by 20 minutes at 100% cpu each, re-parented to
+# launchd, with nothing left to hand their result to. They are only reaped once
+# the named process is gone, so a running app's helpers are never touched.
+ocrapp_reap_helpers() {
+  pgrep -x "$OCRAPP_NAME" >/dev/null 2>&1 && return 0
+  _rh_p="$(ocrapp_all_pids | xargs echo)"
+  [ -n "$_rh_p" ] || return 0
+  echo "$$| >>> [$WHAT] $OCRAPP_NAME is gone but its helper(s) $_rh_p are still running -- ending them"
+  for _rh_i in $_rh_p; do kill "$_rh_i" 2>/dev/null; done
+  _rh_w=0
+  while [ "$_rh_w" -lt 10 ]; do
+    [ -z "$(ocrapp_all_pids)" ] && { echo "$$| >>> [$WHAT] helper(s) ended after ${_rh_w}s"; return 0; }
+    sleep 1; _rh_w=$(( _rh_w + 1 ))
+  done
+  _rh_p="$(ocrapp_all_pids | xargs echo)"
+  echo "$$| >>> [$WHAT] WARNING :: helper(s) $_rh_p survived TERM -- sending KILL"
+  for _rh_i in $_rh_p; do kill -9 "$_rh_i" 2>/dev/null; done
+  return 0
+}
+
+# The Folder Actions dispatcher can WEDGE: alive, every attachment intact and
+# enabled, and launching nothing -- which no check of the attachments can see.
+# launchd starts a new one on demand, so ending it IS the restart. TERM first,
+# KILL only if it ignores that (the Automator runners on ada ignored TERM).
+# Leaves what it saw in _fa_ev, so the caller can print the evidence.
+fa_dispatcher_restart() {
+  _fa_old="$(pgrep -x "$FA_DISPATCHER_NAME" 2>/dev/null | head -n 1)"
+  if [ -z "$_fa_old" ]; then
+    _fa_ev="no $FA_DISPATCHER_NAME was running"
+  else
+    _fa_age="$(ps -o etime= -p "$_fa_old" 2>/dev/null | tr -d ' ')"
+    kill "$_fa_old" 2>/dev/null
+    _fa_w=0
+    while [ "$_fa_w" -lt 5 ] && kill -0 "$_fa_old" 2>/dev/null; do sleep 1; _fa_w=$(( _fa_w + 1 )); done
+    kill -0 "$_fa_old" 2>/dev/null && kill -9 "$_fa_old" 2>/dev/null
+    _fa_ev="pid $_fa_old, up ${_fa_age:-?}, ended"
+  fi
+  _fa_w=0; _fa_new=""
+  while [ "$_fa_w" -lt "${FA_RESTART_WAIT:-10}" ]; do
+    _fa_new="$(pgrep -x "$FA_DISPATCHER_NAME" 2>/dev/null | head -n 1)"
+    [ -n "$_fa_new" ] && [ "$_fa_new" != "$_fa_old" ] && break
+    _fa_new=""; sleep 1; _fa_w=$(( _fa_w + 1 ))
+  done
+  if [ -n "$_fa_new" ]; then
+    _fa_ev="$_fa_ev -> new pid $_fa_new"; return 0
+  fi
+  _fa_ev="$_fa_ev -> no new one came up in ${FA_RESTART_WAIT:-10}s"
+  return 1
+}
+
+# A leftover FineReader killed EARLY names no path yet -- its batch file holds
+# fragments only -- but it already holds a COPY of each page source it was
+# handed (the '.source' files). When every one of them is byte-identical to a
+# document in this run's staging, the leftover holds nothing but our own
+# copies. Seen on the scan host: a stall killed FineReader seconds into a
+# document, the cleaner refused its leftover, and the retry sat on the
+# recovery dialog that leftover raised.
+leftover_sources_are_ours() { # $1 = leftover directory
+  [ -n "$COLLECT_INP_PATH" ] || return 1          # no staging of this run to compare with
+  _so_n=0
+  for _so_s in "$1"/*.source; do
+    [ -f "$_so_s" ] || continue
+    _so_m=""
+    for _so_d in "$S_PATH/$COLLECT_INP_PATH"/* "$TMP_PRE_INP_PATH"/*; do
+      [ -f "$_so_d" ] && cmp -s "$_so_s" "$_so_d" && { _so_m=1; break; }
+    done
+    [ -n "$_so_m" ] || return 1                   # one source that is not ours: not ours
+    _so_n=$(( _so_n + 1 ))
+  done
+  [ "$_so_n" -gt 0 ]
+}
+
+ocrapp_clear_stale_batch() { # $1 = staging prefix (nothing outside it is ours)
+  _sb_stage="$1"
+  # never touch a document while the app that owns it is running
+  [ -n "$(pgrep -x "$OCRAPP_NAME" 2>/dev/null)" ] && return 0
+  for _sb_d in "$OCRAPP_DOCSTORE_BASE/$OCRAPP_BUNDLE_ID"*/Untitled.FR*; do
+    [ -d "$_sb_d" ] || continue
+    _sb_pac="$_sb_d/_FRBatch.pac"
+    if [ ! -r "$_sb_pac" ]; then
+      echo "$$| >>> [trigger-OCR] $OCRAPP_NAME: leftover '$_sb_d' has no readable batch file -- LEFT ALONE (it may be a document of yours; its recovery dialog will block the run)"
+      continue
+    fi
+    # Binary file: one token per printable run, then take each token from its
+    # first '/' -- the format writes a length byte in front of the path.
+    # LC_ALL=C because tr refuses binary input in a UTF-8 locale ("Illegal byte
+    # sequence"), and a tr that fails yields NO paths, which reads exactly like
+    # "nothing maps this to us" -- the cleaner would refuse for ever and look
+    # like it was working. Every ABSOLUTE path counts, not just /Users/ ones:
+    # the staging prefix decides what is ours, so nothing else may be assumed.
+    #
+    # The parse also yields FRAGMENTS -- '/', '/Users', '/5K', '/g\',
+    # '/me/Public/,ocr.i' -- because a path stored behind a length byte is seen
+    # from its inner slashes too. Requiring EVERY extracted string to be under
+    # staging therefore refuses for ever, and that is not hypothetical: a
+    # leftover blocked two consecutive runs while this cleaner reported nothing
+    # amiss. So ask the question of the strings that can answer it. A reference
+    # to a document of YOURS exists as a FILE; a fragment exists as nothing, and
+    # '/' and '/Users' are directories. Hence: at least one path under staging
+    # (it is ours), and no existing FILE outside it (nothing of yours is in it).
+    _sb_paths="$(LC_ALL=C tr -c '[:print:]' '\n' <"$_sb_pac" | sed -n 's|^[^/]*\(/.*\)$|\1|p' | sort -u)"
+    if [ -z "$_sb_paths" ] && ! leftover_sources_are_ours "$_sb_d"; then
+      echo "$$| >>> [trigger-OCR] $OCRAPP_NAME: leftover '$_sb_d' names no source at all -- LEFT ALONE (nothing maps it to this tool)"
+      continue
+    fi
+    _sb_foreign=""; _sb_n=0; _sb_mine=0; _sb_why=""
+    while IFS= read -r _sb_p; do
+      [ -n "$_sb_p" ] || continue
+      _sb_n=$(( _sb_n + 1 ))
+      case "$_sb_p" in
+        "$_sb_stage"/*) _sb_mine=$(( _sb_mine + 1 )); continue ;;
+      esac
+      [ -f "$_sb_p" ] && { _sb_foreign="$_sb_p"; break; }
+    done <<_EOSB_
+$_sb_paths
+_EOSB_
+    if [ -n "$_sb_foreign" ]; then
+      echo "$$| >>> [trigger-OCR] $OCRAPP_NAME: leftover '$_sb_d' holds '$_sb_foreign', a file outside my-ocr's staging -- LEFT ALONE (it is a document of yours)"
+      continue
+    fi
+    if [ "$_sb_mine" -eq 0 ]; then
+      if leftover_sources_are_ours "$_sb_d"; then
+        _sb_why="its $_so_n page source(s) are byte-identical copies of this run's staged document(s), 0 file(s) of yours"
+      else
+        echo "$$| >>> [trigger-OCR] $OCRAPP_NAME: leftover '$_sb_d' names no path under '$_sb_stage' -- LEFT ALONE (nothing maps it to this tool) [$_sb_n path(s)]"
+        continue
+      fi
+    fi
+    if [ -n "$c_trash" ] && [ -x "$c_trash" ]; then
+      if "$c_trash" -- "$_sb_d" >/dev/null 2>&1; then
+        echo "$$| >>> [trigger-OCR] $OCRAPP_NAME: cleared leftover document [${_sb_why:-$_sb_mine of $_sb_n path(s) from staging, 0 file(s) of yours}] -- trashed '$_sb_d'"
+      else
+        echo "$$| >>> [trigger-OCR] $OCRAPP_NAME: WARNING could not trash leftover '$_sb_d' -- its recovery dialog may block the run"
+      fi
+    else
+      echo "$$| >>> [trigger-OCR] $OCRAPP_NAME: WARNING no trash command -- leftover left at '$_sb_d'"
+    fi
+  done
+}
+
+do_trigger_ocr() {
+
+  # Same reasoning as setup: as root every path is /Users/root/... and the
+  # Automator round trip happens in a session that is not the GUI one.
+  if [ "$(id -u)" = "0" ]; then
+    _t_gui="$(/usr/bin/stat -f%Su /dev/console 2>/dev/null)"
+    err 135 "trigger-OCR as root uses '/Users/$WHOAMI/...' and root's login
+session, so AUTOMATOR will never run. Use:  su - ${_t_gui:-<console user>} -c '$US ...'"
+  fi
+
+  ### --trigger-ocr (0)
+  [ $DBG ] && x="(0) " || x="";
+  PFX="$$|   ~ [trigger-OCR] ${x}"
+  # Check if we are already running / past run ?!:
+  # Take the OCR mutex and WAIT for our turn. Only one FineReader run can
+  # exist at a time -- one GUI app, one Automator wiring -- so every caller
+  # queues here instead of each one having to arrange not to collide.
+  local _mi=0; local _mo=""; local _mp=""
+  until mkdir "$OCRAPP_MUTEX_DIR" 2>/dev/null; do
+    _mo="$(cat "$OCRAPP_MUTEX_DIR/owner" 2>/dev/null)"
+    _mp="${_mo#pid=}"; _mp="${_mp%% *}"
+    # Break ONLY a provably dead owner, and never silently: a long OCR is not
+    # a crashed one, and an owner file not yet written is not an absent owner.
+    if [ -n "$_mp" ] && ! kill -0 "$_mp" 2>/dev/null; then
+      echo "$$| >>> [trigger-OCR] ${x}Breaking stale OCR mutex: owner $_mp is gone ($_mo)"
+      rm -f "$OCRAPP_MUTEX_DIR/owner"; rmdir "$OCRAPP_MUTEX_DIR" 2>/dev/null
+      continue
+    fi
+    [ $_mi -eq 0 ] && echo "$$| >>> [trigger-OCR] ${x}$OCRAPP_NAME is busy (${_mo:-another my-ocr}) -- waiting (max ${OCRAPP_MUTEX_TIMEOUT}s) for our turn..."
+    _mi=$(( $_mi + 1 ));
+    [ "$_mi" -gt "$OCRAPP_MUTEX_TIMEOUT" ] && err 129 "TIMEOUT [${_mi}s] waiting for the OCR mutex '$OCRAPP_MUTEX_DIR' (held by ${_mo:-unknown})."
+    sleep 1
+  done
+  WE_HOLD_OCRAPP_MUTEX=1
+  printf 'pid=%s at=%s\n' "$$" "$(date -u +%FT%TZ)" > "$OCRAPP_MUTEX_DIR/owner"
+  [ $DBG ] && echo "${PFX}Took the OCR mutex '$OCRAPP_MUTEX_DIR' after ${_mi}s."
+
+  # The run before us may be gone while its work is not. Wait for that work
+  # and repair what it left, before we create a single file of our own.
+  preflight_dead_queue || err 047 "The run before this one is gone, but its work is still going after ${OCRAPP_TIMEOUT}s -- nothing touched. Check it with '$US status'."
+  [ -s "$QUEUED_FILE_MOVES_LOG" ] && err 177 "Found QUEUED_FILE_MOVES_LOG '$QUEUED_FILE_MOVES_LOG' and could not repair it:
+
+$(cat "$QUEUED_FILE_MOVES_LOG"|sed -e "s/.*/${PFX}        | '&'/")
+
+Should not be."
+
+  # Only now that the turn is OURS do we create working state. Anything set up
+  # while still queueing is state a running instance can trip over -- and its
+  # cleanup can delete.
+  # A crashed run leaves per-run files behind; sweep them before we create
+  # ours, so this run cannot inherit another run's wreckage.
+  self_heal
+
+  # It is per-invocation now, so it MUST be cleaned up: a shared name was
+  # simply reused, a $$ name accumulates one file per run for ever.
+  schedule_for_cleanup "$ENCRYPTED_PDFS_FILELIST"
+  touch "$ENCRYPTED_PDFS_FILELIST" || err 116 "Failed [$?] to create ENCRYPTED_PDFS_FILELIST '$ENCRYPTED_PDFS_FILELIST' (touch, chmod :my-system, chown g-w,o-rwx)"
+  printf "">"$ENCRYPTED_PDFS_FILELIST" || err 077 "Failed [ $?] to erase ENCRYPTED_PDFS_FILELIST (printf "">'$ENCRYPTED_PDFS_FILELIST'). Should not be."
+
+  WE_CREATED_OCRAPP_LOCKFILE=1;
+  schedule_for_cleanup "$OCRAPP_LOCKFILE" # <<< as WE created it --> when we quit, the LOCKFILE should go down with us.
+  touch "$OCRAPP_LOCKFILE" || err 076 "Failed [$?] to create OCRAPP_LOCKFILE '$OCRAPP_LOCKFILE' (touch, chmod :my-system, chown g-w,o-rwx)";
+  [ $DBG ] && echo "${PFX}Created OCRAPP_LOCKFILE '$OCRAPP_LOCKFILE'."
+
+  # to make AUTOMATOR also DBG / FORCE:
+  if [ $DBG ]; then
+    schedule_for_cleanup "$DBG_FLAGFILE"
+    touch "$DBG_FLAGFILE" || err 048 "Failed [$?] to create DBG_FLAGFILE '$DBG_FLAGFILE' (touch, chmod :my-system, chown g-w,o-rwx)";
+    [ $DBG ] && echo "${PFX}Created DBG_FLAGFILE '$DBG_FLAGFILE'."
+  fi
+  # A terminal on ANY of the three streams means a person started this; stdin
+  # is a pipe for 'echo f | my-ocr', and stdout is redirected under --log, so
+  # no single one of them is sufficient.
+  if [ -t 0 ] || [ -t 1 ] || [ -t 2 ]; then
+    schedule_for_cleanup "$INTERACTIVE_FLAGFILE"
+    touch "$INTERACTIVE_FLAGFILE" || err 132 "Failed [$?] to create INTERACTIVE_FLAGFILE '$INTERACTIVE_FLAGFILE'"
+    [ $DBG ] && echo "${PFX}Created INTERACTIVE_FLAGFILE '$INTERACTIVE_FLAGFILE' (started from a terminal)."
+  fi
+
+  if [ $FORCE_ORC ]; then
+    schedule_for_cleanup "$FORCE_FLAGFILE"
+    touch "$FORCE_FLAGFILE" || err 061 "Failed [$?] to create FORCE_FLAGFILE '$FORCE_FLAGFILE' (touch, chmod :my-system, chown g-w,o-rwx)";
+    [ $DBG ] && echo "${PFX}Created FORCE_FLAGFILE '$FORCE_FLAGFILE'."
+  fi
+
+  # Make sure no old PARTx_ERRORED_FLAGFILE is left:
+  [ -e "$PARTx_ERRORED_FLAGFILE" ] && { rm "$PARTx_ERRORED_FLAGFILE" || err 083 "Failed to 'rm \"$PARTx_ERRORED_FLAGFILE\"'"; }
+  # Ours from here on, so it goes down with us -- every successful run left it
+  # behind, empty, and 'reset' found it after each one.
+  schedule_for_cleanup "$PARTx_ERRORED_FLAGFILE"
+  touch "$PARTx_ERRORED_FLAGFILE" || err 027
+
+  touch "$QUEUED_FILE_MOVES_LOG" || err 042 "Failed [$?] to create QUEUED_FILE_MOVES_LOG '$QUEUED_FILE_MOVES_LOG' (touch, chmod :my-system, chown g-w,o-rwx)"
+  [ $DBG ] && echo "${PFX}Created QUEUED_FILE_MOVES_LOG '$QUEUED_FILE_MOVES_LOG'."
+
+
+  ### --trigger-ocr (1) CHECK IF OCRAPP IS ALREADY RUNNING
+  [ $DBG ] && x="(1) " || x="";
+  touch "$OCRAPP_STATEFILE" || err 040 "Failed '$OCRAPP_STATEFILE' (OCRAPP_STATEFILE: touch, chmod :my-system, chown g-w,o-rwx)"
+  local ocrapp_pids="$( pgrep -x "$OCRAPP_NAME"|xargs echo )"
+  [ $DBG ] && echo "$$|  ~~ [trigger-OCR] (1) $OCRAPP_NAME already running? Found PID(s) '$ocrapp_pids'."
+  echo "$ocrapp_pids">"$OCRAPP_STATEFILE" || err 020 "Failed to create OCRAPP_STATEFILE '$OCRAPP_STATEFILE'"
+  [ $DBG ] && echo "$$|  ~~ [trigger-OCR] (1) Wrote found PID(s) to OCRAPP_STATEFILE '$OCRAPP_STATEFILE' (will be removed in step 6 in part-2)."
+  echo "$$| >>> [trigger-OCR] ${x}Created '$OCRAPP_STATEFILE' [pids of '$OCRAPP_NAME': '$ocrapp_pids']"
+  ocrapp_no_window_restore "$OCRAPP_BUNDLE_ID"
+  ocrapp_split_facing_pages "$OCRAPP_BUNDLE_ID"
+  # Helpers of a PREVIOUS run that outlived their app: they hold no document
+  # and answer to nobody, but they do take the cpu this run is about to need
+  # (two of them sat at 100% for twenty minutes). Reaping only on the quit path
+  # never reaches them, because the app that owned them is already gone.
+  ocrapp_reap_helpers
+  ocrapp_clear_stale_batch "$S_PATH"
+
+  [ -t 0 ] && [ $FILELIST_CNT -eq 0 -a $PROVIDED_FILES_CNT -eq 0 ] && err 127 "No <FILES-TO-OCR> provided. Neither as parameters, nor on stdin. Please call with --help for how to use this script.";
+
+  ### --trigger-ocr (2)   COLLECT FILES FOR OCR:
+  #[ -e "$TMP_PRE_INP_PATH" ] && err 107 "TMP_PATH '$TMP_PRE_INP_PATH' (TMP_PRE_INP_PATH) already exists. Should not be." # why not.. ? ;)
+  mkdir -p "$TMP_PRE_INP_PATH" || err 106 "FAILED [$?] creating TMP_PRE_INP_PATH '$TMP_PRE_INP_PATH' (mkdir -p). Should not be."
+
+  ### --trigger-ocr (2) a) PREPARE FILES FROM COMMANDLINE FOR OCR
+  if [ $PROVIDED_FILES_CNT -gt 0 ]; then
+    [ $DBG ] && x="(2) [CLI] " || x="";
+    PFX="$$|   ~ [trigger-OCR] ${x}"
+    VRBPFX="$$|  >  [trigger-OCR]      "
+    [ $VRB ] && echo "$$| >>> [trigger-OCR] ${x}Treating files we got from commandline..."
+    while read fp; do TOTAL_FILES_CNT=$(( $TOTAL_FILES_CNT + 1 )); prepare_file_for_ocr "$fp" "$TOTAL_FILES_CNT" ""; done<<_EOF_
+$(cat "$PROVIDED_FILES_FILELIST")
+_EOF_
+    [ $TOTAL_FILES_CNT -ne $PROVIDED_FILES_CNT ] && err 085 "TOTAL_FILES_CNT='$TOTAL_FILES_CNT' != '$PROVIDED_FILES_CNT'=PROVIDED_FILES_CNT ?!"
+    [ $DBG ] && echo "${PFX}Got '$TOTAL_FILES_CNT' files from commandline"
+  fi
+
+
+  ### --trigger-ocr (2) b) READ FILES FROM STDIN AND PREPARE THEM FOR OCR:
+  # ONLY when no filenames arrived any other way. "stdin is not a tty" does not
+  # mean "stdin has data": from a script, a LaunchDaemon or an ssh session it is
+  # an open pipe nobody ever writes to or closes, and the read below then blocks
+  # FOR EVER -- while holding the OCR mutex, so every other my-ocr queues behind
+  # a process that will never finish. Files on the command line (or --file) are
+  # a complete instruction; there is nothing to wait for.
+  if [ ! -t 0 ] && [ "$PROVIDED_FILES_CNT" -eq 0 ] && [ "$FILELIST_CNT" -eq 0 ]; then
+    [ $DBG ] && x="(2) [STDIN] " || x="";
+    PFX="$$|   ~ [trigger-OCR] ${x}"
+    VRBPFX="$$|  >  [trigger-OCR]      "
+    [ $VRB ] && echo "$$| >>> [trigger-OCR] ${x}Treating files we got from stdin..."
+    stdin_cnt=0; while read fp; do 
+      #echo; echo "MUHKUH $WHAT.stdin.$stdin_cnt: '$fp'"; echo; echo "$fp"|hexdump -v -b -c >/tmp/hexdump.$WHAT.stdin.$stdin_cnt; echo
+      stdin_cnt=$(( $stdin_cnt + 1 )); prepare_file_for_ocr "$fp" "$stdin_cnt" "";
+    done
+    [ $DBG ] && echo "${PFX}Got '$stdin_cnt' files from stdin."
+    TOTAL_FILES_CNT=$(( $TOTAL_FILES_CNT + $stdin_cnt ));
+  fi
+
+
+  ### --trigger-ocr (2) c) PREPARE FILES FROM --FILE PARAM FOR OCR
+  if [ $FILELIST_CNT -gt 0 ]; then
+    [ $DBG ] && x="(2) [--file] " || x="";
+    PFX="$$|   ~ [trigger-OCR] ${x}"
+    VRBPFX="$$|  >  [trigger-OCR]      "
+    [ $VRB ] && echo "$$| >>> [trigger-OCR] ${x}Treating files we got via --file <filelist>..."
+    files_cnt=0;
+    while read fp; do files_cnt=$(( $files_cnt + 1 )); prepare_file_for_ocr "$fp" "$files_cnt" ""; done<<_EOF_
+$(cat "$FILELIST_PARAM")
+_EOF_
+    [ $files_cnt -ne $FILELIST_CNT ] && err 044
+    [ $DBG ] && echo "${PFX}Got '$files_cnt' files from --file '$FILELIST_PARAM'"
+    TOTAL_FILES_CNT=$(( $TOTAL_FILES_CNT + $files_cnt ));
+  fi
+
+
+  [ $TOTAL_FILES_CNT -eq 0 ] && err 006
+  local queued_cnt=$(( $(cat "$QUEUED_FILE_MOVES_LOG"|wc -l) ));
+  if [ $queued_cnt -eq 0 ]; then
+    [ $DBG ] && x="(2)  " || x=""; 
+    if   [ $TOTAL_FILES_CNT -eq $ENCRYPTED_CNT ]; then
+      echo "$$| >>> [trigger-OCR] ${x}ALL of the $TOTAL_FILES_CNT file(s) are ENCRYPTED (see filelist at the end of this script)!"
+    elif [ $TOTAL_FILES_CNT -eq $ALREADY_OCRED_CNT ]; then
+      echo "$$| >>> [trigger-OCR] ${x}ALL of the $TOTAL_FILES_CNT file(s) are ALREADY OCRed!"
+    elif [ $TOTAL_FILES_CNT -eq $IGNORED_CNT ]; then
+      echo "$$| >>> [trigger-OCR] ${x}ALL of the $TOTAL_FILES_CNT file(s) were IGNORED (e.g. directories or files ending '___encrypted.[pP][dD][fF]')!"
+    else
+      echo "$$| >>> [trigger-OCR] ${x}NONE of the $TOTAL_FILES_CNT file(s) can be OCRed -- $TOTAL_FILES_CNT alrady OCRed, $ENCRYPTED_CNT encrypted, $IGNORED_CNT were ignored (dirs, *___encrypted.[pP][dD][fF])!"
+    fi
+    return
+  else
+    [ -s "$ENCRYPTED_PDFS_FILELIST" ] && t=":${NL}$(cat "$ENCRYPTED_PDFS_FILELIST"|while read a; do echo "${PFX}  * \"$a\""; done)" || t=""
+    [ $DBG ] && x="(2)  " || x=""; echo "$$| >>> [trigger-OCR] ${x}$queued_cnt / $TOTAL_FILES_CNT files will be OCRed! -- $WRONG_FILETYPE_CNT wrong file-type, $IGNORED_CNT ignored, $ALREADY_OCRED_CNT already OCRed, $ENCRYPTED_CNT encrypted$t"
+
+    [ $DBG ] && echo "${PFX}Got in total $TOTAL_FILES_CNT files and created QUEUED_FILE_MOVES_LOG '$QUEUED_FILE_MOVES_LOG' with $queued_cnt entries; making sure that all non-OCRED files have an entry there."
+  fi
+
+
+  ### --trigger-ocr (3)
+  [ $VRB ] && echo "$$| >>> [trigger-OCR] (3) Initiating AUTOMATOR_LOG..."
+  PFX="$$|   ~ [trigger-OCR] (3) "
+  if [ -e "$AUTOMATOR_LOG" ]; then
+    mv "$AUTOMATOR_LOG" "${AUTOMATOR_LOG}.bkp" || err 049 "Failed creating backup of last AUTOMATOR_LOG '$AUTOMATOR_LOG'"
+    [ $DBG ] && echo "${PFX}   ~ Moved '$AUTOMATOR_LOG' to '$AUTOMATOR_LOG.bkp'"
+  fi
+  touch "$AUTOMATOR_LOG" || err 051 "Failed '$AUTOMATOR_LOG' (LOG: touch, chmod :my-system, chown g-w,o-rwx)"
+  [ $DBG ] && echo "${PFX}   ~ Touched fresh '$AUTOMATOR_LOG'"
+
+  if [ -z "$LOG" ]; then
+    [ $DBG ] && echo "${PFX}   ~ Listening now to AUTOMATOR_LOG '$AUTOMATOR_LOG'"
+    ( tail -f "$AUTOMATOR_LOG" ) &
+    CLEANUP_PIDS="$CLEANUP_PIDS $!";
+  fi
+
+
+  ### --trigger-ocr (4)
+  [ $VRB ] && echo "$$| >>> [trigger-OCR] (4) Copy all $queued_cnt files we got (and that still need OCR) into INP_PATH '$S_PATH' (via $COLLECT_INP_PATH/)..."
+
+  PFX="$$|   ~ [trigger-OCR] (4) "
+  #
+  [ $DBG ] && printf "${PFX}   ~ Writing 'placing-files' into the LOCKFILE '$OCRAPP_LOCKFILE' to assure that\n${PFX}      the move we are about to issue is completed when part-1 is triggered by AUTOMATOR.\n"
+  printf "placing-files">"$OCRAPP_LOCKFILE" || err 098 "Failed to write 'placing-files' to OCRAPP_LOCKFILE '$OCRAPP_LOCKFILE'"
+  #
+  QUEUED_FILE_MOVES_LOG_CNT=$(( $(cat "$QUEUED_FILE_MOVES_LOG"|wc -l) + 0 )) || err 113
+  TMP_PRE_INP_PATH_CNT=$(( $(ls -1 "$TMP_PRE_INP_PATH/"|wc -l) + 0 )) || err 114
+  [ $QUEUED_FILE_MOVES_LOG_CNT -ne $TMP_PRE_INP_PATH_CNT ] && err 115 "QUEUED_FILE_MOVES_LOG_CNT='$QUEUED_FILE_MOVES_LOG_CNT' TMP_PRE_INP_PATH_CNT='$TMP_PRE_INP_PATH_CNT'"
+  [ $DBG ] && echo "${PFX}   ~ Collected all '$QUEUED_FILE_MOVES_LOG_CNT' file(s) to OCR (cat "$QUEUED_FILE_MOVES_LOG"|cut -f4):
+$(cat "$QUEUED_FILE_MOVES_LOG"|cut -f4|sed -e "s/.*/${PFX}     | '&'/")
+${PFX}     into TMP_PATH '$TMP_PRE_INP_PATH' (TMP_PRE_INP_PATH with '$TMP_PRE_INP_PATH_CNT' files):
+$(ls -la "$TMP_PRE_INP_PATH/"|sed -e "s/.*/${PFX}     | '&'/")
+"
+
+  mv "$TMP_PRE_INP_PATH_REALPATH" "$S_PATH/" || err 108 "FAILED [$?] moving '$COLLECT_INP_PATH' into INP_PATH (mv '$TMP_PRE_INP_PATH_REALPATH' '$S_PATH/'). Should not be."
+  [ $DBG ] && echo "${PFX}   ~ Moved '$TMP_PRE_INP_PATH_REALPATH' into '$S_PATH' to trigger OCR via AUTOMATOR -- ls INP_PATH:
+$(ls -la "$S_PATH"|sed -e "s/^/${PFX}     | /")"
+  #
+  [ $DBG ] && echo "${PFX}   ~ Now we empty the LOCKFILE '$OCRAPP_LOCKFILE', to assure part-1 (0) does not wait (any longer)."
+  printf "">"$OCRAPP_LOCKFILE" || err 099 "Failed to empty OCRAPP_LOCKFILE '$OCRAPP_LOCKFILE'"
+
+
+  ### --trigger-ocr (5)
+  PFX="$$|   ~ [trigger-OCR] (5) "
+  [ $VRB ] && x="(5) " || x=""
+  echo "$$| >>> [trigger-OCR] ${x}Waiting for AUTOMATOR/$OCRAPP_NAME (no time limit while it is working)"
+  # A clock says nothing about $OCRAPP_NAME: when one expires it may still be
+  # mid-OCR, and releasing the lock then lets a SECOND $OCRAPP_NAME start.
+  # So the wait ends on EVIDENCE, and only one piece of evidence is
+  # conclusive -- that $OCRAPP_NAME is not running at all.
+  local i=0; local stalled=0; local last_q=""; local next_alert=$STALL_ALERT_AFTER
+  local _cpu_was=""; local _cpu_still=0; local _cpu_busy=""
+  local _fr_seen=""; local _nudged=""; local _tw=0; local _fa_restarted=""; _fa_ev=""
+  local _retried=""; local _retry_done=""   # attempted / actually handed over again
+  while [ -s "$QUEUED_FILE_MOVES_LOG" ]; do
+
+    if [ -s "$PARTx_ERRORED_FLAGFILE" ]; then
+      schedule_for_cleanup "$PARTx_ERRORED_FLAGFILE"
+      tmp="PARTx_ERRORED_FLAGFILE '$PARTx_ERRORED_FLAGFILE' appeared.$NL${NL}AUTOMATOR --part-1 /or/ --part-2 of this script seemed to have failed:$NL$NL$(cat "$PARTx_ERRORED_FLAGFILE")"
+      [ -z "$IGNORE_PARTx_ERROR" ] && err 066 "$tmp" || echo "$$|   > [trigger-OCR] ${x}WARNING (usually ERROR #066): $tmp"
+    fi
+
+    sleep 1;
+    i=$(( $i + 1 ));
+
+    # Has the OCR app come up at all? Until it has, the hand-over may simply
+    # never have been noticed -- a stall of a run that never started.
+    if [ -z "$_fr_seen" ]; then
+      if pgrep -x "$OCRAPP_NAME" >/dev/null 2>&1; then
+        _fr_seen=1
+      elif [ "${OCRAPP_TRIGGER_WAIT:-0}" -gt 0 ]; then
+        _tw=$(( _tw + 1 ))
+        if [ "$_tw" -ge "$OCRAPP_TRIGGER_WAIT" ] && [ -z "$_nudged" ] \
+           && ! pgrep -f "$US --part-1" >/dev/null 2>&1; then
+          _nudged=1; _tw=0
+          if nudge_handover "$S_PATH/$COLLECT_INP_PATH" "$TMP_PRE_INP_PATH"; then
+            echo "$$| >>> [trigger-OCR] $OCRAPP_NAME had not started ${OCRAPP_TRIGGER_WAIT}s after the hand-over -- made the hand-over again (no file was touched)"
+          else
+            echo "$$| >>> [trigger-OCR] WARNING :: could not re-make the hand-over -- the documents are still in '$S_PATH/$COLLECT_INP_PATH' or '$TMP_PRE_INP_PATH'"
+          fi
+        elif [ "$_tw" -ge "$OCRAPP_TRIGGER_WAIT" ] && [ -n "$_nudged" ] && [ -z "$_fa_restarted" ] \
+             && ! pgrep -f "$US --part-[12]" >/dev/null 2>&1; then
+          # Two hand-overs and nothing fired: the dispatcher itself may be
+          # WEDGED -- alive, attachments intact and enabled, launching nothing.
+          # That held ada for nine hours, and every check said healthy. Restart
+          # it ONCE (a running workflow lives in its own runner and is not
+          # touched) and hand over again.
+          _fa_restarted=1; _tw=0
+          if fa_dispatcher_restart; then
+            echo "$$| >>> [trigger-OCR] nothing fired after two hand-overs -- restarted the Folder Actions dispatcher [$_fa_ev]"
+          else
+            echo "$$| >>> [trigger-OCR] WARNING :: could not restart the Folder Actions dispatcher [$_fa_ev]"
+          fi
+          nudge_handover "$S_PATH/$COLLECT_INP_PATH" "$TMP_PRE_INP_PATH" \
+            || echo "$$| >>> [trigger-OCR] WARNING :: could not re-make the hand-over after the restart"
+        elif [ "$_tw" -ge "$OCRAPP_TRIGGER_WAIT" ] && [ -n "$_fa_restarted" ]; then
+          m="$OCRAPP_NAME never started -- two hand-overs, then a dispatcher restart and a third, and the folder action fired none of them [${_fa_ev:-no restart evidence}]."
+          if _3p_raw="$(automator_3pp_state)"; then
+            m="$m
+Check that Folder Actions are enabled and that '$S_PATH' still has ours attached:  $US setup"
+          else
+            m="$m
+Third-party Automator actions are OFF, and then the workflow is refused before its first step -- $AUTOMATOR_3PP_HOWTO [$_3p_raw]"
+          fi
+          alert_stuck "$m"
+          err 159 "$m${NL}Still queued in '$QUEUED_FILE_MOVES_LOG':${NL}$(cat "$QUEUED_FILE_MOVES_LOG")"
+        fi
+      fi
+    fi
+
+    # progress == the queue shrank since the last look
+    q="$(wc -l < "$QUEUED_FILE_MOVES_LOG" | tr -d ' ')"
+    if [ "$q" != "$last_q" ]; then stalled=0; next_alert=$STALL_ALERT_AFTER
+    else stalled=$(( $stalled + 1 )); fi
+    last_q="$q"
+
+    [ "$stalled" -lt "$STALL_ALERT_AFTER" ] && continue
+
+    ocr_pids="$(ocrapp_all_pids | xargs echo)"
+    if [ -z "$ocr_pids" ]; then
+      # CONCLUSIVE: nothing is running, so nothing can collide -> safe to end.
+      m="$OCRAPP_NAME is NOT running and the queue has not moved for ${stalled}s -- the OCR cannot finish."
+      if [ -z "$_retried" ]; then
+        _retried=1
+        alert_stuck "$m
+Retrying ONCE: the same documents are handed over again." "my-ocr STUCK -- retrying"
+        if retry_stalled_chunk "$QUEUED_FILE_MOVES_LOG_CNT"; then
+          _retry_done=1; stalled=0; last_q=""; next_alert=$STALL_ALERT_AFTER
+          _cpu_was=""; _cpu_still=0; _cpu_busy=""; _fr_seen=""; _tw=0
+          continue
+        fi
+      fi
+      alert_stuck "$m${_retry_done:+ It had already been retried once.}" "my-ocr STUCK -- gave up"
+      err 128 "$m${NL}Still queued in '$QUEUED_FILE_MOVES_LOG':${NL}$(cat "$QUEUED_FILE_MOVES_LOG")"
+    fi
+
+    # Alive but not progressing. It may be grinding a huge scan -- or sitting on
+    # a dialog (a crash recovery prompt, say) that nobody will ever answer, and
+    # then waiting is waiting for ever: that is what held this pipeline for ten
+    # hours. So look at the evidence that separates the two, its CPU TIME, and
+    # only act when it has consumed NOTHING for OCRAPP_IDLE_GIVEUP seconds.
+    # A grinding app keeps its 'no time limit' promise, untouched.
+    if [ "${OCRAPP_IDLE_GIVEUP:-0}" -gt 0 ]; then
+      _cpu_now="$(ocrapp_cpu_secs)"
+      # a RATE: how much cpu it used since the last look, in hundredths, against
+      # what OCRAPP_IDLE_MAX_CPU_PER_MIN allows for one second
+      # 'isInt' is my-scan's helper and does not exist here, so this guard was
+      # printing 'isInt: not found' on every look and falling back regardless.
+      _cpu_bud="$OCRAPP_IDLE_MAX_CPU_PER_MIN"
+      case "$_cpu_bud" in ''|*[!0-9]*) _cpu_bud=3 ;; esac
+      _cpu_bud=$(( _cpu_bud * 100 / 60 ))          # hundredths per second
+      [ "$_cpu_bud" -lt 1 ] && _cpu_bud=1
+      # The FIRST look has nothing to compare with, and the first alert fires
+      # on exactly that look -- so take a second sample a second later, and
+      # the verdict "working or not" exists the moment it is needed.
+      if [ -z "$_cpu_was" ]; then
+        _cpu_was="$_cpu_now"; sleep 1; _cpu_now="$(ocrapp_cpu_secs)"
+      fi
+      if [ $(( _cpu_now - _cpu_was )) -le "$_cpu_bud" ]; then
+        _cpu_still=$(( _cpu_still + 1 ))           # not working, whatever it ticks
+        _cpu_was="$_cpu_now"; _cpu_busy=""
+      else
+        _cpu_still=0; _cpu_was="$_cpu_now"         # it IS working -- keep waiting
+        _cpu_busy=1
+      fi
+      if [ "$_cpu_still" -ge "$OCRAPP_IDLE_GIVEUP" ]; then
+        m="$OCRAPP_NAME [pid(s) $ocr_pids] has used almost no cpu (under ${OCRAPP_IDLE_MAX_CPU_PER_MIN}s per minute) for ${_cpu_still}s while the queue stood still for ${stalled}s [cpu ${_cpu_now}/100s total over $(ocrapp_all_pids | awk 'END{print NR+0}') process(es)].
+It is not working -- it is waiting for someone to answer a dialog."
+        if [ -z "$_retried" ]; then
+          _retried=1
+          alert_stuck "$m
+Retrying ONCE: closing it and handing the same documents over again." "my-ocr STUCK -- retrying"
+          if retry_stalled_chunk "$QUEUED_FILE_MOVES_LOG_CNT"; then
+            _retry_done=1; stalled=0; last_q=""; next_alert=$STALL_ALERT_AFTER
+            _cpu_was=""; _cpu_still=0; _cpu_busy=""; _fr_seen=""; _tw=0
+            continue
+          fi
+        fi
+        m="$m
+${_retry_done:+It had already been retried once. }Giving up: closing it, and the documents go back for a retry."
+        alert_stuck "$m" "my-ocr STUCK -- gave up"
+        ocrapp_quit
+        err 158 "$m${NL}Still queued in '$QUEUED_FILE_MOVES_LOG':${NL}$(cat "$QUEUED_FILE_MOVES_LOG")"
+      fi
+    fi
+
+    # Hold the lock and keep waiting while it is genuinely working.
+    # next_alert, not "stalled % EVERY": with the modulo the first gap would be
+    # EVERY-minus-ALERT_AFTER, so the interval would not mean what it says.
+    # A queue that has not moved is NOT an alarm while the app is measurably
+    # working: a 10-page batch at high quality takes longer than the first
+    # alert interval, and every such batch mailed "STUCK" and left a marker on
+    # the Desktop -- eight of them for one evening of healthy runs. So it is
+    # logged, with the evidence; the mail is kept for an app that is NOT
+    # working, or for when the cpu check is off and nothing can be told.
+    if [ "$stalled" -ge "$next_alert" ]; then
+      _as_msg="$OCRAPP_NAME [pid(s) $ocr_pids] is running but the queue has not moved for ${stalled}s. Still waiting; NOT releasing the lock."
+      if [ -n "$_cpu_busy" ]; then
+        echo "$$| >>> [trigger-OCR] $_as_msg -- it IS working [cpu ${_cpu_now}/100s total over $(ocrapp_all_pids | awk 'END{print NR+0}') process(es)], so no alert"
+      elif [ -n "$_retry_done" ]; then
+        # the incident is already announced (STUCK -- retrying); a notice is not
+        # a change of state, and the next mail is the outcome
+        echo "$$| >>> [trigger-OCR] $_as_msg -- after the retry; no new alert, the outcome will be mailed"
+      else
+        alert_stuck "$_as_msg"
+      fi
+      next_alert=$(( $stalled + $STALL_REALERT_EVERY ))
+    fi
+  done
+  alert_resolved "the queue emptied -- every document of this run went through${_retry_done:+, after one retry}"
+
+}
+
+
+#######################################################
+#### TESTS  (--run-tests)
+##
+## One test per BUG FIXED, written so it FAILS against the build that had the
+## bug. Anything that cannot be checked without starting a real OCR is not a
+## test here -- it is exercised by hand and said so in the design.
+
+T_PASS=0; T_FAIL=0; T_TMP=""
+
+t_ok()  { T_PASS=$(( $T_PASS + 1 )); printf '  ok    %s\n' "$1"; }
+t_bad() { T_FAIL=$(( $T_FAIL + 1 )); printf '  FAIL  %s\n' "$1"
+          [ -n "$2" ] && printf '        %s\n' "$2"; return 0; }
+
+# --- the shebang decides what ps shows, which cleanup() greps for
+rt_shebang() {
+  _sb="$(head -1 "$0")"
+  [ "$_sb" = "#!/bin/dash" ] && t_ok "shebang is /bin/dash" \
+                             || t_bad "shebang is /bin/dash" "got '$_sb'"
+}
+
+rt_dash_syntax() {
+  if /bin/dash -n "$0" 2>/dev/null; then t_ok "parses as dash (dash -n)"
+  else t_bad "parses as dash (dash -n)" "$(/bin/dash -n "$0" 2>&1 | head -1)"; fi
+}
+
+# The code of an error names ONE source line: grep it, land on it. Two lines
+# sharing a code (028, 106, 138, 160 and 161 did) send the reader to the wrong
+# one. Commented-out calls count too, so a revived line collides with nothing.
+rt_err_codes_unique() {
+  grep -noE '\berr 0*[0-9]{3,5}( "|$)' "$0" | awk -F: '
+    { split($2, a, " "); c = a[2] + 0; n[c]++; l[c] = l[c] " " $1; if (c > max) max = c }
+    END { for (c in n) if (n[c] > 1) print "SHARED " c " at lines" l[c]; print "MAX " max }' > "$T_TMP/errcodes"
+  _eu_hdr="$(sed -n 's/^# \([0-9]*\) == highest used errCode$/\1/p' "$0")"
+  _eu_max="$(sed -n 's/^MAX //p' "$T_TMP/errcodes")"
+  if grep -q '^SHARED ' "$T_TMP/errcodes"; then
+    t_bad "error codes: each names one source line" "$(grep '^SHARED ' "$T_TMP/errcodes")"
+  else t_ok "error codes: each names one source line"; fi
+  if [ "$_eu_hdr" = "$_eu_max" ]; then t_ok "error codes: the header names the highest one ($_eu_max)"
+  else t_bad "error codes: the header names the highest one" "header '$_eu_hdr', highest '$_eu_max'"; fi
+}
+
+# --- REGRESSION: '--file' used $(( )) (arithmetic) instead of $( ), which is a
+#     fatal syntax error at parse time, so the documented option never worked.
+rt_file_option() {
+  _f="$T_TMP/filelist"; printf 'a\nb\n' > "$_f"
+  # --part-1 --no-log parses --file, then stops at err 003 before doing work
+  _out="$(MY_OCR_CONFIG="$T_TMP/sandbox.conf" "$0" --part-1 --no-log --file "$_f" 2>&1)"
+  case "$_out" in
+    *"syntax error"*) t_bad "--file parses (no arithmetic-expansion bug)" \
+                            "$(printf '%s' "$_out" | head -1)";;
+    *"ERROR 003"*)    t_ok  "--file parses (no arithmetic-expansion bug)";;
+    *)                t_bad "--file parses (no arithmetic-expansion bug)" \
+                            "unexpected: $(printf '%s' "$_out" | head -1)";;
+  esac
+}
+
+# --- REGRESSION: cleanup() hard-coded '/bin/sh' when hunting its own
+#     Automator-launched children, so changing the shebang silently made it
+#     match nothing and it stopped killing them.
+rt_cleanup_pattern_interpreter_agnostic() {
+  _stand="$T_TMP/my-ocr"
+  printf '#!/bin/dash\nsleep 20\n' > "$_stand"; chmod 755 "$_stand"
+  "$_stand" --part-1 & _pid=$!
+  sleep 1
+  _agnostic=$(pgrep -f "^[^ ]* $_stand --part-1" 2>/dev/null | wc -l | tr -d ' ')
+  _hardcoded=$(pgrep -f "^/bin/sh $_stand --part-1" 2>/dev/null | wc -l | tr -d ' ')
+  kill "$_pid" 2>/dev/null; wait "$_pid" 2>/dev/null
+  if [ "$_agnostic" -ge 1 ] && [ "$_hardcoded" -eq 0 ]; then
+    t_ok "cleanup pattern finds a child under ANY interpreter"
+  else
+    t_bad "cleanup pattern finds a child under ANY interpreter" \
+          "agnostic=$_agnostic (want >=1), hardcoded=$_hardcoded (want 0)"
+  fi
+  # and the source must not have gone back to naming an interpreter
+  if grep -q 'w="\[\^ \]\* /LINKS/bin/my-ocr-finereader --part-\$a"' "$0"; then
+    t_ok "cleanup pattern is not tied to an interpreter name"
+  else
+    t_bad "cleanup pattern is not tied to an interpreter name" \
+          "$(grep -n 'my-ocr --part-\$a"' "$0" | head -1)"
+  fi
+}
+
+# --- CLAIMS AUDIT: --help must not promise behaviour the code does not have
+rt_help_claims() {
+  _h="$("$0" --help 2>&1)"
+  # every option --help lists must be accepted by the parser
+  for _o in --part-1 --part-2 -F -V -D --log --no-log -f --file --test-mail; do
+    case "$_h" in *"$_o"*) ;; *) continue;; esac
+    # an option may be written '-F)' or, alternated, '-F|--force)'
+    if grep -q -- "$_o)" "$0" || grep -q -- "$_o|" "$0"; then :; else
+      t_bad "--help option '$_o' exists in the parser" "documented but unhandled"; return
+    fi
+  done
+  t_ok "every option --help lists is handled by the parser"
+}
+
+# --- a marked file must never be OCRed, whoever hands it over
+rt_no_ocr_marker() {
+  # the glob logic itself
+  _hits=""
+  for _n in "no-ocr-scan-x.pdf" "no-ocr-scan.pdf" "scan.pdf" "2026-01-01___scan.pdf"; do
+    for _pat in $NO_OCR_FILENAME_PATTERNS; do
+      # shellcheck disable=SC2254
+      case "$_n" in $_pat) _hits="$_hits $_n";; esac
+    done
+  done
+  if [ "$_hits" = " no-ocr-scan-x.pdf no-ocr-scan.pdf" ]; then
+    t_ok "NO_OCR_FILENAME_PATTERNS matches only the marked names"
+  else
+    t_bad "NO_OCR_FILENAME_PATTERNS matches only the marked names" "matched:$_hits"
+  fi
+  # and it is actually consulted where files are vetted
+  if grep -q 'NO_OCR_FILENAME_PATTERNS' "$0" && \
+     awk '/^prepare_file_for_ocr\(\)/,/^}/' "$0" | grep -q 'NO_OCR_FILENAME_PATTERNS'; then
+    t_ok "the marker is honoured inside prepare_file_for_ocr()"
+  else
+    t_bad "the marker is honoured inside prepare_file_for_ocr()" "not wired in"
+  fi
+}
+
+# --- the Finder must not pop open when nobody started this from a terminal
+rt_reveal_policy() {
+  # part-1/part-2 are launched by AUTOMATOR and never have a tty, so the
+  # decision cannot be a tty test there -- it must come from the flagfile.
+  # the REVEAL DECISION itself, not merely the name appearing somewhere in
+  # part-2 -- it is also in part-2's cleanup loop, which made an earlier
+  # version of this test pass against a build that decided on a tty.
+  _rev="$(awk '/case "\$REVEAL_IN_FINDER" in/,/^  esac/' "$0")"
+  _rev_ok=1
+  case "$_rev" in *INTERACTIVE_FLAGFILE*) ;; *) _rev_ok=0;; esac
+  case "$_rev" in *"-t 0"*|*"-t 1"*|*"-t 2"*) _rev_ok=0;; esac
+  if [ "$_rev_ok" = 1 ]; then
+    t_ok "part-2 decides the reveal from INTERACTIVE_FLAGFILE, not from a tty"
+  else
+    t_bad "part-2 decides the reveal from INTERACTIVE_FLAGFILE, not from a tty" \
+          "part-2 has no tty of its own; a [ -t N ] test there would never fire"
+  fi
+  if awk '/^do_trigger_ocr\(\)/,/^}/' "$0" | grep -q -- '-t 0 \] || \[ -t 1 \] || \[ -t 2 \]'; then
+    t_ok "trigger-OCR records interactivity from any of the three streams"
+  else
+    t_bad "trigger-OCR records interactivity from any of the three streams" \
+          "stdin is a pipe for 'echo f | my-ocr'; stdout is redirected under --log"
+  fi
+  # the three-way policy
+  _r=""
+  for _p in never always auto; do
+    case "$_p" in
+      never)  _r="$_r never:no";;
+      always) _r="$_r always:yes";;
+      *)      _r="$_r auto:flagfile";;
+    esac
+  done
+  [ "$_r" = " never:no always:yes auto:flagfile" ] \
+    && t_ok "REVEAL_IN_FINDER has three states (never/always/auto)" \
+    || t_bad "REVEAL_IN_FINDER has three states (never/always/auto)" "$_r"
+}
+
+# --- REGRESSION: my-ocr must be able to quarantine what it could not OCR,
+#     so a caller never has to infer which files failed.
+rt_move_failed_to() {
+  # default is "": current behaviour, files stay put (the default lives in
+  # default_config_content(), unindented)
+  if default_config_content | grep -qx 'MOVE_FAILED_TO=""'; then
+    t_ok "MOVE_FAILED_TO defaults to '' (failed files stay put)"
+  else
+    t_bad "MOVE_FAILED_TO defaults to '' (failed files stay put)" "changed default = behaviour change for hand use"
+  fi
+  # a typo must be caught at STARTUP, not during cleanup
+  _o="$(MY_OCR_CONFIG="$T_TMP/sandbox.conf" "$0" --move-failed-to /nonexistent/quarantine --part-1 --no-log 2>&1)"
+  case "$_o" in
+    *"ERROR 131"*) t_ok "a bad --move-failed-to is refused up front (err 131)";;
+    *)             t_bad "a bad --move-failed-to is refused up front (err 131)" \
+                         "$(printf '%s' "$_o" | head -1)";;
+  esac
+  # and the move happens where the failure list already lives
+  if awk '/^cleanup\(\)/,/^}/' "$0" | grep -q 'MOVE_FAILED_TO'; then
+    t_ok "quarantine runs in cleanup(), which every exit path reaches"
+  else
+    t_bad "quarantine runs in cleanup(), which every exit path reaches" "not wired in"
+  fi
+}
+
+# --- REGRESSION: the AUTOMATOR wait must never end on a clock. A timeout
+#     would release the lock while FineReader might still be running.
+rt_wait_is_evidence_based() {
+  _w="$(awk '/### --trigger-ocr \(5\)/,/^  done$/' "$0")"
+  _ok=1
+  # it must consult whether the OCR app is actually running
+  case "$_w" in *"pgrep -x \"\$OCRAPP_NAME\""*) ;; *) _ok=0;; esac
+  # and it must NOT bound the loop by a clock
+  case "$_w" in *"AUTOMATOR_TIMEOUT"*|*"i -le \$i_max"*|*"i -lt \$i_max"*) _ok=0;; esac
+  [ "$_ok" = 1 ] && t_ok "the AUTOMATOR wait ends on evidence, never on a clock" \
+                 || t_bad "the AUTOMATOR wait ends on evidence, never on a clock" \
+                          "a timeout here releases the lock while $OCRAPP_NAME may still run"
+  # the alert must reach all three channels
+  _a="$(awk '/^alert_stuck\(\)/,/^}/; /^send_alert\(\)/,/^}/' "$0")"
+  _n=0
+  case "$_a" in *'"$my_notify" --'*)   _n=$(( $_n + 1 ));; esac
+  case "$_a" in *'--mail'*)            _n=$(( $_n + 1 ));; esac
+  case "$_a" in *STUCK_MARKER_DIR*)    _n=$(( $_n + 1 ));; esac
+  [ "$_n" = 3 ] && t_ok "a stall alerts on all three channels (notify, mail, marker)" \
+                || t_bad "a stall alerts on all three channels (notify, mail, marker)" "found $_n of 3"
+  # and it must not swallow my-notify's own failure
+  case "$_a" in
+    *"my-notify failed"*) t_ok "a failed alert is itself reported, not swallowed";;
+    *) t_bad "a failed alert is itself reported, not swallowed" "stderr is redirected away";;
+  esac
+}
+
+# --- REGRESSION: the gate must be ATOMIC and must QUEUE, not refuse.
+#     The old "[ -e LOCK ] ... err 080; touch LOCK" was test-then-act: two
+#     callers could both pass it and both drive FineReader.
+rt_mutex() {
+  _acq="$(awk '/Take the OCR mutex and WAIT/,/Took the OCR mutex/' "$0")"
+  case "$_acq" in
+    *"until mkdir \"\$OCRAPP_MUTEX_DIR\""*) t_ok "the gate is mkdir (atomic test-and-set)";;
+    *) t_bad "the gate is mkdir (atomic test-and-set)" "'[ -e ] && touch' is a race, not a lock";;
+  esac
+  case "$_acq" in
+    *"kill -0"*) t_ok "only a provably dead owner is broken";;
+    *) t_bad "only a provably dead owner is broken" "a long OCR is not a crashed one";;
+  esac
+  # err 080 refused instead of queueing; it must be gone from the CALL sites.
+  # Scoped to do_trigger_ocr: the whole file also matches this test's own
+  # message text, which made an earlier version of this test fail itself.
+  if awk '/^do_trigger_ocr\(\)/,/^}/' "$0" | grep -q 'err 080 "'; then
+    t_bad "my-ocr queues rather than refusing (err 080 gone)" "still refuses concurrent callers"
+  else
+    t_ok "my-ocr queues rather than refusing (err 080 gone)"
+  fi
+  # cleanup must not tear down when we never held the lock
+  if awk '/^cleanup\(\)/,/^}/' "$0" | grep -q '"129"'; then
+    t_ok "cleanup leaves everything alone when the mutex was never ours"
+  else
+    t_bad "cleanup leaves everything alone when the mutex was never ours" \
+          "a mutex timeout would tear down the instance that DOES hold it"
+  fi
+  # ...and must release it when it was ours (a dir: rm -f cannot do that)
+  if awk '/^cleanup\(\)/,/^}/' "$0" | grep -q 'rmdir "\$OCRAPP_MUTEX_DIR"'; then
+    t_ok "cleanup releases the mutex directory with rmdir"
+  else
+    t_bad "cleanup releases the mutex directory with rmdir" \
+          "schedule_for_cleanup uses rm -f, which will not remove a directory"
+  fi
+
+  # behavioural: the acquire loop itself, against a throwaway directory
+  _m="$T_TMP/mutex"
+  mkdir "$_m" && printf 'pid=999999 at=x\n' > "$_m/owner"
+  _mo="$(cat "$_m/owner")"; _mp="${_mo#pid=}"; _mp="${_mp%% *}"
+  if [ -n "$_mp" ] && ! kill -0 "$_mp" 2>/dev/null; then
+    rm -f "$_m/owner"; rmdir "$_m"
+    t_ok "a dead owner (pid 999999) is detected and broken"
+  else
+    t_bad "a dead owner (pid 999999) is detected and broken" "kill -0 said it lives"
+  fi
+  mkdir "$_m" && printf 'pid=%s at=x\n' "$$" > "$_m/owner"
+  _mo="$(cat "$_m/owner")"; _mp="${_mo#pid=}"; _mp="${_mp%% *}"
+  if kill -0 "$_mp" 2>/dev/null; then
+    t_ok "a LIVE owner is waited for, never broken"
+  else
+    t_bad "a LIVE owner is waited for, never broken" "would have broken a live lock"
+  fi
+  rm -rf "$_m"
+}
+
+# ---------------------------------------------------------------- --status
+# Everything a caller (or a person) may need to ask when a scan is stuck.
+# Read-only: it starts nothing, waits for nothing, and takes no lock.
+do_status() {
+  _st_pfx="$1"
+
+  # 1. the mutex -- is an OCR running, and whose?
+  if [ -d "$OCRAPP_MUTEX_DIR" ]; then
+    _st_o="$(cat "$OCRAPP_MUTEX_DIR/owner" 2>/dev/null)"
+    _st_p="${_st_o#pid=}"; _st_p="${_st_p%% *}"
+    # WHICH document -- "busy" without the name tells you nothing you can act on
+    _st_f=""
+    [ -s "$OCRAPP_LOCKFILE" ] && _st_f="$(sed -n '1s|.*/||p' "$OCRAPP_LOCKFILE" 2>/dev/null)"
+    case "$_st_f" in placing-files) _st_f="(still placing files)";; esac
+    [ -z "$_st_f" ] && [ -s "$QUEUED_FILE_MOVES_LOG" ] \
+      && _st_f="$(awk -F"\t" 'NR==1{n=$1; sub(/.*\//,"",n); print n}' "$QUEUED_FILE_MOVES_LOG" 2>/dev/null)"
+    _st_nn=0
+    [ -s "$QUEUED_FILE_MOVES_LOG" ] && _st_nn="$(awk 'END{print NR+0}' "$QUEUED_FILE_MOVES_LOG")"
+    [ "$_st_nn" -gt 1 ] && _st_f="$_st_f (+$(( _st_nn - 1 )) more)"
+    if [ -n "$_st_p" ] && kill -0 "$_st_p" 2>/dev/null; then
+      echo "${_st_pfx}OCR       BUSY -- ${_st_f:-<file not yet known>}   [$_st_o]"
+    else
+      echo "${_st_pfx}OCR       STALE LOCK -- owner ${_st_p:-?} is gone ($_st_o)"
+    fi
+  else
+    echo "${_st_pfx}OCR       idle"
+  fi
+
+  # 2. the OCR application itself
+  _st_pids="$(pgrep -x "$OCRAPP_NAME" 2>/dev/null | xargs echo)"
+  if [ ! -d "$OCRAPP_PATH" ]; then
+    echo "${_st_pfx}OCRAPP    $OCRAPP_NAME NOT INSTALLED at '$OCRAPP_PATH' -- OCR cannot run"
+  elif [ -n "$_st_pids" ]; then
+    # name the document here too: a running OCR app on its own says nothing
+    # Only claim a document when there IS one: the app can sit running with
+    # nothing in hand, and "running on <unknown>" reads like a lost file.
+    if [ -n "$_st_f" ]; then
+      echo "${_st_pfx}OCRAPP    $OCRAPP_NAME running on $_st_f   [pid(s) $_st_pids]"
+    else
+      echo "${_st_pfx}OCRAPP    $OCRAPP_NAME running, idle (no document in hand)   [pid(s) $_st_pids]"
+    fi
+  else
+    echo "${_st_pfx}OCRAPP    $OCRAPP_NAME installed, not running"
+  fi
+
+  # 3. what is queued -- the lines still in QUEUED_FILE_MOVES_LOG are the
+  #    files that have NOT completed
+  if [ -s "$QUEUED_FILE_MOVES_LOG" ]; then
+    _st_n="$(wc -l < "$QUEUED_FILE_MOVES_LOG" | tr -d ' ')"
+    echo "${_st_pfx}QUEUE     $_st_n file(s) not yet OCRed"
+    [ "$VRB" = "1" ] && cut -f1 "$QUEUED_FILE_MOVES_LOG" | while IFS= read -r _st_f; do
+      echo "${_st_pfx}          | ${_st_f##*/}"
+    done
+  else
+    echo "${_st_pfx}QUEUE     empty"
+  fi
+
+  # What is left over from runs that are gone, each with its raw value. While a
+  # run is LIVE, its parts, its staging folder and its error flag are its own
+  # and not a problem; the rest are debris whatever is running.
+  _st_live=""; [ -n "$_st_p" ] && kill -0 "$_st_p" 2>/dev/null && _st_live=1
+  _st_app="$(pgrep -x "$OCRAPP_NAME" 2>/dev/null | xargs echo)"
+  _st_hp="$(ocrapp_all_pids | grep -vxF -e "${_st_app:-none}" | xargs echo)"
+  _st_hn="$(echo "$_st_hp" | awk '{print NF}')"
+  _st_lo=0
+  for _st_d in "$OCRAPP_DOCSTORE_BASE/$OCRAPP_BUNDLE_ID"*/Untitled.FR*; do [ -d "$_st_d" ] && _st_lo=$(( _st_lo + 1 )); done
+  _st_sf="$(stale_run_files | awk 'END{print NR+0}')"
+  _st_ef=0; [ -s "$PARTx_ERRORED_FLAGFILE" ] && _st_ef="$(awk 'END{print NR+0}' "$PARTx_ERRORED_FLAGFILE")"
+  _st_pa="$(run_parts_alive)"; _st_pn="$(echo "$_st_pa" | awk '{print NF}')"
+  # EMPTY staging is harmless -- every part-1/part-2 creates it, and the next
+  # hand-over reuses it; only one that still HOLDS documents is debris
+  _st_sd="none"; for _st_d in "$TMP_PRE_INP_PATH" "$S_PATH/${TMP_PRE_INP_PATH##*/}"; do
+    [ -d "$_st_d" ] && [ -n "$(ls -A "$_st_d" 2>/dev/null)" ] && _st_sd="$_st_d"; done
+  _st_bad=""
+  [ -z "$_st_app" ] && [ "$_st_hn" -gt 0 ] && _st_bad="$_st_bad; $_st_hn $OCRAPP_NAME helper(s) without the app -- the next run ends them"
+  [ -z "$_st_app" ] && [ "$_st_lo" -gt 0 ] && _st_bad="$_st_bad; a leftover $OCRAPP_NAME document -- the next run clears it if it is my-ocr's"
+  [ "$_st_sf" -gt 0 ] && _st_bad="$_st_bad; $_st_sf file(s) of runs that are gone -- '$US reset go'"
+  if [ -z "$_st_live" ]; then
+    [ "$_st_pn" -gt 0 ] && _st_bad="$_st_bad; part-1/part-2 of a run that is gone still at work -- the next run waits for it"
+    [ "$_st_ef" -gt 0 ] && _st_bad="$_st_bad; an error flag from a run that is gone -- '$US reset go'"
+    [ "$_st_sd" != none ] && _st_bad="$_st_bad; a staging folder with documents from a run that is gone -- '$US reset go'"
+  fi
+  _st_raw="helpers ${_st_hn}${_st_hp:+ ($_st_hp)}, leftover $_st_lo, stale files $_st_sf, error flag $_st_ef line(s), parts ${_st_pn}${_st_pa:+ ($_st_pa)}, staging $_st_sd"
+  if [ -n "$_st_bad" ]; then
+    echo "${_st_pfx}HEALTH    ATTENTION -- ${_st_bad#; }   [$_st_raw]"
+  else
+    echo "${_st_pfx}HEALTH    ok   [$_st_raw]"
+  fi
+
+  # What FineReader will ACTUALLY be told, read back out of the installed
+  # workflow -- beside what the config asks for, so a config edited without a
+  # 'setup go' after it shows up here instead of being believed.
+  export_quality; _st_cq="$EXPORT_Q"; _st_ck="$EXPORT_QK"
+  _st_wf="$WORKFLOW_DIR/$WORKFLOW_NAME/Contents/document.wflow"
+  _st_iv="$(workflow_export_values "$_st_wf")"
+  if [ -z "$_st_iv" ]; then
+    echo "${_st_pfx}EXPORT    no installed workflow to read -- config wants OCRAPP_MRC=$OCRAPP_MRC $_st_ck=$_st_cq -- '$US setup go'"
+  else
+    _st_im="${_st_iv% *}"; _st_iq="${_st_iv#* }"   # "<mrc> <quality>"
+    if [ "$_st_iv" = "$OCRAPP_MRC $_st_cq" ]; then
+      echo "${_st_pfx}EXPORT    MRC $( [ "$_st_im" = 1 ] && echo on || echo off ), quality $_st_iq ($(quality_name "$_st_iq"))   [workflow = config: OCRAPP_MRC=$OCRAPP_MRC, $_st_ck=$_st_cq]"
+    else
+      echo "${_st_pfx}EXPORT    MISMATCH -- workflow has MRC=$_st_im quality=$_st_iq, config wants OCRAPP_MRC=$OCRAPP_MRC $_st_ck=$_st_cq -- run '$US setup go'"
+    fi
+  fi
+  _st_sp="$(/usr/bin/defaults read "$OCRAPP_BUNDLE_ID" ImportSplitFacingPages 2>/dev/null)" || _st_sp="unset"
+  if [ "$_st_sp" = "$OCRAPP_SPLIT_FACING_PAGES" ]; then
+    echo "${_st_pfx}SPLIT     facing pages $( [ "$_st_sp" = 1 ] && echo on || echo off )   [$OCRAPP_NAME = config: $_st_sp]"
+  else
+    echo "${_st_pfx}SPLIT     facing pages: $OCRAPP_NAME has '$_st_sp', config wants $OCRAPP_SPLIT_FACING_PAGES -- the next run sets it"
+  fi
+  if _st_3p="$(automator_3pp_state)"; then
+    echo "${_st_pfx}AUTOMATOR third-party actions enabled   [$_st_3p]"
+  else
+    echo "${_st_pfx}AUTOMATOR third-party actions OFF -- $OCRAPP_NAME's step will be refused: $AUTOMATOR_3PP_HOWTO   [$_st_3p]"
+  fi
+  _st_cf="$CONFIG_FILE"
+  [ -n "$_st_cf" ] || _st_cf="none found -- built-in defaults ($US --create-config prints them)"
+  echo "${_st_pfx}CONFIG    $_st_cf"
+
+  [ "$VRB" = "1" ] || return 0
+  echo "${_st_pfx}          in  $S_PATH"
+  echo "${_st_pfx}          out $T_PATH"
+  echo "${_st_pfx}          mutex $OCRAPP_MUTEX_DIR"
+  echo "${_st_pfx}          lock  $OCRAPP_LOCKFILE"
+  for _st_f in "$DBG_FLAGFILE" "$FORCE_FLAGFILE" "$INTERACTIVE_FLAGFILE"; do
+    [ -e "$_st_f" ] && echo "${_st_pfx}          flag  ${_st_f##*/}"
+  done
+  return 0
+}
+
+
+build_id() {
+  _h="$(shasum -a 256 "$0" 2>/dev/null | cut -c1-12)"
+  [ -z "$_h" ] && _h="unknown"
+  echo "$_h"
+}
+
+# SCRIPT_VERSION names the release these bytes are BASED on -- only a release
+# commit sets it. Whether they ARE that release is git's own describe string,
+# printed verbatim. Git first (exact in a checkout), the stamp second (a
+# deployed copy has no git; it lags one release step, because stamping
+# happens before the tag exists).
+# The directory holding the REAL file, symlinks resolved. /LINKS/bin/<tool> is
+# a farm link into ANOTHER repo, so asking git from there answers about THAT
+# repo -- and once it has a tag of its own, this tool would report a stranger's
+# release as its own.
+_self_dir() {
+  _sd_p=$0
+  while [ -L "$_sd_p" ]; do
+    _sd_t=$(readlink "$_sd_p") || break
+    case "$_sd_t" in
+      /*) _sd_p=$_sd_t ;;
+      *)  _sd_p=$(dirname "$_sd_p")/$_sd_t ;;
+    esac
+  done
+  (cd "$(dirname "$_sd_p")" 2>/dev/null && pwd -P)
+}
+
+do_version() {
+  _bid="$(build_id)"
+  _vd="$(git -c safe.directory='*' -C "$(_self_dir)" describe --tags --long 2>/dev/null)"
+  # describe answers about WHERE this file sits, not about what it is: a copy
+  # dropped in a foreign repo gets THAT repo's tags (/LINKS/global is one, and
+  # it holds the copies my-rollout promotes). The stamped PARENT is the
+  # proof -- a repo that does not have it is not this tool's repo. Not
+  # SCRIPT_COMMIT: that one only ever existed in the clone that stamped, so
+  # every other checkout of the real repo was taken for a foreign one.
+  _vproof="${SCRIPT_PARENT:-$SCRIPT_COMMIT}"
+  if [ -n "$_vd" ] && [ -n "$_vproof" ] \
+     && ! git -c safe.directory='*' -C "$(_self_dir)" cat-file -e "${_vproof}^{commit}" 2>/dev/null; then
+    _vd=""
+  fi
+  # The stamp is a PAIR, written together: without SCRIPT_COMMIT there is no
+  # stamp to fall back to, and a lone SCRIPT_RELEASE would be a release claim
+  # nothing backs -- an unstamped file says so.
+  if [ -z "$_vd" ] && [ -n "$SCRIPT_COMMIT" ]; then _vd=$SCRIPT_RELEASE; fi
+  case "$_vd" in
+    *-*-g*)
+      _vtag="${_vd%-*-g*}"
+      _vn="${_vd%-g*}"; _vn="${_vn##*-}"
+      if [ "$_vn" = 0 ]; then
+        echo "$US $SCRIPT_VERSION ($_vd: the $_vtag tag, build $_bid)"
+      else
+        echo "$US $SCRIPT_VERSION+$_vn ($_vd: $_vn commit(s) past $_vtag, unreleased, build $_bid)"
+      fi ;;
+    *)
+      if [ -n "$SCRIPT_COMMIT" ]; then
+        echo "$US $SCRIPT_VERSION (commit $SCRIPT_COMMIT, build $_bid)"
+      else
+        echo "$US $SCRIPT_VERSION (build $_bid, unstamped)"
+      fi ;;
+  esac
+}
+
+# --test-mail: ONE alert through send_alert(), the call the real STUCK alerts
+# make -- a notification and a mail -- so a passing test says something about
+# them. my-ocr has no config file; the recipient is my-notify's own default.
+do_test_mail() {
+  [ -x "$my_notify" ] || err 154 "my_notify='$my_notify' is not executable."
+  _tm_to="the my-notify default recipient"
+  send_alert "$US test mail" "test alert -- a test mail went out too" \
+"This is a test mail from '$US --test-mail'. It went out through
+send_alert(), the call my-ocr's real STUCK alerts use.
+
+Host:    $(hostname -s)
+User:    $(id -un)
+Time:    $(date '+%Y-%m-%d %H:%M:%S %Z')
+Config:  none -- my-ocr keeps its settings in the script: $0
+Version: $(do_version)"
+  _tm_rc=$?
+  [ "$_tm_rc" -eq 0 ] || err 155 "test mail to $_tm_to NOT sent [my-notify rc $_tm_rc]"
+  echo " >>> test mail sent to $_tm_to [my-notify rc $_tm_rc]"
+  return 0
+}
+
+# Record the commit this file came from, INTO the file, then amend that commit.
+# Four guards, each for a failure that has actually happened somewhere:
+#   - other dirty files would be swallowed by the --amend
+#   - an already-pushed commit must not be rewritten
+#   - it must be idempotent
+#   - it edits the very file it is running from, so: temp file + mv, mode kept
+do_stamp_version() {
+  _dir="$(cd "$(dirname "$0")" && pwd)" || err 141 "Cannot resolve own directory."
+  git -C "$_dir" rev-parse --git-dir >/dev/null 2>&1 \
+    || err 142 "Not inside a git checkout -- nothing to stamp."
+
+  _other="$(git -C "$_dir" status --porcelain -- . | grep -v " $US\$" | grep -v "/$US\$")"
+  if [ -n "$_other" ]; then
+    echo "$_other" | sed -e 's/^/    > /' 1>&2
+    err 143 "Other files are dirty; commit or stash them first."
+  fi
+
+  if git -C "$_dir" rev-parse --abbrev-ref '@{upstream}' >/dev/null 2>&1; then
+    git -C "$_dir" merge-base --is-ancestor HEAD '@{upstream}' 2>/dev/null \
+      && err 144 "HEAD is already pushed -- amending it would rewrite published history."
+  fi
+
+  # The repo may be SHARED -- other sessions commit here too -- and an amend
+  # rewrites whatever HEAD happens to be. Stamp only the commit that carries
+  # THIS file: if HEAD does not touch it, HEAD is somebody else's work.
+  [ -n "$(git -C "$_dir" show --name-only --format= HEAD -- "$US" 2>/dev/null)" ] \
+    || err 156 "HEAD does not touch this file -- it is not this file's commit (commit it first; in a shared repo the amend would rewrite someone else's)."
+
+  _sha="$(git -C "$_dir" rev-parse --short HEAD)" || err 145 "git rev-parse HEAD failed."
+  if [ "$SCRIPT_COMMIT" = "$_sha" ]; then
+    echo " >>> Already stamped with commit $_sha -- nothing to do."
+    return 0
+  fi
+
+  # a stamped build is a RELEASED build: it must pass its own tests first
+  if ! "$0" --run-tests >/dev/null 2>&1; then
+    err 146 "--run-tests fails -- refusing to stamp a build that does not pass."
+  fi
+
+  # git's own spelling, kept verbatim so it can be pasted back into git
+  _desc="$(git -c safe.directory='*' -C "$(_self_dir)" describe --tags --long 2>/dev/null)"
+  _tmp="$0.stamp.$$"
+  _par="$(git -C "$_dir" rev-parse --short HEAD~1 2>/dev/null)"   # "" for a first commit
+  sed -e "s|^SCRIPT_COMMIT=\".*\"|SCRIPT_COMMIT=\"$_sha\"|" \
+      -e "s|^SCRIPT_RELEASE=\".*\"|SCRIPT_RELEASE=\"$_desc\"|" \
+      -e "s|^SCRIPT_PARENT=\".*\"|SCRIPT_PARENT=\"$_par\"|" "$0" >"$_tmp" \
+    || { rm -f "$_tmp"; err 147 "FAILED to rewrite SCRIPT_COMMIT."; }
+  grep -q "^SCRIPT_COMMIT=\"$_sha\"" "$_tmp" \
+    || { rm -f "$_tmp"; err 148 "SCRIPT_COMMIT line not found -- refusing to install."; }
+  grep -q "^SCRIPT_PARENT=\"$_par\"" "$_tmp" \
+    || { rm -f "$_tmp"; err 178 "SCRIPT_PARENT line not found -- refusing to install."; }
+
+  _mode="$(/usr/bin/stat -f '%Lp' "$0")" || _mode=750
+  if ! { chmod "$_mode" "$_tmp" && mv -f "$_tmp" "$0"; }; then
+    rm -f "$_tmp"; err 149 "FAILED to install."
+  fi
+
+  git -C "$_dir" add -- "$US" || err 150 "git add failed."
+  git -C "$_dir" commit --amend --no-edit >/dev/null || err 151 "git commit --amend failed."
+
+  echo " >>> Stamped $US with commit $_sha, release ${_desc:-<no tag yet>} [$(build_id)]"
+  echo "    > the stamped sha lags HEAD by one: amending changes the sha. That is"
+  echo "      expected; do not 'fix' it. The build id identifies these exact bytes."
+  return 0
+}
+
+# Is a run with this pid still alive? Per-run files carry the pid in their
+# name, which is what makes staleness DECIDABLE rather than guessed: "old" is
+# not "dead", and a long OCR is not a crashed one.
+run_is_alive() { [ -n "$1" ] && kill -0 "$1" 2>/dev/null; }
+
+# A run is more than its trigger's pid: Automator runs its part-1 and part-2,
+# and between them the OCR app works on the batch. When the trigger is killed
+# all of that carries on. Prints the pids of the parts still running, if any.
+run_parts_alive() { pgrep -f "$US --part-[12]" 2>/dev/null | xargs echo; }
+
+# What of a run is still at work, if anything, printed; 0 when something is.
+# The OCR app counts only while the queue says a batch was handed over -- a
+# FineReader a person opened is nobody's run.
+run_work_alive() {
+  _rw="$(run_parts_alive)"
+  [ -n "$_rw" ] && { echo "its part-1/part-2 (pid(s) $_rw)"; return 0; }
+  [ -s "$QUEUED_FILE_MOVES_LOG" ] || return 1
+  _rw="$(pgrep -x "$OCRAPP_NAME" 2>/dev/null | xargs echo)"
+  [ -n "$_rw" ] && { echo "$OCRAPP_NAME on its batch (pid(s) $_rw)"; return 0; }
+  return 1
+}
+
+# Every per-run file whose owning pid is gone, one per line.
+stale_run_files() {
+  for _sf in /var/lib/mine/"$WHOAMI"/"${US%.*}".[0-9]*.filelist \
+             /var/lib/mine/"$WHOAMI"/"${US%.*}".[0-9]*.encrypted-pdfs.filelist \
+             /var/log/mine/"${US%.*}".[0-9]*.CLEANUP-FILELIST.log*; do
+    [ -e "$_sf" ] || continue
+    _sp="${_sf##*/}"; _sp="${_sp#"${US%.*}".}"; _sp="${_sp%%.*}"
+    case "$_sp" in ''|*[!0-9]*) continue;; esac
+    run_is_alive "$_sp" || printf '%s\n' "$_sf"
+  done
+}
+
+# What a document IS, in one line: bytes, pages, and what the OCR found in it.
+# Printed side by side for two copies, so a person can see how they differ
+# without opening either.
+doc_facts() { # $1 = file
+  _df_b="$(wc -c <"$1" 2>/dev/null | tr -d ' ')"
+  _df_p="$(pages_of "$1")"
+  _df_t="$("$c_pdftotext" "$1" - 2>/dev/null)"
+  _df_w="$(printf '%s' "$_df_t" | wc -w | tr -d ' ')"
+  _df_c="$(printf '%s' "$_df_t" | tr -d '[:space:]' | wc -c | tr -d ' ')"
+  printf '%s B, %s pages, %s words, %s chars' \
+    "${_df_b:-?}" "${_df_p:-?}" "${_df_w:-0}" "${_df_c:-0}"
+}
+
+# The document a stranded file came from, from the queued-moves log: field 2
+# is its name under ,ocr.in, field 3 under ,ocr.out; field 4 is where it was
+# filed, field 1 the original. Prints "<label><TAB><path>" for the first that
+# still EXISTS, nothing when there is no record or no copy left.
+stranded_origin() { # $1 = basename of the stranded file
+  [ -s "$QUEUED_FILE_MOVES_LOG" ] || return 0
+  awk -F'\t' -v b="$1" '{ n=split($2,a,"/"); m=split($3,c,"/")
+      if (a[n]==b || c[m]==b) { print $4 "\t" $1; exit } }' "$QUEUED_FILE_MOVES_LOG" |
+  while IFS="$(printf '\t')" read -r _so_final _so_orig; do
+    if   [ -n "$_so_final" ] && [ -e "$_so_final" ]; then printf 'filed\t%s\n' "$_so_final"
+    elif [ -n "$_so_orig" ]  && [ -e "$_so_orig" ];  then printf 'original\t%s\n' "$_so_orig"; fi
+  done
+}
+
+# A stranded file is a copy or a result, never the document itself -- but
+# "same name as the filed one" proves only that it came from the same SCAN:
+# two OCR runs of one scan differ in bytes AND in recognised text. So a file is
+# removed only when it is BYTE-IDENTICAL to its document (cmp, one call, no
+# window between check and removal); anything else is kept, with both copies'
+# facts printed side by side. Returns 0 when the file was dealt with here,
+# 1 when the caller should keep it.
+stranded_verdict() { # $1 = stranded file, $2 = "go" or ""
+  _sv_p=""             # the document it belongs to; read by the caller
+  _sv_b="${1##*/}"
+  _sv_o="$(stranded_origin "$_sv_b")"
+  if [ -z "$_sv_o" ]; then
+    echo "    > '$_sv_b' -- no record of the document it came from: kept"
+    echo "        stranded: $(doc_facts "$1")"
+    return 1
+  fi
+  _sv_lbl="${_sv_o%%	*}"; _sv_p="${_sv_o#*	}"
+  echo "    > '$_sv_b'"
+  echo "        stranded: $(doc_facts "$1")"
+  echo "        $_sv_lbl:$( [ "$_sv_lbl" = filed ] && echo '   ' ) $(doc_facts "$_sv_p")  '$_sv_p'"
+  # TRASHED, never rm: a byte-identical copy is still a file someone might
+  # want back, and the Trash is what makes a wrong call recoverable. cmp, not
+  # diff: same answer on binary files, and it says nothing when they match.
+  if cmp -s "$1" "$_sv_p"; then
+    if [ "$2" != "go" ]; then
+      echo "        -> byte-identical to its $_sv_lbl copy: WOULD TRASH it (recoverable from the Trash)"; return 0
+    fi
+    if [ -n "$c_trash" ] && [ -x "$c_trash" ] && "$c_trash" -- "$1" >/dev/null 2>&1; then
+      echo "        -> byte-identical to its $_sv_lbl copy: TRASHED it -- in the Trash, recoverable"; return 0
+    fi
+    echo "        -> byte-identical to its $_sv_lbl copy, but it could NOT be trashed: kept where it is"
+    return 1
+  fi
+  echo "        -> DIFFERS from its $_sv_lbl copy: kept"
+  return 1
+}
+
+# One paste-ready command that opens every file listed in $1 (one path per
+# line), each quoted. What a person does next with a kept file is LOOK at it
+# beside its document; spelling the paths out saves them the digging.
+print_open_cmd() { # $1 = file listing the paths
+  [ -s "$1" ] || return 0
+  printf '    > look at them:  open'
+  while IFS= read -r _oc_p; do
+    [ -n "$_oc_p" ] && printf ' \\\n        "%s"' "$_oc_p"
+  done <"$1"
+  printf '\n'
+}
+
+# Make the hand-over AGAIN: move the staging directory out of the watched
+# folder and straight back, so the folder action gets a fresh event. The files
+# travel with the directory and are never touched -- this moves, never copies
+# or deletes. Returns 1 if either move fails, leaving the files wherever the
+# last successful move put them, which is always one of the two directories.
+# A stalled chunk gets ONE more try before it is given up: most stalls are
+# FineReader itself (a dialog, a hang), not the documents, and the same chunk
+# goes through on a fresh start. Put the machinery back to where the first
+# hand-over found it -- no app, no workflow step still running, no leftover
+# document, an empty lockfile -- and hand the same staging folder over again.
+# Only while NOTHING of the chunk has been filed: a second hand-over OCRs every
+# document in the folder, and one already filed would be done twice.
+# Prints what it did or why it could not; returns 0 when it handed over again.
+retry_stalled_chunk() { # $1 = documents this run handed over
+  _rt_q="$(awk 'END{print NR+0}' "$QUEUED_FILE_MOVES_LOG" 2>/dev/null)"
+  if [ "$_rt_q" != "$1" ]; then
+    echo "$$| >>> [trigger-OCR] no retry: $(( $1 - _rt_q )) of $1 document(s) already filed -- a second hand-over would OCR them again [queue $_rt_q/$1]"
+    return 1
+  fi
+  [ -d "$S_PATH/$COLLECT_INP_PATH" ] || {
+    echo "$$| >>> [trigger-OCR] no retry: the staged documents are not in '$S_PATH/$COLLECT_INP_PATH' any more"; return 1; }
+  ocrapp_quit
+  # the workflow run that carried the stalled attempt must be over, or its
+  # part-2 would act on the new one
+  _rt_w=0
+  while [ -n "$(run_parts_alive)" ] && [ "$_rt_w" -lt 30 ]; do sleep 1; _rt_w=$(( _rt_w + 1 )); done
+  _rt_pa="$(run_parts_alive)"
+  if [ -n "$_rt_pa" ]; then
+    echo "$$| >>> [trigger-OCR] no retry: part-1/part-2 of the stalled attempt still running after ${_rt_w}s (pid(s) $_rt_pa)"; return 1
+  fi
+  # what a part wrote while FineReader was being closed belongs to the attempt
+  # that is over -- log it, and do not let it end the retry
+  if [ -s "$PARTx_ERRORED_FLAGFILE" ]; then
+    echo "$$| >>> [trigger-OCR] the stalled attempt left an error, from closing $OCRAPP_NAME under it:"
+    sed "s/^/$$|      | /" "$PARTx_ERRORED_FLAGFILE"
+    : >"$PARTx_ERRORED_FLAGFILE"
+  fi
+  printf "" >"$OCRAPP_LOCKFILE" || { echo "$$| >>> [trigger-OCR] no retry: could not empty '$OCRAPP_LOCKFILE'"; return 1; }
+  printf "" >"$OCRAPP_STATEFILE"      # nothing of $OCRAPP_NAME is anyone else's now
+  ocrapp_reap_helpers
+  ocrapp_clear_stale_batch "$S_PATH"
+  if nudge_handover "$S_PATH/$COLLECT_INP_PATH" "$TMP_PRE_INP_PATH"; then
+    echo "$$| >>> [trigger-OCR] RETRY: handed the same $1 document(s) over again [$OCRAPP_NAME closed, workflow over after ${_rt_w}s, lockfile emptied]"
+    return 0
+  fi
+  echo "$$| >>> [trigger-OCR] no retry: could not re-make the hand-over -- the documents are in '$S_PATH/$COLLECT_INP_PATH' or '$TMP_PRE_INP_PATH'"
+  return 1
+}
+
+nudge_handover() { # $1 = staging dir inside the watched folder, $2 = a path outside it
+  [ -d "$1" ] || return 1
+  [ -e "$2" ] && { rmdir "$2" 2>/dev/null || return 1; }
+  mv "$1" "$2" || return 1
+  sleep 1
+  mv "$2" "$1" || return 1      # back to the SAME path: moving it into the
+                                # parent would rename it to $2's basename
+  [ -d "$1" ] || return 1
+  return 0
+}
+
+# Pages in a file. A picture is one page; "" means we could not tell.
+pages_of() { # $1 = file
+  case "$(file --brief "$1" 2>/dev/null | cut -f1 -d' ')" in
+    PDF)           "$c_pdfinfo" "$1" 2>/dev/null | awk '/^Pages:/{print $2; exit}' ;;
+    JPEG|PNG|TIFF) echo 1 ;;
+    *)             echo "" ;;
+  esac
+}
+
+# The result REPLACES the original, and the original is moved to the Trash a
+# moment BEFORE that -- so an unchecked bad result is a lost document. Look
+# at it while the original is still there.
+#
+# PAGES is the check that matters: a truncated or half-recognised result comes
+# back with fewer pages than went in, and nothing else notices.
+#   - MORE pages is NOT a failure. The OCR application splits a sheet it
+#     believes holds several pages; that is a feature, common with book scans.
+#   - SIZE is deliberately not checked. MRC compression is on, so a much
+#     smaller result is the normal healthy outcome, not a symptom.
+# Mark a PDF as having been through OCR WITHOUT replacing it. Used when the
+# OCR found no text: the document then IS the original (a photograph, a blank
+# sheet), and the OCR application's output is strictly worse -- the scan that
+# prompted this turned 665 KB of A3 into 6.1 MB split across two A4 pages,
+# cutting the picture in half. But the original carries no Producer, so a later
+# run would OCR it again, for ever. So write the Producer onto the ORIGINAL.
+#
+# qpdf's JSON round-trip, not a rewrite: page content is copied through
+# untouched (checked -- pdfimages reports the identical image before and
+# after) and the file grows by the metadata alone. Ghostscript cannot do this:
+# pdfwrite stamps its own /Producer over whatever you set.
+tag_as_ocred() { # $1 = PDF to tag. 0 = tagged, 1 = could not (TAG_WHY says why)
+  TAG_WHY=""
+  _tg_f="$1"
+  { [ -n "$c_qpdf" ] && [ -x "$c_qpdf" ]; }   || { TAG_WHY="no qpdf";    return 1; }
+  [ -x /usr/bin/python3 ]                     || { TAG_WHY="no python3"; return 1; }
+  _tg_before="$("$c_pdfinfo" "$_tg_f" 2>/dev/null | awk '/^Pages:/{print $2; exit}')"
+
+  # temps beside the file: an atomic mv must stay on one filesystem
+  _tg_j="$_tg_f.my-ocr-tag.$$.json"
+  _tg_n="$_tg_f.my-ocr-tag.$$.new"
+  _tg_m="$_tg_f.my-ocr-tag.$$.mode"
+  rm -f "$_tg_j" "$_tg_n" "$_tg_m"
+
+  if ! "$c_qpdf" "$_tg_f" --json-output "$_tg_j" 2>/dev/null; then
+    rm -f "$_tg_j"; TAG_WHY="qpdf could not read it as JSON"; return 1
+  fi
+  if ! /usr/bin/python3 - "$_tg_j" "$OCRAPP_PRODUCER_TAG (my-ocr: no text found -- original kept)" <<'_EOTAG_'
+import json, sys
+path, prod = sys.argv[1], sys.argv[2]
+d = json.load(open(path))
+objs = d["qpdf"][1]
+tr = objs["trailer"]["value"]
+ref = tr.get("/Info")
+if ref:
+    objs["obj:" + ref]["value"]["/Producer"] = "u:" + prod
+else:
+    hdr = d["qpdf"][0]
+    nid = int(hdr.get("maxobjectid", 0)) + 1
+    hdr["maxobjectid"] = nid
+    objs["obj:%d 0 R" % nid] = {"value": {"/Producer": "u:" + prod}}
+    tr["/Info"] = "%d 0 R" % nid
+json.dump(d, open(path, "w"))
+_EOTAG_
+  then
+    rm -f "$_tg_j"; TAG_WHY="could not set /Producer in the JSON"; return 1
+  fi
+  if ! "$c_qpdf" "$_tg_f" --update-from-json="$_tg_j" "$_tg_n" 2>/dev/null; then
+    rm -f "$_tg_j" "$_tg_n"; TAG_WHY="qpdf could not write the tagged copy"; return 1
+  fi
+  rm -f "$_tg_j"
+
+  # VERIFY BEFORE INSTALLING. This overwrites a document that is in no other
+  # danger, so it may only proceed on proof: it still parses, it kept every
+  # page, and qpdf still calls it sound.
+  _tg_after="$("$c_pdfinfo" "$_tg_n" 2>/dev/null | awk '/^Pages:/{print $2; exit}')"
+  if [ -z "$_tg_after" ] || [ "$_tg_after" != "$_tg_before" ]; then
+    rm -f "$_tg_n"
+    TAG_WHY="the tagged copy has ${_tg_after:-no readable} page(s), not $_tg_before"
+    return 1
+  fi
+  "$c_qpdf" --check "$_tg_n" >/dev/null 2>&1
+  case "$?" in
+    0|3) ;;
+    *) rm -f "$_tg_n"; TAG_WHY="the tagged copy does not survive qpdf --check"; return 1 ;;
+  esac
+
+  # carry the original's mode across: cp -p makes the carrier, the new bytes go
+  # into it, and rename(2) installs it in one step
+  if ! cp -p "$_tg_f" "$_tg_m" 2>/dev/null; then
+    rm -f "$_tg_n"; TAG_WHY="could not copy the original's permissions"; return 1
+  fi
+  if ! cat "$_tg_n" >"$_tg_m" 2>/dev/null; then
+    rm -f "$_tg_n" "$_tg_m"; TAG_WHY="could not fill the replacement"; return 1
+  fi
+  rm -f "$_tg_n"
+  if ! mv -f "$_tg_m" "$_tg_f" 2>/dev/null; then
+    rm -f "$_tg_m"; TAG_WHY="could not install the tagged file"; return 1
+  fi
+  return 0
+}
+
+verify_ocr_result() { # $1 = result, $2 = original.  0 = usable, 1 = refuse
+  VERIFY_WHY=""; VERIFY_NOTEXT=""
+  # These tools are REQUIRED, not optional: a result that cannot be verified is
+  # about to replace an original that is then trashed. setup refuses to install
+  # without them, so reaching this without one means the host changed since.
+  for _vo_t in "$c_pdfinfo" "$c_qpdf" "$c_pdftotext"; do
+    [ -n "$_vo_t" ] && [ -x "$_vo_t" ] && continue
+    err 153 "Cannot verify the OCR result: pdfinfo/qpdf/pdftotext are all required
+(c_pdfinfo='$c_pdfinfo' c_qpdf='$c_qpdf' c_pdftotext='$c_pdftotext').
+Install them (brew install poppler qpdf) and re-run '$US setup'. Refusing to
+replace an original with a result nothing has checked."
+  done
+  if ! "$c_pdfinfo" "$1" >/dev/null 2>&1; then
+    VERIFY_WHY="it does not parse as a PDF"; return 1
+  fi
+  _vo_out="$(pages_of "$1")"
+  case "$_vo_out" in ''|*[!0-9]*)
+    VERIFY_WHY="its page count cannot be read"; return 1 ;;
+  esac
+  _vo_in="$(pages_of "$2")"
+  case "$_vo_in" in ''|*[!0-9]*) _vo_in="" ;; esac
+  if [ -n "$_vo_in" ] && [ "$_vo_out" -lt "$_vo_in" ]; then
+    VERIFY_WHY="it LOST pages -- $_vo_in went in, $_vo_out came out"; return 1
+  fi
+  _vo_prod="$("$c_pdfinfo" "$1" 2>/dev/null | awk -F': *' '/^Producer:/{print $2; exit}')"
+  case "$_vo_prod" in
+    *"$OCRAPP_PRODUCER_TAG"*) ;;
+    *) VERIFY_WHY="it was not produced by $OCRAPP_NAME (Producer: '${_vo_prod:-none}')"; return 1 ;;
+  esac
+
+  # Structure: qpdf walks every object and stream. pdfinfo reads only the
+  # trailer, catalog and page tree, so a valid catalog over damaged content
+  # passes it and fails here -- which is the shape a mangled result takes.
+  "$c_qpdf" --check "$1" >/dev/null 2>&1
+  _vo_q=$?
+  # qpdf's exit codes are graded and MUST be read as such:
+  #   0 = clean, 3 = warnings only, 2 (and anything else) = real damage.
+  # Treating every non-zero as damage would quarantine healthy documents over
+  # cosmetic warnings, which plenty of real-world PDFs carry.
+  case "$_vo_q" in
+    0) ;;
+    3) echo "$$| >>> [$WHAT] note: qpdf reports warnings (not damage) for '${1##*/}'" ;;
+    *) VERIFY_WHY="qpdf reports it as structurally damaged (exit $_vo_q)"; return 1 ;;
+  esac
+
+  # NO TEXT IS NOT A FAILURE. Every check above is the evidence that the OCR
+  # application ran correctly: the result parses, it is the app's own output,
+  # it kept its pages, and it is structurally sound. A page with nothing to
+  # recognise then yields no text -- a finding about the DOCUMENT (a
+  # photograph, a blank sheet), not a fault in the run. Refusing it filed
+  # perfectly good scans under FAILED and told the user the OCR had failed.
+  # Flag it so the caller can file it AND report it on its own line.
+  _vo_tx="$("$c_pdftotext" "$1" - 2>/dev/null | tr -d '[:space:]' | wc -c | tr -d ' ')"
+  case "$_vo_tx" in ''|*[!0-9]*) _vo_tx=0 ;; esac
+  [ "$_vo_tx" -eq 0 ] && VERIFY_NOTEXT=1
+  if [ -n "$_vo_in" ] && [ "$_vo_out" -gt "$_vo_in" ]; then
+    echo "$$| >>> [$WHAT] note: $OCRAPP_NAME split pages -- $_vo_in in, $_vo_out out ('${2##*/}')"
+  fi
+  return 0
+}
+
+# If THIS run started the OCR application and is now dying before part-2 could
+# close it, close it here. Otherwise it is orphaned: every later run sees it
+# "already running" and leaves it be, so one crash leaks it permanently.
+close_ocrapp_if_ours() {
+  [ "$WE_HOLD_OCRAPP_MUTEX" = "1" ] || return 0     # not our run, not our app
+  [ -s "$OCRAPP_STATEFILE" ] && return 0            # it predates us: leave it be
+  _co_p="$(pgrep -x "$OCRAPP_NAME" 2>/dev/null | xargs echo)"
+  [ -n "$_co_p" ] || return 0
+  if ocrapp_quit; then
+    :
+  else
+    echo "$$| >>> [$WHAT] WARNING :: could not close $OCRAPP_NAME (pid(s) $_co_p)"
+  fi
+  return 0
+}
+
+# The watched folder itself is NEVER staging, whatever a variable says. With
+# COLLECT_INP_PATH empty -- as it is in 'reset', which runs before it is set --
+# "$S_PATH/$COLLECT_INP_PATH" IS the watched folder, and reset rmdir'ed it: the
+# Folder Action was left attached to a folder that no longer existed. Every
+# removal of a staging directory asks this first.
+is_watched_folder() { # $1 = a directory about to be removed
+  [ "${1%/}" = "${S_PATH%/}" ]
+}
+
+# Drop what a crashed run left behind, before it can poison this one. Only
+# provably dead owners. Runs at the start of every trigger-OCR.
+self_heal() {
+  _sh_n=0
+  # A staging directory left in the watched folder belongs to a run that died
+  # before its cleanup ran. EMPTY, it is junk that misleads whoever looks.
+  # Holding files, it is DOCUMENTS: never removed here, and never merged into --
+  # the next hand-over would fail on it (err 108). 'reset' puts those files
+  # where they can be retried, and only then is the directory empty.
+  if [ -d "$S_PATH/$COLLECT_INP_PATH" ] && ! is_watched_folder "$S_PATH/$COLLECT_INP_PATH"; then
+    if rmdir "$S_PATH/$COLLECT_INP_PATH" 2>/dev/null; then
+      _sh_n=$(( _sh_n + 1 ))
+    else
+      echo "$$| >>> [$WHAT] '$S_PATH/$COLLECT_INP_PATH' is left over from a run that died and still holds document(s) -- '$US reset' puts them where they can be retried"
+    fi
+  fi
+  for _sf in $(stale_run_files); do
+    rm -f "$_sf" 2>/dev/null && _sh_n=$(( _sh_n + 1 ))
+  done
+  if [ -e "$PARTx_ERRORED_FLAGFILE" ] && [ ! -s "$PARTx_ERRORED_FLAGFILE" ]; then
+    rm -f "$PARTx_ERRORED_FLAGFILE" 2>/dev/null && _sh_n=$(( _sh_n + 1 ))
+  fi
+  [ "$_sh_n" -gt 0 ] && [ -n "$VRB$DBG" ] \
+    && echo "$$| >>> [$WHAT] self-heal: removed $_sh_n leftover file(s) from runs that are gone"
+  return 0
+}
+
+# ----------------------------------------------------------------- reset
+# Put the machinery back to clean after a crashed or killed run, and put any
+# STRANDED document back where it can be retried. It never deletes a document:
+# a file in flight is MOVED to RESET_RETRY_TO, so a reset can always be undone
+# by looking in one folder -- which is what makes it safe to run when you have
+# no idea what is wrong.
+# A queue log found at the start of a run belongs to a run whose TRIGGER is gone
+# -- this run holds the mutex. Refusing (err 047) left the documents waiting for
+# someone to type 'reset go'. But a dead trigger is not a dead run: its batch
+# may still be inside the OCR app, and its part-2 may still be waiting to file
+# it. Repairing then pulled a staged copy out from under a working OCR and took
+# the queue from a part-2 that still needed it (seen on ada, in a kill -9 test).
+# So: wait while any of that run's work is alive, and repair only once none is.
+# "Its queue is gone" is NOT "it is done": its part-2 empties the queue and
+# THEN removes its staging directory -- the next run's hand-over failed on that
+# directory (err 108, the second kill -9 test on ada). It runs right after the
+# mutex is taken, before this run creates ANY shared state, so the two runs
+# never write the same files. Still busy after OCRAPP_TIMEOUT: returns 1, the
+# caller refuses and nothing has been touched.
+preflight_dead_queue() {
+  _pf_w=0
+  while _pf_what="$(run_work_alive)"; do
+    [ "$_pf_w" -eq 0 ] && echo "$$| >>> [trigger-OCR] the run before this one is gone, but its work is not: $_pf_what -- waiting for it to finish"
+    [ "$_pf_w" -ge "${OCRAPP_TIMEOUT:-1800}" ] && {
+      echo "$$| >>> [trigger-OCR] still at work after ${_pf_w}s -- not touching it"; return 1; }
+    sleep 5; _pf_w=$(( _pf_w + 5 ))
+  done
+  [ "$_pf_w" -gt 0 ] && echo "$$| >>> [trigger-OCR] its work ended after ${_pf_w}s"
+  if [ ! -s "$QUEUED_FILE_MOVES_LOG" ]; then
+    # Its part-2 is done with every document it was handed: each staged file is
+    # a COPY whose queue entry was written before it was copied, and the queue
+    # is empty. What is left in staging is what the dead run's own cleanup would
+    # have removed -- a kill -9 just never let it -- and the next hand-over
+    # collides with it (err 108, the third kill -9 test on ada). Finish that
+    # cleanup, to the Trash.
+    for _pf_d in "$TMP_PRE_INP_PATH" "$S_PATH/$COLLECT_INP_PATH"; do
+      [ -d "$_pf_d" ] || continue
+      is_watched_folder "$_pf_d" && continue
+      rm -f "$_pf_d/.DS_Store"; rmdir "$_pf_d" 2>/dev/null && continue
+      if [ -n "$c_trash" ] && [ -x "$c_trash" ] && "$c_trash" -- "$_pf_d" >/dev/null 2>&1; then
+        echo "$$| >>> [trigger-OCR] the run that is gone left its staged copies in '$_pf_d' -- its part-2 is done with them: TRASHED them, as its own cleanup would have"
+      else
+        echo "$$| >>> [trigger-OCR] the run that is gone left its staged copies in '$_pf_d', and they could NOT be trashed -- '$US reset' shows them"
+      fi
+    done
+    return 0
+  fi
+  echo "$$| >>> [trigger-OCR] a run that is gone left its queue, and nothing of it is at work any more -- repairing it the way 'reset go' does:"
+  _rs_go=1; _rs_n=0
+  reset_stranded 2>&1 | sed "s/^/$$|  /"
+  return 0
+}
+
+# The part of reset that deals with DOCUMENTS: what a dead run left in the
+# staging directories, those directories themselves, and the queue log --
+# last, as it is the only record of where each stranded file came from.
+# 'reset' runs it after the machinery; a run that finds a dead run's queue
+# log runs it alone, before it starts (the mutex is then its own, and the
+# OCR app -- which may be someone's -- is left alone). Uses reset's _rs_
+# variables: _rs_go ('' = dry run) and the _rs_n counter.
+reset_stranded() {
+  # Documents stranded mid-flight: put them somewhere they can be RETRIED.
+  echo "  >> stranded documents -> retry"
+  _rs_dest="$RESET_RETRY_TO"
+  [ -z "$_rs_dest" ] && _rs_dest="$T_PATH.retry"
+  _rs_d=0
+  _rs_look="/tmp/${US%.*}.$$.look"; : >"$_rs_look"
+  for _rs_src in "$TMP_PRE_INP_PATH" "$S_PATH" "$T_PATH"; do
+    [ -d "$_rs_src" ] || continue
+    find "$_rs_src" -mindepth 1 -maxdepth 2 -type f ! -name '.DS_Store' \
+      >"/tmp/${US%.*}.$$.stranded" 2>/dev/null
+    while IFS= read -r _rs_f; do
+      [ -n "$_rs_f" ] || continue
+      _rs_d=$(( _rs_d + 1 ))
+      if stranded_verdict "$_rs_f" "${_rs_go:+go}"; then
+        [ -n "$_rs_go" ] && _rs_n=$(( _rs_n + 1 ))
+        continue
+      fi
+      _rs_cp="$_sv_p"
+      if [ -z "$_rs_go" ]; then
+        { echo "$_rs_f"; [ -n "$_rs_cp" ] && echo "$_rs_cp"; } >>"$_rs_look"
+        echo "        WOULD MOVE it -> '$_rs_dest/'"
+      else
+        mkdir -p "$_rs_dest" 2>/dev/null
+        _rs_t="$_rs_dest/${_rs_f##*/}"
+        [ -e "$_rs_t" ] && _rs_t="$_rs_dest/$(date +%Y-%m-%d_%H%M.%S)___${_rs_f##*/}"
+        if mv "$_rs_f" "$_rs_t" 2>/dev/null; then
+          { echo "$_rs_t"; [ -n "$_rs_cp" ] && echo "$_rs_cp"; } >>"$_rs_look"
+          echo "        moved it -> '$_rs_t'"; _rs_n=$(( _rs_n + 1 ))
+        else
+          echo "    > FAILED to move '$_rs_f' -- left where it is"
+        fi
+      fi
+    done <"/tmp/${US%.*}.$$.stranded"
+    rm -f "/tmp/${US%.*}.$$.stranded"
+  done
+  if [ "$_rs_d" -eq 0 ]; then
+    echo "    > none in flight"
+  else
+    print_open_cmd "$_rs_look"
+    # only a document that was actually SENT to retry wants the retry command;
+    # when every one was a duplicate and trashed, the line pointed at nothing
+    [ -n "$_rs_go" ] && [ -s "$_rs_look" ] && echo "    > retry them with:  $US $_rs_dest/*"
+  fi
+  rm -f "$_rs_look"
+
+  # The staging directories are machinery too, and go once nothing is left in
+  # them. This runs AFTER the documents above were handled, not only when none
+  # were found: otherwise the very run that empties a staging dir is the one
+  # that leaves it behind, and the reset after it is never empty.
+  # "Empty" is judged by LOOKING, never by trying: a dry run used to rmdir and
+  # re-create the directory to find out, which changed its owner, mode and
+  # mtime, and would have deleted it had the mkdir failed. A Finder .DS_Store
+  # is not content.
+  # reset runs BEFORE COLLECT_INP_PATH is set, so the staging name is derived
+  # here the way the main path derives it: from TMP_PRE_INP_PATH's basename.
+  # And the watched folder itself is refused outright -- with the name empty,
+  # this loop rmdir'ed ~/Public/,ocr.in and left the Folder Action on nothing.
+  _rs_coll="${COLLECT_INP_PATH:-${TMP_PRE_INP_PATH##*/}}"
+  for _rs_sd in "$S_PATH/$_rs_coll" "$TMP_PRE_INP_PATH"; do
+    [ -d "$_rs_sd" ] || continue
+    is_watched_folder "$_rs_sd" && continue
+    _rs_e=1                          # empty until something real is found
+    for _rs_x in "$_rs_sd"/* "$_rs_sd"/.[!.]* "$_rs_sd"/..?*; do
+      [ -e "$_rs_x" ] || continue    # an unmatched glob stays literal
+      [ "${_rs_x##*/}" = ".DS_Store" ] && continue
+      _rs_e=""; break
+    done
+    [ -n "$_rs_e" ] || continue
+    if [ -z "$_rs_go" ]; then
+      echo "    > WOULD REMOVE the now-empty staging dir '$_rs_sd'"
+    elif rm -f "$_rs_sd/.DS_Store" && rmdir "$_rs_sd" 2>/dev/null; then
+      echo "    > removed the now-empty staging dir '$_rs_sd'"; _rs_n=$(( _rs_n + 1 ))
+    else
+      echo "    > FAILED to remove the empty staging dir '$_rs_sd'"
+    fi
+  done
+
+  # The queued-moves log goes LAST: it is the only record of which document a
+  # stranded file came from, so it must still exist while those files are
+  # being dealt with -- removing it first destroyed the evidence.
+  if [ -s "$QUEUED_FILE_MOVES_LOG" ]; then
+    if [ -z "$_rs_go" ]; then echo "    > WOULD REMOVE the queued-moves log ($(awk 'END{print NR+0}' "$QUEUED_FILE_MOVES_LOG") entr(ies))"
+    else rm -f "$QUEUED_FILE_MOVES_LOG" && { echo "    > removed the queued-moves log"; _rs_n=$(( _rs_n + 1 )); }; fi
+  else
+    echo "    > no queued moves outstanding"
+  fi
+}
+
+do_reset() {
+  _rs_go=""; [ "$1" = "go" ] && _rs_go=1
+  if [ -n "$_rs_go" ]; then
+    echo " >>> my-ocr RESET -- putting the machinery back to clean"
+  else
+    echo " >>> my-ocr RESET -- DRY RUN. Nothing is changed. Apply with: $US reset go"
+  fi
+  _rs_n=0
+
+  # A LIVE run is not a broken one. Refuse rather than pull the rug out.
+  if [ -d "$OCRAPP_MUTEX_DIR" ]; then
+    _rs_o="$(cat "$OCRAPP_MUTEX_DIR/owner" 2>/dev/null)"
+    _rs_p="${_rs_o#pid=}"; _rs_p="${_rs_p%% *}"
+    if run_is_alive "$_rs_p"; then
+      echo "  >> a my-ocr run is LIVE (${_rs_o:-unknown}) -- nothing reset."
+      echo "     Wait for it, or stop it first. reset never interrupts real work."
+      return 1
+    fi
+  fi
+  # ...and a run whose trigger is gone may still have its parts at work.
+  _rs_pa="$(run_parts_alive)"
+  if [ -n "$_rs_pa" ]; then
+    echo "  >> a my-ocr run's part-1/part-2 is still at work (pid(s) $_rs_pa) -- nothing reset."
+    echo "     Wait for it, or stop it first. reset never interrupts real work."
+    return 1
+  fi
+
+  echo "  >> OCR mutex"
+  if [ -d "$OCRAPP_MUTEX_DIR" ]; then
+    if [ -z "$_rs_go" ]; then
+      echo "    > WOULD BREAK it: owner ${_rs_p:-unknown} is gone"
+    else
+      rm -f "$OCRAPP_MUTEX_DIR/owner"; rmdir "$OCRAPP_MUTEX_DIR" 2>/dev/null
+      echo "    > broke it: owner ${_rs_p:-unknown} is gone"; _rs_n=$(( _rs_n + 1 ))
+    fi
+  else
+    echo "    > free"
+  fi
+
+  echo "  >> leftovers from runs that are gone"
+  _rs_any=""
+  for _rs_f in $(stale_run_files); do
+    _rs_any=1
+    if [ -z "$_rs_go" ]; then echo "    > WOULD REMOVE ${_rs_f##*/}"
+    else rm -f "$_rs_f" && { echo "    > removed ${_rs_f##*/}"; _rs_n=$(( _rs_n + 1 )); }; fi
+  done
+  for _rs_f in "$PARTx_ERRORED_FLAGFILE" "$DBG_FLAGFILE" "$FORCE_FLAGFILE" "$INTERACTIVE_FLAGFILE"; do
+    [ -e "$_rs_f" ] || continue
+    _rs_any=1
+    if [ -z "$_rs_go" ]; then echo "    > WOULD REMOVE ${_rs_f##*/}"
+    else rm -f "$_rs_f" && { echo "    > removed ${_rs_f##*/}"; _rs_n=$(( _rs_n + 1 )); }; fi
+  done
+  [ -z "$_rs_any" ] && echo "    > none"
+
+  # A run that dies before part-2 orphans the OCR application. Every later run
+  # then sees it "already running", records it as pre-existing, and correctly
+  # leaves it alone -- so one crash leaks it for ever. With no my-ocr live, a
+  # running OCR app is by definition nobody's, and closing it is machinery.
+  echo "  >> $OCRAPP_NAME left over from a crashed run"
+  _rs_ap="$(pgrep -x "$OCRAPP_NAME" 2>/dev/null | xargs echo)"
+  if [ -z "$_rs_ap" ]; then
+    echo "    > not running"
+  elif [ -z "$_rs_go" ]; then
+    echo "    > WOULD CLOSE it (pid(s) $_rs_ap) -- no my-ocr run is live, so it is orphaned"
+  elif ocrapp_quit; then
+    echo "    > closed it (pid(s) $_rs_ap)"; _rs_n=$(( _rs_n + 1 ))
+  else
+    echo "    > FAILED to close it (pid(s) $_rs_ap) -- close it by hand"
+  fi
+
+  echo "  >> lockfile / queued moves"
+  if [ -s "$OCRAPP_LOCKFILE" ]; then
+    if [ -z "$_rs_go" ]; then echo "    > WOULD EMPTY the lockfile"
+    else printf "" > "$OCRAPP_LOCKFILE" && { echo "    > emptied the lockfile"; _rs_n=$(( _rs_n + 1 )); }; fi
+  else
+    echo "    > lockfile clean"
+  fi
+
+  reset_stranded
+
+  echo
+  if [ -z "$_rs_go" ]; then
+    echo " >>> this was a dry run -- apply it with:  $US reset go"
+  else
+    echo " >>> reset OK -- $_rs_n item(s) cleaned, no document deleted [0]"
+  fi
+  return 0
+}
+
+# ----------------------------------------------------------------- setup
+# my-ocr's OWN Folder Action, on its OWN in-path. Nothing here knows about
+# scanners; my-scan sets up its own and the two never meet.
+# Resolve a directory to its physical path: System Events stores the RESOLVED
+# path of a folder action, so a symlinked one never string-matches.
+canon_dir() {
+  ( cd "$1" 2>/dev/null && pwd -P ) 2>/dev/null || printf '%s\n' "$1"
+}
+
+# Run an AppleScript with a bound on it; combined output lands in $OSA_OUT.
+# 0 = ok, 1 = script error, 2 = killed for overrunning OSASCRIPT_TIMEOUT.
+osa_run() {
+  OSA_OUT=""
+  _osa_scr="$(mktemp /tmp/my-ocr.osa.XXXXXX)"    || return 1
+  _osa_res="$(mktemp /tmp/my-ocr.osaout.XXXXXX)" || { rm -f "$_osa_scr"; return 1; }
+  cat >"$_osa_scr"
+  /usr/bin/osascript "$_osa_scr" >"$_osa_res" 2>&1 &
+  _osa_pid=$!
+  _osa_max="$OSASCRIPT_TIMEOUT"
+  [ "$_osa_max" -eq "$_osa_max" ] 2>/dev/null || _osa_max=180
+  _osa_w=0
+  while kill -0 "$_osa_pid" 2>/dev/null; do
+    [ "$_osa_w" -ge "$_osa_max" ] && break
+    sleep 1
+    _osa_w=$(( _osa_w + 1 ))
+  done
+  if kill -0 "$_osa_pid" 2>/dev/null; then
+    kill -9 "$_osa_pid" 2>/dev/null
+    OSA_OUT="osascript did not answer within ${_osa_max}s"
+    rm -f "$_osa_scr" "$_osa_res"
+    return 2
+  fi
+  wait "$_osa_pid" 2>/dev/null
+  _osa_rc=$?
+  OSA_OUT="$(cat "$_osa_res")"
+  rm -f "$_osa_scr" "$_osa_res"
+  [ "$_osa_rc" -eq 0 ] || return 1
+  return 0
+}
+
+# Can an Automation consent dialog actually be answered from here?
+osa_can_prompt() {
+  [ -n "$SSH_CONNECTION$SSH_TTY$SSH_CLIENT" ] && return 1
+  [ "$(/usr/bin/stat -f%Su /dev/console 2>/dev/null)" = "$WHOAMI" ] || return 1
+  return 0
+}
+
+# Generate the three-step Automator workflow: part-1, the OCR application's own
+# Automator action, part-2. This existed only as a hand-built file before, so
+# nothing recreated it and my-ocr simply would not work on a new machine.
+setup_write_workflow() {
+  _sw_wf="$WORKFLOW_DIR/$WORKFLOW_NAME"
+  export_config_check
+  export_quality; _sw_q="$EXPORT_Q"; _sw_qk="$EXPORT_QK"
+  [ "$OCRAPP_MRC" = "1" ] && _sw_m="on" || _sw_m="off"
+  _sw_ex="MRC $_sw_m, image quality $_sw_q ($(quality_name "$_sw_q")) [OCRAPP_MRC=$OCRAPP_MRC -> $_sw_qk=$_sw_q]"
+
+  # Automator runs a workflow whose shell it does not offer by doing nothing at
+  # all -- silently. Refuse to write one rather than ship a dead Folder Action.
+  [ -n "$WORKFLOW_SHELL" ] || WORKFLOW_SHELL="/bin/zsh"
+  case "$WORKFLOW_SHELL" in
+    /bin/bash|/bin/csh|/bin/ksh|/bin/sh|/bin/tcsh|/bin/zsh) ;;
+    /usr/bin/perl|/usr/bin/ruby|/usr/local/bin/python|/usr/local/bin/python3) ;;
+    *) err 139 "WORKFLOW_SHELL '$WORKFLOW_SHELL' is not one Automator accepts. Its Run Shell Script step silently does nothing with any other shell. Use one of: /bin/zsh /bin/sh /bin/bash /bin/ksh /bin/csh /bin/tcsh." ;;
+  esac
+
+  # The shell steps must call the path cleanup() greps for, or it cannot kill
+  # its own children. Compare the two rather than trusting they still agree.
+  if ! grep -q "w=\"\[\^ \]\* $WORKFLOW_MY_OCR --part-\$a\"" "$0"; then
+    echo "    > WARNING: WORKFLOW_MY_OCR is '$WORKFLOW_MY_OCR' but cleanup() looks"
+    echo "               for a different path -- children may survive a kill."
+  fi
+
+  if [ -z "$_su_go" ]; then
+    echo "    > WOULD WRITE a THREE-step workflow into '$_sw_wf':"
+    echo "        1. $WORKFLOW_MY_OCR --part-1"
+    echo "        2. $OCRAPP_NAME 'Convert to PDF Document'  -> $T_PATH"
+    echo "           languages: $OCR_LANGUAGES"
+    echo "           export: $_sw_ex"
+    echo "        3. $WORKFLOW_MY_OCR --part-2"
+    return 0
+  fi
+
+  if [ -d "$_sw_wf" ]; then
+    _sw_bak="$_sw_wf.bak-$(date -u +%Y%m%dT%H%M%SZ)"
+    if mv "$_sw_wf" "$_sw_bak" 2>/dev/null; then
+      echo "    > backed the existing workflow up to '$_sw_bak'"
+    fi
+  fi
+  mkdir -p "$_sw_wf/Contents" || { err 136 "FAILED to create '$_sw_wf/Contents'."; return 1; }
+
+  cat >"$_sw_wf/Contents/Info.plist" <<_EOIP_
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>AMFolderAction</key>
+	<string>AMAddingFolderItems</string>
+</dict>
+</plist>
+_EOIP_
+
+  _sw_doc="$_sw_wf/Contents/document.wflow"
+  _sw_err="$(mktemp /tmp/my-ocr.wflow.XXXXXX)" || return 1
+  MY_OCR_BIN="$WORKFLOW_MY_OCR" \
+  MY_OCR_SHELL="$WORKFLOW_SHELL" \
+  OCR_ACTION="$OCRAPP_PATH/Contents/Library/Automator/ExportToPdf.action" \
+  OCR_APPNAME="$OCRAPP_NAME" \
+  OCR_SAVE="$T_PATH" \
+  OCR_LANGS="$OCR_LANGUAGES" \
+  OCR_INPATH="$S_PATH" \
+  OCR_EXPORT_MRC="$OCRAPP_MRC" \
+  OCR_EXPORT_QUALITY="$_sw_q" \
+  /usr/bin/python3 - "$_sw_doc" 2>"$_sw_err" <<'_EOPY_'
+import os, plistlib, sys, uuid
+
+BIN    = os.environ["MY_OCR_BIN"]
+SHELL_ = os.environ["MY_OCR_SHELL"]
+ACT    = os.environ["OCR_ACTION"]
+APP    = os.environ["OCR_APPNAME"]
+SAVE   = os.environ["OCR_SAVE"]
+LANGS  = os.environ["OCR_LANGS"]
+INPATH = os.environ["OCR_INPATH"]
+# checked by export_config_check before this runs: MRC 0/1, quality 0/1/2
+MRC    = os.environ["OCR_EXPORT_MRC"] == "1"
+QUAL   = int(os.environ["OCR_EXPORT_QUALITY"])
+
+def shell(cmd, uid):
+    return {"action": {
+        "AMAccepts": {"Container": "List", "Optional": False,
+                      "Types": ["com.apple.cocoa.string"]},
+        "AMActionVersion": "2.0.3",
+        "AMApplication": ["Automator"],
+        "AMParameterProperties": {
+            "COMMAND_STRING": {}, "CheckedForUserDefaultShell": {},
+            "inputMethod": {}, "shell": {}, "source": {}},
+        "AMProvides": {"Container": "List", "Types": ["com.apple.cocoa.string"]},
+        "ActionBundlePath": "/System/Library/Automator/Run Shell Script.action",
+        "ActionName": "Run Shell Script",
+        "ActionParameters": {
+            "COMMAND_STRING": cmd,
+            "CheckedForUserDefaultShell": True,
+            "inputMethod": 0,
+            "shell": SHELL_,
+            "source": ""},
+        "BundleIdentifier": "com.apple.RunShellScript",
+        "CFBundleVersion": "2.0.3",
+        "CanShowSelectedItemsWhenRun": False,
+        "CanShowWhenRun": True,
+        "Category": ["AMCategoryUtilities"],
+        "Class Name": "RunShellScriptAction",
+        "InputUUID": str(uuid.uuid4()),
+        "Keywords": ["Shell", "Script", "Command", "Run", "Unix"],
+        "OutputUUID": str(uuid.uuid4()),
+        "UUID": uid,
+        "UnlocalizedApplications": ["Automator"],
+        "arguments": {},
+        "isViewVisible": 1,
+        "location": "309.000000:253.000000",
+        "nibPath": "/System/Library/Automator/Run Shell Script.action/Contents/Resources/Base.lproj/main.nib"}}
+
+def ocr(uid):
+    # Parameters mirror the hand-built workflow this replaces; only the save
+    # path and the language list are driven by my-ocr's own configuration.
+    return {"action": {
+        "AMAccepts": {"Container": "List", "Optional": True,
+                      "Types": ["com.apple.cocoa.path"]},
+        "AMActionVersion": "1.0",
+        "AMApplication": [APP],
+        "AMParameterProperties": {
+            "AFRBlockIsCreated": {}, "AFRKeySaveFileName": {},
+            "AFRKeySavePath": {"variableUUIDsInMenu": []}, "AFRKeyViewMode": {},
+            "AFRMergeFiles": {}, "AFRReplaceExistingFile": {},
+            "exportPdfCreateOutline": {}, "exportPdfEmbedFonts": {},
+            "exportPdfEnabledTaggedPDF": {}, "exportPdfExportMode": {},
+            "exportPdfImageQuality": {},
+            "exportPdfKeepPageNumbersHeadersAndFooters": {},
+            "exportPdfKeepPictures": {}, "exportPdfKeepTextAndBackgroundColor": {},
+            "exportPdfMakePdfACompliant": {}, "exportPdfPaperMargins": {},
+            "exportPdfPaperSize": {}, "exportPdfUseMRC": {},
+            "exportSaveOption": {}, "preferencesRecognitionLanguages": {}},
+        "AMProvides": {"Container": "List", "Types": ["com.apple.cocoa.path"]},
+        "AMRequiredResources": [],
+        "ActionBundlePath": ACT,
+        "ActionName": "Convert to PDF Document",
+        "ActionParameters": {
+            "AFRBlockIsCreated": True,
+            "AFRKeySaveFileName": "",
+            "AFRKeySavePath": SAVE,
+            "AFRKeyViewMode": 1,
+            "AFRMergeFiles": False,
+            "AFRReplaceExistingFile": True,
+            "exportPdfCreateOutline": False,
+            "exportPdfEmbedFonts": True,
+            "exportPdfEnabledTaggedPDF": True,
+            "exportPdfExportMode": 2,
+            # both from the config (OCRAPP_MRC + the quality key that goes
+            # with it); the reasons for the defaults are in
+            # default_config_content()
+            "exportPdfImageQuality": QUAL,
+            "exportPdfKeepPageNumbersHeadersAndFooters": True,
+            "exportPdfKeepPictures": True,
+            "exportPdfKeepTextAndBackgroundColor": True,
+            "exportPdfMakePdfACompliant": False,
+            "exportPdfPaperMargins": "1.180555, 0.7881944, 0,59027777, 0.7881944",
+            "exportPdfPaperSize": "0,0",
+            "exportPdfUseMRC": MRC,
+            "exportSaveOption": 3,
+            "preferencesRecognitionLanguages": LANGS},
+        "BundleIdentifier": "com.abbyy.ExportToPdf",
+        "CFBundleVersion": "1.0",
+        "CanShowSelectedItemsWhenRun": False,
+        "CanShowWhenRun": True,
+        "Category": ["AMCategoryDocuments"],
+        "Class Name": "AMRemoteAction",
+        "InputUUID": str(uuid.uuid4()),
+        "Keywords": [],
+        "OutputUUID": str(uuid.uuid4()),
+        "UUID": uid,
+        "UnlocalizedApplications": [APP],
+        "arguments": {},
+        "isViewVisible": True,
+        "location": "301.500000:709.000000",
+        "nibPath": ACT + "/Contents/Resources/main.nib"}}
+
+u1, u2, u3 = (str(uuid.uuid4()) for _ in range(3))
+acts = [
+    shell('while read a; do echo "$a"; done|%s --part-1' % BIN, u1),
+    ocr(u2),
+    shell('while read a; do echo "$a"; done|%s --part-2' % BIN, u3),
+]
+
+# A multi-step workflow does NOT chain by array order: Automator follows the
+# connectors, and without them the OCR step and part-2 never receive input.
+def link(a, b):
+    return {"from": "%s - %s" % (a, a), "to": "%s - %s" % (b, b)}
+
+doc = {
+    "AMApplicationBuild": "528",
+    "AMApplicationVersion": "2.10",
+    "AMDocumentVersion": "2",
+    "actions": acts,
+    "connectors": {str(uuid.uuid4()): link(u1, u2),
+                   str(uuid.uuid4()): link(u2, u3)},
+    "variables": [],
+    "workflowMetaData": {
+        "folderActionFolderPath": INPATH,
+        "workflowTypeIdentifier": "com.apple.Automator.folderAction"},
+}
+with open(sys.argv[1], "wb") as fh:
+    plistlib.dump(doc, fh)
+_EOPY_
+  _sw_rc=$?
+  if [ "$_sw_rc" -ne 0 ]; then
+    err 137 "FAILED [$_sw_rc] to generate '$_sw_doc': $(tail -n 3 "$_sw_err" | tr '\n' ' ')"
+    rm -f "$_sw_err"; return 1
+  fi
+  rm -f "$_sw_err"
+
+  # verify what landed on disk rather than trusting the generator
+  /usr/bin/plutil -lint "$_sw_doc" >/dev/null 2>&1 \
+    || { err 138 "'$_sw_doc' is not a valid plist."; return 1; }
+  _sw_n="$(/usr/bin/plutil -extract actions raw -o - "$_sw_doc" 2>/dev/null)"
+  if [ "$_sw_n" != "3" ]; then
+    err 171 "'$_sw_doc' has $_sw_n step(s), expected 3."
+    return 1
+  fi
+  echo "    > wrote a ${_sw_n}-step workflow, plist lints clean [0]"
+  echo "    > export: $_sw_ex"
+  return 0
+}
+
+# Bind the workflow to the in-path through System Events, then read the
+# bindings back and say what Folder Actions Setup should now show.
+setup_attach_workflow() {
+  if [ -z "$_su_go" ]; then
+    echo "    > WOULD ATTACH '$WORKFLOW_NAME' to '$S_PATH'"
+    return 0
+  fi
+
+  if ! osa_can_prompt; then
+    echo "    > NOTE: macOS may now ask '...wants access to control System Events'"
+    echo "            ON THE CONSOLE of $(hostname -s) -- go there and click Allow."
+  fi
+
+  osa_run <<_EOAS_
+tell application "System Events"
+	set folder actions enabled to true
+	set p to POSIX file "$S_PATH" as alias
+	try
+		set fa to folder action (name of (info for p))
+	on error
+		set fa to make new folder action at end of folder actions with properties {path:"$S_PATH"}
+	end try
+	tell fa
+		set enabled to true
+		try
+			get script "$WORKFLOW_NAME"
+		on error
+			make new script at end of scripts with properties {name:"$WORKFLOW_NAME"}
+		end try
+	end tell
+end tell
+_EOAS_
+  _sa_st=$?
+  if [ "$_sa_st" -eq 0 ]; then
+    echo "    > attached '$WORKFLOW_NAME' to '$S_PATH' [0]"
+  elif [ "$_sa_st" -eq 2 ]; then
+    echo "    > TIMED OUT: $OSA_OUT"
+    echo "      The consent dialog is probably waiting on the console of $(hostname -s)."
+    echo "      Click Allow there, then re-run '$US setup go'."
+    return 1
+  else
+    echo "    > COULD NOT attach automatically: $OSA_OUT"
+    echo "      System Settings -> Privacy & Security -> Automation -> your terminal"
+    echo "      -> allow 'System Events'. Or attach it by hand:"
+    echo "      right-click '$S_PATH' -> Services -> Folder Actions Setup."
+    return 1
+  fi
+
+  # Read back, and name any OTHER script on our folder. A second workflow can
+  # be deliberate, so this warns rather than refuses.
+  osa_run <<'_EOSV_' || return 0
+tell application "System Events"
+	set out to ""
+	set fas to {}
+	try
+		set fas to folder actions
+	end try
+	repeat with fa in fas
+		set fn to ""
+		try
+			set fn to POSIX path of (path of fa)
+		end try
+		if fn is "" then
+			try
+				set fn to (path of fa) as text
+			end try
+		end if
+		if fn is "" then set fn to "-"
+		set scs to {}
+		try
+			set scs to scripts of fa
+		end try
+		repeat with sc in scs
+			set sn to "-"
+			try
+				set sn to (name of sc) as text
+			end try
+			set out to out & fn & tab & sn & linefeed
+		end repeat
+	end repeat
+	return out
+end tell
+_EOSV_
+
+  _sa_mine="$(canon_dir "$S_PATH")"
+  _sa_other=""
+  # '%s\n', not '%s': the command substitution stripped the trailing newline,
+  # and read returns non-zero at EOF, silently dropping the LAST record.
+  _sa_tab="$(printf '\t')"
+  printf '%s\n' "$OSA_OUT" | while IFS="$_sa_tab" read -r _sa_f _sa_s; do
+    [ -z "$_sa_f" ] && continue
+    [ "$(canon_dir "$_sa_f")" = "$_sa_mine" ] || continue
+    if [ "$_sa_s" = "$WORKFLOW_NAME" ]; then
+      echo "    > bound: $_sa_s  on '$S_PATH'"
+    else
+      echo "    > ALSO bound: $_sa_s"
+    fi
+  done
+
+  _sa_other="$(printf '%s\n' "$OSA_OUT" | awk -F"$_sa_tab" -v d="$_sa_mine" -v w="$WORKFLOW_NAME" \
+      '$1!="" && $2!=w { print $1 "\t" $2 }' | while IFS="$_sa_tab" read -r _f _s; do
+         [ "$(canon_dir "$_f")" = "$_sa_mine" ] && printf '%s ' "$_s"
+       done)"
+  if [ -n "$_sa_other" ]; then
+    echo
+    echo "    > WARNING: another script also runs on '$S_PATH': $_sa_other"
+    echo "      macOS fires EVERY attached script for each new file, so each"
+    echo "      document is OCRed more than once. Intended? Leave it. Otherwise:"
+    echo "      detach it in Folder Actions Setup -- select the folder, select"
+    echo "      the script, click '-'."
+  fi
+  return 0
+}
+
+# The inverse of setup: take the wiring OUT, and nothing else. It removes ONLY
+# what setup put in -- our own script, and the workflow setup generated. Another
+# tool's script on the same folder is left alone, and the folder action itself
+# survives while any script still needs it. It never touches ,ocr.in, ,ocr.out,
+# a queue or a document: removing the trigger must not be able to lose a scan.
+do_uninstall() {
+  _uu_go=""; [ "$1" = "go" ] && _uu_go=1
+
+  _uu_gui="$(/usr/bin/stat -f%Su /dev/console 2>/dev/null)"
+  if [ "$(id -u)" = "0" ]; then
+    err 140 "Run '$US uninstall' as the GUI user, not as root.
+The Folder Action belongs to the caller's login session; as root you would be
+detaching root's, not '${_uu_gui:-the console user}'s.
+Try:   su - ${_uu_gui:-<the console user>} -c '$US uninstall${1:+ $1}'"
+  fi
+
+  if [ -n "$_uu_go" ]; then
+    echo " >>> my-ocr UNINSTALL -- removing the wiring, for GUI user '$(id -un)' on $(hostname -s)"
+  else
+    echo " >>> my-ocr UNINSTALL -- DRY RUN. Nothing is changed. Apply with: $US uninstall go"
+  fi
+  echo "    > ,ocr.in, ,ocr.out, queues and documents are never touched"
+
+  echo "  >> Folder Action on '$S_PATH'"
+  if [ -z "$_uu_go" ]; then
+    echo "    > WOULD DETACH '$WORKFLOW_NAME' from '$S_PATH'"
+  else
+    osa_run <<_EOUN_
+tell application "System Events"
+	set p to POSIX file "$S_PATH" as alias
+	try
+		set fa to folder action (name of (info for p))
+		tell fa
+			try
+				delete script "$WORKFLOW_NAME"
+			end try
+		end tell
+		if (count of scripts of fa) is 0 then delete fa
+	end try
+end tell
+_EOUN_
+    _uu_st=$?
+    if [ "$_uu_st" -eq 0 ]; then
+      echo "    > detached '$WORKFLOW_NAME' from '$S_PATH' [0]"
+    elif [ "$_uu_st" -eq 2 ]; then
+      echo "    > TIMED OUT: $OSA_OUT"
+      echo "      a consent dialog may be waiting on the console of $(hostname -s)."
+    else
+      echo "    > COULD NOT detach automatically: $OSA_OUT"
+      echo "      Do it by hand: right-click '$S_PATH' -> Services -> Folder Actions Setup."
+    fi
+  fi
+
+  _uu_wf="$WORKFLOW_DIR/$WORKFLOW_NAME"
+  echo "  >> Automator workflow '$_uu_wf'"
+  if [ ! -d "$_uu_wf" ]; then
+    echo "    > not present -- nothing to remove"
+  elif [ -z "$_uu_go" ]; then
+    echo "    > WOULD REMOVE it (to the Trash, so it stays recoverable)"
+  elif [ -n "$c_trash" ] && [ -x "$c_trash" ]; then
+    if "$c_trash" -- "$_uu_wf" >/dev/null 2>&1; then echo "    > moved to the Trash [0]"
+    else echo "    > COULD NOT trash it -- remove '$_uu_wf' by hand"; fi
+  else
+    echo "    > no trash command -- remove '$_uu_wf' by hand (not deleting it here)"
+  fi
+
+  echo
+  if [ -z "$_uu_go" ]; then
+    echo " >>> this was a dry run -- apply it with:  $US uninstall go"
+  else
+    echo " >>> done. '$US setup go' puts it back."
+  fi
+  return 0
+}
+
+do_setup() {
+  _su_go=""; [ "$1" = "go" ] && _su_go=1
+
+  # Every path my-ocr uses is built from $WHOAMI -- S_PATH is
+  # /Users/$WHOAMI/Public/,ocr.in -- and the Folder Action belongs to the
+  # caller's login session. As root that means /Users/root/Public/,ocr.in,
+  # which setup would cheerfully CREATE, and a binding in a session no scan
+  # ever reaches. It would look like it worked.
+  _su_gui="$(/usr/bin/stat -f%Su /dev/console 2>/dev/null)"
+  if [ "$(id -u)" = "0" ]; then
+    err 134 "Run '$US setup' as the GUI user, not as root.
+Every path here is built from \$WHOAMI (here: '$WHOAMI'), and the Folder
+Action belongs to the caller's login session -- as root both would be root's.
+Try:   su - ${_su_gui:-<the console user>} -c '$US setup${1:+ $1}'"
+  fi
+  if [ -n "$_su_gui" ] && [ "$_su_gui" != "$WHOAMI" ]; then
+    echo "    > WARNING: you are '$WHOAMI' but the console (GUI) user is '$_su_gui'."
+    echo "               The Folder Action must belong to the account whose"
+    echo "               session the files arrive in -- check the paths below."
+  fi
+  if [ -n "$_su_go" ]; then
+    echo " >>> my-ocr SETUP -- applying, for GUI user '$(id -un)' on $(hostname -s)"
+  else
+    echo " >>> my-ocr SETUP -- DRY RUN. Nothing is changed. Apply with: $US setup go"
+  fi
+
+  _su_fail=0
+  echo "  >> Preflight"
+
+  # The OCR application, and the Automator action it must expose. Without
+  # these a Folder Action would be wired to something that cannot work, and
+  # the failure would only surface on the first real scan.
+  if [ -d "$OCRAPP_PATH" ]; then
+    echo "    > $OCRAPP_NAME  OK   $OCRAPP_PATH"
+  else
+    echo "    > $OCRAPP_NAME  MISSING at '$OCRAPP_PATH' -- install it, or fix OCRAPP_PATH"
+    _su_fail=1
+  fi
+  _su_act="$OCRAPP_PATH/Contents/Library/Automator/ExportToPdf.action"
+  if [ -d "$_su_act" ]; then
+    echo "    > OCR action    OK   $_su_act"
+  else
+    echo "    > OCR action    MISSING at '$_su_act'"
+    echo "                    the workflow's OCR step cannot load without it"
+    _su_fail=1
+  fi
+
+  # An UNSET tool is not "nothing to check" -- it is a capability that will
+  # fail at the first file that needs it. Name it rather than skipping it.
+  for _su_n in trash convert pdfinfo qpdf pdftotext; do
+    eval "_su_c=\$c_$_su_n"
+    if [ -z "$_su_c" ]; then
+      echo "    > $(printf '%-13s' "$_su_n") NOT SET (c_$_su_n) -- a declared capability that would fail at the first file needing it"
+      _su_fail=1
+      continue
+    fi
+    if [ -x "$_su_c" ]; then echo "    > $(printf '%-13s' "${_su_c##*/}") OK   $_su_c"
+    else echo "    > $(printf '%-13s' "${_su_c##*/}") MISSING at '$_su_c'"; _su_fail=1; fi
+  done
+
+  _su_auto=""
+  for _su_c in /System/Applications/Automator.app /Applications/Automator.app; do
+    [ -d "$_su_c" ] && _su_auto="$_su_c" && break
+  done
+  if [ -n "$_su_auto" ]; then echo "    > Automator     OK   $_su_auto"
+  else echo "    > Automator     MISSING"; _su_fail=1; fi
+  # Not a reason to skip the wiring -- it is right either way, and enabling the
+  # setting afterwards is all it takes -- but the run cannot work until then.
+  _su_3p=""
+  if _su_3s="$(automator_3pp_state)"; then echo "    > third-party   OK   Automator actions enabled [$_su_3s]"
+  else echo "    > third-party   OFF  -- the $OCRAPP_NAME step will be refused: $AUTOMATOR_3PP_HOWTO [$_su_3s]"; _su_3p=1; fi
+
+  echo "  >> Directories"
+  for _su_d in "$S_PATH" "$T_PATH" "$(dirname "$OCRAPP_LOCKFILE")"; do
+    if [ -d "$_su_d" ]; then
+      echo "    > OK       $_su_d"
+    elif [ -z "$_su_go" ]; then
+      echo "    > WOULD CREATE  $_su_d"
+    elif mkdir -p "$_su_d" 2>/dev/null; then
+      echo "    > CREATED  $_su_d"
+    else
+      echo "    > CANNOT CREATE $_su_d"; _su_fail=1
+    fi
+  done
+
+  echo "  >> Automator workflow '$WORKFLOW_DIR/$WORKFLOW_NAME'"
+  if [ "$_su_fail" = "0" ]; then
+    setup_write_workflow || _su_fail=1
+  else
+    echo "    > SKIPPED -- fix the MISSING items above first"
+  fi
+
+  echo "  >> Folder Action on '$S_PATH'"
+  if [ "$_su_fail" = "0" ]; then
+    setup_attach_workflow || _su_fail=1
+  else
+    echo "    > SKIPPED -- fix the MISSING items above first"
+  fi
+
+  echo
+  if [ "$_su_fail" != "0" ]; then echo " >>> preflight INCOMPLETE [$_su_fail] -- fix the MISSING items above"
+  elif [ -n "$_su_3p" ]; then echo " >>> wired, but NOT ready -- enable third-party Automator actions (see above)"
+  else echo " >>> preflight OK [0]"; fi
+  echo
+  do_status "     "
+  return $_su_fail
+}
+
+# --- --status and setup must be READ-ONLY: no lock, no OCR, no side effects
+# Two my-ocr processes overlap by design: one holds the mutex while another
+# queues. Anything they share by NAME, or create before their turn, is a race.
+# --- a crash must not leave a dialog that blocks the next unattended run.
+# A plist PATH is a defaults domain too, so nothing of the user's is touched.
+# --- the leftover document: cleared only when it is provably my-ocr's own.
+# The decision is made from _FRBatch.pac, the only place a source is named.
+# --- the OCR app is CLOSED, never killed: a signal skips a Cocoa app's quit
+# path, and the abnormal exit is what leaves the crash dialog AND the document
+# that blocks the next run.
+# --- a summary may not print a number that cannot be true.
+# --- a stalled OCR app: grinding, or waiting on a dialog? CPU time decides.
+# --- reset keeps its only evidence until it has dealt with the documents
+# --- a stranded file is removed only when BYTE-IDENTICAL to its document
+rt_stranded_verdict() {
+  _v="$T_TMP/verdict"; mkdir -p "$_v"
+  t_mkpdf "$_v/filed.pdf" 2 FineReader "one two three"
+  cp "$_v/filed.pdf" "$_v/same.#1.pdf"                       # a true copy
+  t_mkpdf "$_v/other.#1.pdf" 2 FineReader "one two four"     # same scan, other OCR
+  t_mkpdf "$_v/nolog.#1.pdf" 1 FineReader "alone"            # no record at all
+  T='	'
+  {
+    printf '%s%s/,ocr.in/same.#1.pdf%s/,ocr.out/same.#1.pdf%s%s\n'   "$_v/o1" "$T$_v" "$T$_v" "$T" "$_v/filed.pdf"
+    printf '%s%s/,ocr.in/other.#1.pdf%s/,ocr.out/other.#1.pdf%s%s\n' "$_v/o2" "$T$_v" "$T$_v" "$T" "$_v/filed.pdf"
+  } >"$_v/log"
+  printf '#!/bin/dash\nshift 2>/dev/null\nrm -rf "$@"\n' >"$_v/trash"; chmod +x "$_v/trash"
+  _o="$( QUEUED_FILE_MOVES_LOG="$_v/log"; c_trash="$_v/trash"
+         stranded_verdict "$_v/same.#1.pdf" "";   echo "rc=$?"
+         [ -e "$_v/same.#1.pdf" ] && echo "DRYRUN-KEPT"
+         stranded_verdict "$_v/same.#1.pdf" go;   echo "rc=$?"
+         [ -e "$_v/same.#1.pdf" ] || echo "GONE"
+         stranded_verdict "$_v/other.#1.pdf" go;  echo "rc=$?"
+         [ -e "$_v/other.#1.pdf" ] && echo "OTHER-KEPT"
+         stranded_verdict "$_v/nolog.#1.pdf" go;  echo "rc=$?"
+         [ -e "$_v/nolog.#1.pdf" ] && echo "NOLOG-KEPT" )"
+  case "$_o" in *"WOULD TRASH"*"DRYRUN-KEPT"*)
+    t_ok "verdict: a dry run names the byte-identical copy and trashes NOTHING";;
+  *) t_bad "verdict: a dry run names the byte-identical copy and trashes NOTHING" "$_o";; esac
+  case "$_o" in *"TRASHED it -- in the Trash, recoverable"*"GONE"*)
+    t_ok "verdict: with go, a byte-identical copy goes to the TRASH, never rm";;
+  *) t_bad "verdict: with go, a byte-identical copy goes to the TRASH, never rm" "$_o";; esac
+  # shellcheck disable=SC2016  # matching literal source text
+  if awk '/^stranded_verdict\(\) \{/,/^\}/' "$0" | grep -q 'rm -f "\$1"'; then
+    t_bad "verdict: the removal path uses trash, not rm" "an rm is still in there"
+  else
+    t_ok "verdict: the removal path uses trash, not rm"
+  fi
+  case "$_o" in *"DIFFERS from its filed copy: kept"*"OTHER-KEPT"*)
+    t_ok "verdict: same scan, different OCR -- DIFFERS and is kept, never removed";;
+  *) t_bad "verdict: same scan, different OCR -- DIFFERS and is kept, never removed" "$_o";; esac
+  case "$_o" in *"no record of the document"*"NOLOG-KEPT"*)
+    t_ok "verdict: no record of its document -- kept";;
+  *) t_bad "verdict: no record of its document -- kept" "$_o";; esac
+  # the fixture writes its text on EVERY page: 2 x "one two three" = 6 words, 22 chars
+  case "$_o" in *"stranded: "*" B, 2 pages, 6 words, 22 chars"*"filed:    "*" B, 2 pages, 6 words, 22 chars"*)
+    t_ok "verdict: both copies show bytes, pages, words and chars";;
+  *) t_bad "verdict: both copies show bytes, pages, words and chars" "$_o";; esac
+}
+
+# --- what reset keeps, it hands over as ONE command that opens it
+# --- the hand-over can be made AGAIN, and it moves documents, never loses them
+rt_nudge() {
+  _n="$T_TMP/nudge"; mkdir -p "$_n/watched/staging" "$_n/out"; rmdir "$_n/out"
+  : >"$_n/watched/staging/doc.#1.pdf"; : >"$_n/watched/staging/two.#1.pdf"
+  if nudge_handover "$_n/watched/staging" "$_n/out" \
+     && [ -f "$_n/watched/staging/doc.#1.pdf" ] && [ -f "$_n/watched/staging/two.#1.pdf" ] \
+     && [ ! -e "$_n/out" ]; then
+    t_ok "nudge: the staging dir leaves the watched folder and comes back, with both documents"
+  else
+    t_bad "nudge: the staging dir leaves the watched folder and comes back, with both documents" \
+          "$(find "$_n" | tr '\n' ' ')"
+  fi
+  if nudge_handover "$_n/watched/absent" "$_n/out"; then
+    t_bad "nudge: nothing to hand over means it says so" "returned 0 for a missing dir"
+  else
+    t_ok "nudge: nothing to hand over means it says so"
+  fi
+  # shellcheck disable=SC2016  # matching literal source text
+  if grep -q 'OCRAPP_TRIGGER_WAIT=' "$0" && awk '/^wait_for_/,0' "$0" | grep -q nudge_handover \
+     || grep -q 'nudge_handover "\$S_PATH/\$COLLECT_INP_PATH"' "$0"; then
+    t_ok "nudge: the wait re-triggers after OCRAPP_TRIGGER_WAIT, and 0 disables it"
+  else
+    t_bad "nudge: the wait re-triggers after OCRAPP_TRIGGER_WAIT, and 0 disables it" "not wired in"
+  fi
+}
+
+# --- a staging dir left by a dead run: empty is junk, full is DOCUMENTS
+rt_staging_sweep() {
+  _ss="$T_TMP/sweep"; mkdir -p "$_ss/in/staging"
+  _o="$( S_PATH="$_ss/in"; COLLECT_INP_PATH=staging; WHAT=sweeptest
+         PARTx_ERRORED_FLAGFILE="$_ss/flag"; self_heal 2>&1 )"
+  if [ ! -d "$_ss/in/staging" ]; then t_ok "sweep: an EMPTY staging leftover is removed"
+  else t_bad "sweep: an EMPTY staging leftover is removed" "$_o"; fi
+  mkdir -p "$_ss/in/staging"; : >"$_ss/in/staging/doc.#1.pdf"
+  _o="$( S_PATH="$_ss/in"; COLLECT_INP_PATH=staging; WHAT=sweeptest
+         PARTx_ERRORED_FLAGFILE="$_ss/flag"; self_heal 2>&1 )"
+  case "$_o" in
+    *"still holds document"*"reset"*)
+      if [ -f "$_ss/in/staging/doc.#1.pdf" ]; then
+        t_ok "sweep: one holding DOCUMENTS is left alone and points at reset"
+      else
+        t_bad "sweep: one holding DOCUMENTS is left alone and points at reset" "the document is gone!"
+      fi ;;
+    *) t_bad "sweep: one holding DOCUMENTS is left alone and points at reset" "$_o";;
+  esac
+}
+
+rt_open_cmd() {
+  _oc="$T_TMP/opencmd"; mkdir -p "$_oc"
+  printf '%s\n' "/a b/,ocr.out/x.#1.pdf" "/docs/,scans/x.pdf" >"$_oc/list"
+  _o="$(print_open_cmd "$_oc/list")"
+  # shellcheck disable=SC1003  # the backslashes ARE the line continuations being matched
+  case "$_o" in
+    *'open \'*'"/a b/,ocr.out/x.#1.pdf" \'*'"/docs/,scans/x.pdf"'*)
+      t_ok "reset prints one paste-ready 'open' with every kept file and its document, quoted";;
+    *) t_bad "reset prints one paste-ready 'open' with every kept file and its document, quoted" "$_o";;
+  esac
+  : >"$_oc/empty"
+  if [ -z "$(print_open_cmd "$_oc/empty")" ]; then t_ok "nothing kept, no 'open' line"
+  else t_bad "nothing kept, no 'open' line" "printed one anyway"; fi
+  # and the printed command must actually be valid shell: parse it
+  _cmd="$(print_open_cmd "$_oc/list" | sed 's/^    > look at them:  //')"
+  if printf '%s\n' "$_cmd" | /bin/dash -n 2>/dev/null; then t_ok "the 'open' line is valid shell as printed"
+  else t_bad "the 'open' line is valid shell as printed" "$_cmd"; fi
+}
+
+# Generate the workflow for real, into a sandbox, with the given export
+# settings, and print what the PLIST says -- not what this script meant to write.
+t_wf_set() { # the sandbox's settings -- called INSIDE t_wf_gen's subshell only
+  WORKFLOW_DIR="$1"; _su_go=1; OCRAPP_MRC="$2"
+  OCRAPP_IMAGE_QUALITY_MRC="$3"; OCRAPP_IMAGE_QUALITY_NO_MRC="$4"
+}
+
+t_wf_gen() { # $1 dir, $2 OCRAPP_MRC, $3 QUALITY_MRC, $4 QUALITY_NO_MRC -> "mrc=M quality=Q" or "REFUSED ..."
+  rm -rf "$1"; mkdir -p "$1"
+  # the subshell keeps the overrides out of the rest of the suite
+  ( t_wf_set "$@"; setup_write_workflow ) >"$1/out" 2>&1
+  _wg_p="$1/$WORKFLOW_NAME/Contents/document.wflow"
+  if [ ! -f "$_wg_p" ]; then printf 'REFUSED %s\n' "$(grep -E 'ERROR|must be' "$1/out" | head -n 1)"; return 0; fi
+  _wg_v="$(workflow_export_values "$_wg_p")"
+  printf 'mrc=%s quality=%s\n' "${_wg_v% *}" "${_wg_v#* }"
+}
+
+rt_workflow_export() {
+  _we_d="$T_TMP/wf-export"
+  # the defaults: no MRC, and the no-MRC quality (Balanced)
+  _we_v="$(t_wf_gen "$_we_d" "$OCRAPP_MRC" "$OCRAPP_IMAGE_QUALITY_MRC" "$OCRAPP_IMAGE_QUALITY_NO_MRC")"
+  if [ "$_we_v" = "mrc=0 quality=1" ]; then t_ok "setup: by default the workflow exports without MRC, at quality 1 [$_we_v]"
+  else t_bad "setup: by default the workflow exports without MRC, at quality 1" "got [$_we_v]"; fi
+  # the switch brings ITS quality along
+  _we_v="$(t_wf_gen "$_we_d" 1 2 1)"
+  if [ "$_we_v" = "mrc=1 quality=2" ]; then t_ok "setup: OCRAPP_MRC=1 writes MRC on, with OCRAPP_IMAGE_QUALITY_MRC [$_we_v]"
+  else t_bad "setup: OCRAPP_MRC=1 writes MRC on, with OCRAPP_IMAGE_QUALITY_MRC" "got [$_we_v]"; fi
+  # a changed quality for the ACTIVE mode really lands in the plist
+  _we_v="$(t_wf_gen "$_we_d" 0 2 2)"
+  if [ "$_we_v" = "mrc=0 quality=2" ]; then t_ok "setup: OCRAPP_IMAGE_QUALITY_NO_MRC=2 lands in the workflow [$_we_v]"
+  else t_bad "setup: OCRAPP_IMAGE_QUALITY_NO_MRC=2 lands in the workflow" "got [$_we_v]"; fi
+  # 3 aborts FineReader: refused, and the key is named -- also for the INACTIVE mode
+  _we_v="$(t_wf_gen "$_we_d" 0 3 1)"
+  case "$_we_v" in
+    "REFUSED "*OCRAPP_IMAGE_QUALITY_MRC*) t_ok "setup: a quality of 3 is refused, naming the key, even for the mode that is off";;
+    *) t_bad "setup: a quality of 3 is refused, naming the key, even for the mode that is off" "got [$_we_v]";;
+  esac
+  _we_v="$(t_wf_gen "$_we_d" yes 2 1)"
+  case "$_we_v" in
+    "REFUSED "*OCRAPP_MRC*) t_ok "setup: OCRAPP_MRC must be 0 or 1 -- 'yes' is refused, naming the key";;
+    *) t_bad "setup: OCRAPP_MRC must be 0 or 1 -- 'yes' is refused, naming the key" "got [$_we_v]";;
+  esac
+  # END TO END: status reads what setup WROTE (a plist BOOLEAN for MRC -- the
+  # first reader took digits only and called a fresh workflow 'none'), via a
+  # real config file pointing WORKFLOW_DIR at the sandbox
+  t_wf_gen "$_we_d" 0 2 1 >/dev/null
+  printf 'WORKFLOW_DIR="%s"\n' "$_we_d" >"$_we_d.conf"
+  _we_o="$(MY_OCR_CONFIG="$_we_d.conf" "$0" status 2>&1 | grep EXPORT)"
+  case "$_we_o" in
+    *"EXPORT    MRC off, quality 1 (Balanced)"*"workflow = config"*) t_ok "status: reads back the workflow setup wrote, and it agrees with the config";;
+    *) t_bad "status: reads back the workflow setup wrote, and it agrees with the config" "$_we_o";;
+  esac
+  # ...and a config changed AFTER setup is caught, not believed
+  printf 'WORKFLOW_DIR="%s"\nOCRAPP_MRC=1\n' "$_we_d" >"$_we_d.conf"
+  _we_o="$(MY_OCR_CONFIG="$_we_d.conf" "$0" status 2>&1 | grep EXPORT)"
+  case "$_we_o" in
+    *"MISMATCH"*"MRC=0 quality=1"*"OCRAPP_MRC=1"*"setup go"*) t_ok "status: a config changed after setup is reported as a MISMATCH, with both sides";;
+    *) t_bad "status: a config changed after setup is reported as a MISMATCH, with both sides" "$_we_o";;
+  esac
+}
+
+rt_trash_by_mv() {
+  _tt_d="$T_TMP/trash-mv"; mkdir -p "$_tt_d/trash" "$_tt_d/in"
+  _tt_o="$(
+    TRASH_DIR="$_tt_d/trash"
+    echo earlier >"$_tt_d/trash/doc.pdf"                    # trashed before, same name
+    echo new >"$_tt_d/in/doc.pdf"
+    trash_by_mv "$_tt_d/in/doc.pdf" && echo "RC0"
+    echo plain >"$_tt_d/in/fresh.pdf"; trash_by_mv "$_tt_d/in/fresh.pdf" && echo "FRESH-RC0"
+    echo x >"$_tt_d/trash/noext"; echo y >"$_tt_d/in/noext"; trash_by_mv "$_tt_d/in/noext" && echo "NOEXT-RC0"
+    chmod 500 "$_tt_d/trash"; echo z >"$_tt_d/in/locked.pdf"
+    if trash_by_mv "$_tt_d/in/locked.pdf"; then echo "LOCKED-RC0"; else echo "LOCKED-FAILED [$_tm_err]"; fi
+    chmod 700 "$_tt_d/trash"
+  )"
+  _tt_doc=""; _tt_noext=""; _tt_all=""
+  for _tt_f in "$_tt_d/trash"/*; do
+    [ -e "$_tt_f" ] || continue
+    _tt_all="$_tt_all${_tt_f##*/}|"
+    case "${_tt_f##*/}" in
+      "doc "[0-9][0-9]-[0-9][0-9]-[0-9][0-9].pdf) _tt_doc=1 ;;
+      "noext "[0-9][0-9]-[0-9][0-9]-[0-9][0-9]) _tt_noext=1 ;;
+    esac
+  done
+  # THE production case: the name is taken -- the earlier file must SURVIVE
+  if [ "$(cat "$_tt_d/trash/doc.pdf" 2>/dev/null)" = "earlier" ] && [ -n "$_tt_doc" ] \
+     && [ ! -e "$_tt_d/in/doc.pdf" ] && case "$_tt_o" in *RC0*) true;; *) false;; esac; then
+    t_ok "trash: a taken name is never overwritten -- the new one gets a time suffix, the earlier survives"
+  else
+    t_bad "trash: a taken name is never overwritten -- the new one gets a time suffix, the earlier survives" \
+          "trash holds: $_tt_all earlier=[$(cat "$_tt_d/trash/doc.pdf" 2>/dev/null)] out=[$_tt_o]"
+  fi
+  if [ "$(cat "$_tt_d/trash/fresh.pdf" 2>/dev/null)" = "plain" ]; then t_ok "trash: a free name is used as it is"
+  else t_bad "trash: a free name is used as it is" "$_tt_all"; fi
+  if [ -n "$_tt_noext" ]; then t_ok "trash: a name without an extension gets the suffix at the end"
+  else t_bad "trash: a name without an extension gets the suffix at the end" "$_tt_all"; fi
+  case "$_tt_o" in
+    *"LOCKED-FAILED ["?*"]"*) t_ok "trash: a refused move fails, and carries mv's own words";;
+    *) t_bad "trash: a refused move fails, and carries mv's own words" "$_tt_o";;
+  esac
+}
+
+rt_config_file() {
+  _tc_d="$T_TMP/config"; mkdir -p "$_tc_d"
+  # Each default exists ONCE: in default_config_content(). A second assignment
+  # of a setting before it -- the old defaults block -- is a copy that drifts.
+  "$0" --create-config >"$_tc_d/default" 2>&1
+  _tc_keys="$(sed -n 's/^\([A-Z_][A-Z0-9_]*\)=.*/\1/p' "$_tc_d/default")"
+  _tc_bad=""
+  for _tc_k in $_tc_keys; do
+    awk -v k="$_tc_k" '/^default_config_content\(\)/{exit} $0 ~ "^[ \t]*" k "=" {f=1} END{exit !f}' "$0" \
+      && _tc_bad="$_tc_bad $_tc_k"
+  done
+  if [ -n "$_tc_keys" ] && [ -z "$_tc_bad" ]; then t_ok "config: every setting ($(echo "$_tc_keys" | wc -w | tr -d ' ')) has its default only in default_config_content()"
+  else t_bad "config: every setting has its default only in default_config_content()" "also assigned before it:$_tc_bad"; fi
+  # ...and that one place is what the script loads: once, before main sources
+  # a config file on top of it
+  # shellcheck disable=SC2016  # matching literal source text
+  if awk '/^eval "\$\(default_config_content\)"$/{e=NR; c++} /^\[ -n "\$CONFIG_FILE" \] && \{ \. /{m=NR}
+          END{exit !(c == 1 && m && e < m)}' "$0"; then
+    t_ok "config: the defaults are loaded from default_config_content(), before a config file"
+  else
+    t_bad "config: the defaults are loaded from default_config_content(), before a config file" "no single eval of it ahead of main"
+  fi
+  # a config really takes effect -- by the env var, and by --config
+  printf 'OCRAPP_MRC=1\n' >"$_tc_d/mrc.conf"
+  _tc_o="$(MY_OCR_CONFIG="$_tc_d/mrc.conf" "$0" status 2>&1)"
+  case "$_tc_o" in
+    *"CONFIG    $_tc_d/mrc.conf"*"OCRAPP_MRC=1"*|*"OCRAPP_MRC=1"*"CONFIG    $_tc_d/mrc.conf"*)
+      t_ok "config: \$MY_OCR_CONFIG is read, and its value is used";;
+    *) t_bad "config: \$MY_OCR_CONFIG is read, and its value is used" "$(printf '%s' "$_tc_o" | grep -E 'EXPORT|CONFIG')";;
+  esac
+  _tc_o="$("$0" --config "$_tc_d/mrc.conf" status 2>&1)"
+  case "$_tc_o" in
+    *"CONFIG    $_tc_d/mrc.conf"*) t_ok "config: --config <FILE> is read, and its value is not taken for a document";;
+    *) t_bad "config: --config <FILE> is read, and its value is not taken for a document" "$(printf '%s' "$_tc_o" | tail -n 2)";;
+  esac
+  # --create-config FILE never overwrites
+  printf 'mine\n' >"$_tc_d/exists.conf"
+  "$0" --create-config "$_tc_d/exists.conf" >/dev/null 2>&1
+  if [ "$(cat "$_tc_d/exists.conf")" = "mine" ]; then t_ok "config: --create-config <FILE> refuses to overwrite"
+  else t_bad "config: --create-config <FILE> refuses to overwrite" "the file was replaced"; fi
+  "$0" --create-config="$_tc_d/new.conf" >/dev/null 2>&1
+  if grep -q '^OCRAPP_MRC=0' "$_tc_d/new.conf" 2>/dev/null; then t_ok "config: --create-config=<FILE> writes a new one"
+  else t_bad "config: --create-config=<FILE> writes a new one" "not written"; fi
+}
+
+rt_split_pref() {
+  # LIVE, against a THROW-AWAY preferences domain -- never FineReader's own
+  _ts_dom="my-ocr.suite.$$"
+  _ts_o="$(
+    OCRAPP_NAME="my-ocr-no-such-app-xyzzy"
+    /usr/bin/defaults write "$_ts_dom" ImportSplitFacingPages -bool YES
+    OCRAPP_SPLIT_FACING_PAGES=0; ocrapp_split_facing_pages "$_ts_dom"
+    echo "NOW=$(/usr/bin/defaults read "$_ts_dom" ImportSplitFacingPages)"
+    echo "---"; ocrapp_split_facing_pages "$_ts_dom"; echo "---"
+    OCRAPP_SPLIT_FACING_PAGES=1; ocrapp_split_facing_pages "$_ts_dom"
+    echo "NOW2=$(/usr/bin/defaults read "$_ts_dom" ImportSplitFacingPages)"
+  )"
+  /usr/bin/defaults delete "$_ts_dom" >/dev/null 2>&1
+  case "$_ts_o" in
+    *"split facing pages off (was: 1)"*"NOW=0"*) t_ok "split: on in the app, off in the config -- set off, and said so with the old value";;
+    *) t_bad "split: on in the app, off in the config -- set off, and said so with the old value" "$_ts_o";;
+  esac
+  case "$_ts_o" in
+    *"---${NL}---"*) t_ok "split: already as configured -- nothing done, nothing printed";;
+    *) t_bad "split: already as configured -- nothing done, nothing printed" "$_ts_o";;
+  esac
+  case "$_ts_o" in
+    *"split facing pages on (was: 0)"*"NOW2=1"*) t_ok "split: OCRAPP_SPLIT_FACING_PAGES=1 turns it on";;
+    *) t_bad "split: OCRAPP_SPLIT_FACING_PAGES=1 turns it on" "$_ts_o";;
+  esac
+  # while the app runs, it is left alone -- a running app writes its own value back
+  _ts_d="$T_TMP/split"; mkdir -p "$_ts_d"; _ts_n="mosp$$"; ln -s /bin/sleep "$_ts_d/$_ts_n"
+  "$_ts_d/$_ts_n" 20 & _ts_p=$!
+  sleep 1
+  _ts_o="$(
+    OCRAPP_NAME="$_ts_n"
+    /usr/bin/defaults write "$_ts_dom" ImportSplitFacingPages -bool YES
+    OCRAPP_SPLIT_FACING_PAGES=0; ocrapp_split_facing_pages "$_ts_dom"
+    echo "NOW=$(/usr/bin/defaults read "$_ts_dom" ImportSplitFacingPages)"
+  )"
+  kill "$_ts_p" 2>/dev/null; wait "$_ts_p" 2>/dev/null
+  /usr/bin/defaults delete "$_ts_dom" >/dev/null 2>&1
+  case "$_ts_o" in
+    *"is running"*"NOW=1"*) t_ok "split: while the app runs, the preference is left alone, and it says so";;
+    *) t_bad "split: while the app runs, the preference is left alone, and it says so" "$_ts_o";;
+  esac
+}
+
+rt_fa_restart() {
+  # LIVE, with a stand-in for the dispatcher: a renamed 'sleep'. The real one
+  # is never touched by the suite.
+  _fr_d="$T_TMP/fa-restart"; mkdir -p "$_fr_d"
+  _fr_n="mofad$$"; ln -s /bin/sleep "$_fr_d/$_fr_n"
+  # shellcheck disable=SC2030,SC2031  # deliberate: the subshell keeps the
+  # overrides out of the rest of the suite
+  (
+    FA_DISPATCHER_NAME="$_fr_n"; FA_RESTART_WAIT=3
+    # 1. launchd's part, played by a loop: whatever ends it, a new one comes up
+    ( while [ ! -e "$_fr_d/stop" ]; do "$_fr_d/$_fr_n" 30; done ) & _fr_sup=$!
+    sleep 1; _fr_p1="$(pgrep -x "$_fr_n" | head -n 1)"
+    if fa_dispatcher_restart; then echo "RC0 $_fa_ev"; else echo "RC1 $_fa_ev"; fi
+    _fr_p2="$(pgrep -x "$_fr_n" | head -n 1)"
+    [ -n "$_fr_p1" ] && [ -n "$_fr_p2" ] && [ "$_fr_p1" != "$_fr_p2" ] && echo "REPLACED $_fr_p1->$_fr_p2"
+    : >"$_fr_d/stop"; pkill -x "$_fr_n"; wait "$_fr_sup" 2>/dev/null
+    # 2. nobody brings it back: the restart must SAY so, not claim success
+    "$_fr_d/$_fr_n" 30 & _fr_lone=$!
+    sleep 1
+    if fa_dispatcher_restart; then echo "LONE-RC0 $_fa_ev"; else echo "LONE-RC1 $_fa_ev"; fi
+    kill -0 "$_fr_lone" 2>/dev/null && { echo "LONE-SURVIVED"; kill -9 "$_fr_lone"; }
+  ) >"$_fr_d/out" 2>&1
+  _fr_o="$(cat "$_fr_d/out")"
+  case "$_fr_o" in
+    *"RC0 pid "*"ended -> new pid"*"REPLACED "*)
+      t_ok "dispatcher restart: the wedged one is ended and a NEW one is confirmed, with both pids";;
+    *) t_bad "dispatcher restart: the wedged one is ended and a NEW one is confirmed, with both pids" "$_fr_o";;
+  esac
+  case "$_fr_o" in
+    *"LONE-RC1 pid "*"no new one came up"*)
+      case "$_fr_o" in
+        *LONE-SURVIVED*) t_bad "dispatcher restart: when nothing comes back it says so" "the old one was not ended";;
+        *) t_ok "dispatcher restart: when nothing comes back it says so, and fails";;
+      esac;;
+    *) t_bad "dispatcher restart: when nothing comes back it says so, and fails" "$_fr_o";;
+  esac
+  # and the wait loop gives up only AFTER that restart was tried. Scoped to
+  # do_trigger_ocr(): searched file-wide, the pattern matched THIS line too and
+  # the check passed with the restart removed.
+  # shellcheck disable=SC2016  # matching literal source text
+  if awk '/^do_trigger_ocr\(\) \{/,/^\}/' "$0" \
+     | awk '/fa_dispatcher_restart; then/{r=NR} /err 159 /{e=NR} END{exit !(r && e && r < e)}'; then
+    t_ok "never-started: the dispatcher is restarted before the run gives up"
+  else
+    t_bad "never-started: the dispatcher is restarted before the run gives up" "err 159 is reachable without a restart"
+  fi
+}
+
+rt_trap_term() {
+  # LIVE, with the script's OWN trap line: a TERMed run must reach cleanup().
+  # TERM is what kill, pkill and launchd send; without it in the list every
+  # TERMed run left its mutex, run files and a 'tail -f' behind.
+  _tt_line="$(grep -E '^for i in [0-9 ]+; do trap "cleanup' "$0" | head -n 1)"
+  if [ -z "$_tt_line" ]; then
+    t_bad "trap: a TERMed run reaches cleanup()" "the trap line was not found in the script"; return 0
+  fi
+  _tt_f="$T_TMP/trap-term.sh"
+  # shellcheck disable=SC2016  # '$2' and '$$' belong to the CHILD script, written literally
+  {
+    printf '%s\n' 'cleanup() { echo "CLEANED $2"; trap - 0; exit 0; }'
+    printf '%s\n' "$_tt_line"
+    printf '%s\n' 'kill -TERM $$' 'sleep 2' 'echo NOT-CLEANED'
+  } >"$_tt_f"
+  _tt_o="$(/bin/dash "$_tt_f" 2>&1)"
+  case "$_tt_o" in
+    *"CLEANED 15"*) t_ok "trap: a TERMed run reaches cleanup() (the script's own trap line catches 15)";;
+    *) t_bad "trap: a TERMed run reaches cleanup() (the script's own trap line catches 15)" "got: $_tt_o";;
+  esac
+}
+
+t_reset_sandbox() { # $1 = sandbox root
+  US="my-ocr-sandbox"; WHOAMI="nobody-sandbox-xyzzy"; OCRAPP_NAME="no-such-process-xyzzy"
+  OCRAPP_MUTEX_DIR="$1/lib/mutex"; OCRAPP_LOCKFILE="$1/lib/lock"
+  PARTx_ERRORED_FLAGFILE="$1/lib/f1"; DBG_FLAGFILE="$1/lib/f2"
+  FORCE_FLAGFILE="$1/lib/f3"; INTERACTIVE_FLAGFILE="$1/lib/f4"
+  QUEUED_FILE_MOVES_LOG="$1/lib/files-2-move"; c_trash="$1/bin/trash"
+  S_PATH="$1/pub"; COLLECT_INP_PATH=""; TMP_PRE_INP_PATH="$1/tmp/my-ocr.pre_,ocr.in_TMP-path"
+  T_PATH="$1/out"; RESET_RETRY_TO="$1/retry"
+}
+
+rt_reset_stable() {
+  # LIVE, in a sandbox: the situation reset met on ada after a killed run -- a
+  # staged copy byte-identical to its filed document, a Finder .DS_Store, and
+  # the queue log that maps the one to the other. Three runs, in order:
+  #   dry  -- must change NOTHING (it used to rmdir + mkdir to test emptiness)
+  #   go   -- trashes the copy AND removes the staging dir it emptied
+  #   dry  -- must find NOTHING left: a reset that is not stable is not done
+  _rz="$T_TMP/reset-stable"; mkdir -p "$_rz/bin" "$_rz/pub/my-ocr.pre_,ocr.in_TMP-path" "$_rz/filed" "$_rz/lib"
+  printf '#!/bin/dash\nshift 2>/dev/null\nrm -rf "$@"\n' >"$_rz/bin/trash"; chmod +x "$_rz/bin/trash"
+  printf 'the document\n' >"$_rz/filed/doc.pdf"
+  cp "$_rz/filed/doc.pdf" "$_rz/pub/my-ocr.pre_,ocr.in_TMP-path/doc.#1.pdf"
+  : >"$_rz/pub/my-ocr.pre_,ocr.in_TMP-path/.DS_Store"
+  printf '%s\t%s\t%s\t%s\n' "$_rz/orig/doc.pdf" "$_rz/pub/my-ocr.pre_,ocr.in_TMP-path/doc.#1.pdf" \
+         "$_rz/out/doc.#1.pdf" "$_rz/filed/doc.pdf" >"$_rz/lib/files-2-move"
+  # every path reset touches, pointed into the sandbox -- called INSIDE the
+  # subshell below, which is what keeps the overrides out of the rest of the suite
+  (
+    t_reset_sandbox "$_rz"
+    _i1="$(ls -di "$_rz/pub/my-ocr.pre_,ocr.in_TMP-path" 2>/dev/null)"
+    do_reset >"$_rz/r1" 2>&1
+    _i2="$(ls -di "$_rz/pub/my-ocr.pre_,ocr.in_TMP-path" 2>/dev/null)"
+    [ "$_i1" = "$_i2" ] && [ -f "$_rz/pub/my-ocr.pre_,ocr.in_TMP-path/doc.#1.pdf" ] && echo DRY-UNTOUCHED
+    do_reset go >"$_rz/r2" 2>&1
+    [ -d "$_rz/pub/my-ocr.pre_,ocr.in_TMP-path" ] || echo STAGE-GONE
+    [ -f "$_rz/filed/doc.pdf" ] && echo DOC-KEPT
+    do_reset >"$_rz/r3" 2>&1
+    # a TRULY empty staging dir is where the old dry run did rmdir + mkdir;
+    # with a document or a .DS_Store in it, that branch never ran at all
+    mkdir -p "$_rz/pub/my-ocr.pre_,ocr.in_TMP-path"
+    _i3="$(ls -di "$_rz/pub/my-ocr.pre_,ocr.in_TMP-path" 2>/dev/null)"
+    do_reset >"$_rz/r4" 2>&1
+    _i4="$(ls -di "$_rz/pub/my-ocr.pre_,ocr.in_TMP-path" 2>/dev/null)"
+    [ "$_i3" = "$_i4" ] && grep -q "WOULD REMOVE the now-empty staging dir" "$_rz/r4" && echo EMPTY-DRY-UNTOUCHED
+    # THE ada CASE: the watched folder EMPTY, and COLLECT_INP_PATH empty as it
+    # really is in reset -- 'reset go' rmdir'ed the watched folder itself here
+    rm -rf "$_rz/pub/my-ocr.pre_,ocr.in_TMP-path"
+    do_reset go >"$_rz/r5" 2>&1
+    [ -d "$_rz/pub" ] && echo WATCHED-KEPT
+    # and self_heal, which runs at every trigger-OCR, with the same empty name
+    self_heal >/dev/null 2>&1
+    [ -d "$_rz/pub" ] && echo WATCHED-KEPT-BY-SELF-HEAL
+  ) >"$_rz/out.txt" 2>&1
+  _rz_o="$(cat "$_rz/out.txt")"
+  case "$_rz_o" in
+    *DRY-UNTOUCHED*) t_ok "reset: a DRY run leaves the staging dir untouched (same inode, copy still there)";;
+    *) t_bad "reset: a DRY run leaves the staging dir untouched" "$(cat "$_rz/r1")";;
+  esac
+  case "$_rz_o" in
+    *STAGE-GONE*DOC-KEPT*) t_ok "reset go: the duplicate is trashed, the staging dir it emptied goes too, the document stays";;
+    *) t_bad "reset go: the duplicate is trashed, the staging dir it emptied goes too, the document stays" \
+             "$_rz_o // $(grep -E 'staging|TRASH' "$_rz/r2")";;
+  esac
+  if grep -q 'retry them with' "$_rz/r2"; then
+    t_bad "reset go: no 'retry them with' when nothing went to retry" "$(grep 'retry them with' "$_rz/r2")"
+  else
+    t_ok "reset go: no 'retry them with' when nothing went to retry"
+  fi
+  case "$_rz_o" in
+    *WATCHED-KEPT*) t_ok "reset go: the WATCHED folder itself is never removed, even empty, even with COLLECT_INP_PATH empty";;
+    *) t_bad "reset go: the WATCHED folder itself is never removed, even empty, even with COLLECT_INP_PATH empty" \
+             "$(grep -i staging "$_rz/r5")";;
+  esac
+  case "$_rz_o" in
+    *WATCHED-KEPT-BY-SELF-HEAL*) t_ok "self_heal: the WATCHED folder itself is never removed";;
+    *) t_bad "self_heal: the WATCHED folder itself is never removed" "the watched folder is gone";;
+  esac
+  case "$_rz_o" in
+    *EMPTY-DRY-UNTOUCHED*) t_ok "reset: a DRY run reports an EMPTY staging dir without touching it (same inode)";;
+    *) t_bad "reset: a DRY run reports an EMPTY staging dir without touching it (same inode)" \
+             "inode changed or not reported: $(grep staging "$_rz/r4")";;
+  esac
+  if grep -qE 'WOULD|kept' "$_rz/r3"; then
+    t_bad "reset: a second reset right after 'go' finds NOTHING" "$(grep -E 'WOULD|kept' "$_rz/r3")"
+  else
+    t_ok "reset: a second reset right after 'go' finds NOTHING"
+  fi
+}
+
+t_pf_app() { # the stand-in OCR app and the wait -- called INSIDE a subshell only
+  OCRAPP_NAME="$1"; OCRAPP_TIMEOUT="$2"
+}
+t_pf_coll() { COLLECT_INP_PATH="$1"; } # as trigger-OCR has it -- INSIDE a subshell only
+
+rt_preflight_repair() {
+  # What a KILLed run leaves: its queue log and a staged copy of a document
+  # already filed. The NEXT run holds the mutex (a live owner -- itself), so
+  # 'reset' refuses; the pre-flight repair must not -- but only once nothing of
+  # the dead run is still at work.
+  _pr="$T_TMP/preflight"
+  _pr_world() {
+    rm -rf "$_pr"; mkdir -p "$_pr/bin" "$_pr/pub/my-ocr.pre_,ocr.in_TMP-path" "$_pr/filed" "$_pr/lib/mutex"
+    printf '#!/bin/dash\nshift 2>/dev/null\nrm -rf "$@"\n' >"$_pr/bin/trash"; chmod +x "$_pr/bin/trash"
+    printf 'the document\n' >"$_pr/filed/doc.pdf"
+    cp "$_pr/filed/doc.pdf" "$_pr/pub/my-ocr.pre_,ocr.in_TMP-path/doc.#1.pdf"
+    printf '%s\t%s\t%s\t%s\n' "$_pr/orig/doc.pdf" "$_pr/pub/my-ocr.pre_,ocr.in_TMP-path/doc.#1.pdf" \
+           "$_pr/out/doc.#1.pdf" "$_pr/filed/doc.pdf" >"$_pr/lib/files-2-move"
+    printf 'pid=%s at=now\n' "$$" >"$_pr/lib/mutex/owner"          # a LIVE owner
+  }
+  _pr_world
+  _pr_o="$(
+    t_reset_sandbox "$_pr"
+    do_reset go >"$_pr/reset.out" 2>&1; echo "RESET-RC=$?"
+    preflight_dead_queue >"$_pr/repair.out" 2>&1; echo "PF-RC=$?"
+    [ -s "$QUEUED_FILE_MOVES_LOG" ] || echo "QUEUE-GONE"
+    [ -e "$_pr/pub/my-ocr.pre_,ocr.in_TMP-path/doc.#1.pdf" ] || echo "COPY-GONE"
+    [ -f "$_pr/filed/doc.pdf" ] && echo "DOC-KEPT"
+  )"
+  case "$_pr_o" in
+    *"RESET-RC=1"*) t_ok "preflight: with a live mutex owner, 'reset' still refuses (it never interrupts a run)";;
+    *) t_bad "preflight: with a live mutex owner, 'reset' still refuses (it never interrupts a run)" "$_pr_o";;
+  esac
+  case "$_pr_o" in
+    *"PF-RC=0"*QUEUE-GONE*COPY-GONE*DOC-KEPT*) t_ok "preflight: nothing of the dead run at work -- its queue is repaired: duplicate trashed, queue log gone, document kept";;
+    *) t_bad "preflight: nothing of the dead run at work -- its queue is repaired" "$_pr_o // $(cat "$_pr/repair.out")";;
+  esac
+
+  # THE ada CASE: the dead run's batch is still in the OCR app. Then it is not
+  # dead, and NOTHING may be touched -- here the app outlives the wait.
+  _pr_world; mkdir -p "$_pr/app"; _pr_n="mopf$$"; ln -s /bin/sleep "$_pr/app/$_pr_n"
+  "$_pr/app/$_pr_n" 30 & _pr_app=$!
+  sleep 1
+  _pr_o="$(
+    t_reset_sandbox "$_pr"; t_pf_app "$_pr_n" 5
+    preflight_dead_queue >"$_pr/busy.out" 2>&1; echo "PF-RC=$?"
+    [ -s "$QUEUED_FILE_MOVES_LOG" ] && echo "QUEUE-KEPT"
+    [ -e "$_pr/pub/my-ocr.pre_,ocr.in_TMP-path/doc.#1.pdf" ] && echo "COPY-KEPT"
+  )"
+  kill "$_pr_app" 2>/dev/null; wait "$_pr_app" 2>/dev/null
+  case "$_pr_o" in
+    *"PF-RC=1"*QUEUE-KEPT*COPY-KEPT*) t_ok "preflight: while the dead run's batch is still in the OCR app, nothing is touched -- and it gives up, it does not repair";;
+    *) t_bad "preflight: while the dead run's batch is still in the OCR app, nothing is touched" "$_pr_o // $(cat "$_pr/busy.out")";;
+  esac
+
+  # ...and the usual ending: that run's own part-2 finishes and removes its
+  # queue while we wait -- then there is nothing to repair at all
+  _pr_world; mkdir -p "$_pr/app"; ln -s /bin/sleep "$_pr/app/$_pr_n"
+  "$_pr/app/$_pr_n" 30 & _pr_app=$!
+  ( sleep 3; rm -f "$_pr/lib/files-2-move" ) &
+  sleep 1
+  _pr_o="$(
+    t_reset_sandbox "$_pr"; t_pf_app "$_pr_n" 20
+    preflight_dead_queue >"$_pr/done.out" 2>&1; echo "PF-RC=$?"
+    [ -e "$_pr/pub/my-ocr.pre_,ocr.in_TMP-path/doc.#1.pdf" ] && echo "COPY-UNTOUCHED"
+  )"
+  kill "$_pr_app" 2>/dev/null; wait "$_pr_app" 2>/dev/null
+  case "$_pr_o" in
+    *"PF-RC=0"*COPY-UNTOUCHED*) t_ok "preflight: when the old run finishes its own queue while we wait, nothing is repaired";;
+    *) t_bad "preflight: when the old run finishes its own queue while we wait, nothing is repaired" "$_pr_o // $(cat "$_pr/done.out")";;
+  esac
+
+  # THE SECOND ada CASE: the queue is already gone, but the dead run's part-2
+  # is not -- it still has to remove its staging directory. Returning then let
+  # the next hand-over collide with that directory (err 108). The stand-in
+  # part-2 marks when it ends; the pre-flight must return only after that.
+  _pr_world; rm -f "$_pr/lib/files-2-move"
+  /bin/sh -c 'sleep 4; touch "$1"' "my-ocr-sandbox --part-2" "$_pr/part-ended" & _pr_part=$!
+  sleep 1
+  _pr_o="$(
+    t_reset_sandbox "$_pr"; t_pf_app "no-such-app-xyzzy" 20
+    preflight_dead_queue >"$_pr/part.out" 2>&1; echo "PF-RC=$?"
+    [ -e "$_pr/part-ended" ] && echo "PART-ENDED-FIRST"
+    [ -e "$_pr/pub/my-ocr.pre_,ocr.in_TMP-path/doc.#1.pdf" ] && echo "COPY-UNTOUCHED"
+  )"
+  wait "$_pr_part" 2>/dev/null
+  case "$_pr_o" in
+    *"PF-RC=0"*PART-ENDED-FIRST*COPY-UNTOUCHED*) t_ok "preflight: with the queue gone, it still waits for the dead run's part-2 to end";;
+    *) t_bad "preflight: with the queue gone, it still waits for the dead run's part-2 to end" "$_pr_o // $(cat "$_pr/part.out")";;
+  esac
+
+  # THE THIRD ada CASE: nothing at work, the queue empty -- its part-2 did
+  # every document -- but the dead run's staged COPIES are still there, because
+  # its cleanup never ran. The next hand-over collided with them (err 108).
+  # They go (to the Trash); the watched folder and what else is in it stay.
+  _pr_world; rm -f "$_pr/lib/files-2-move"
+  mkdir -p "$_pr/tmp/my-ocr.pre_,ocr.in_TMP-path"; cp "$_pr/filed/doc.pdf" "$_pr/tmp/my-ocr.pre_,ocr.in_TMP-path/doc2.#1.pdf"
+  printf 'not ours\n' >"$_pr/pub/someone-elses.pdf"
+  _pr_o="$(
+    t_reset_sandbox "$_pr"; t_pf_coll "my-ocr.pre_,ocr.in_TMP-path"
+    preflight_dead_queue >"$_pr/copies.out" 2>&1; echo "PF-RC=$?"
+    [ -e "$_pr/pub/my-ocr.pre_,ocr.in_TMP-path" ] || echo "HANDED-OVER-COPIES-GONE"
+    [ -e "$_pr/tmp/my-ocr.pre_,ocr.in_TMP-path" ] || echo "TMP-COPIES-GONE"
+    [ -f "$_pr/pub/someone-elses.pdf" ] && echo "WATCHED-FOLDER-KEPT"
+  )"
+  case "$_pr_o" in
+    *"PF-RC=0"*HANDED-OVER-COPIES-GONE*TMP-COPIES-GONE*WATCHED-FOLDER-KEPT*) t_ok "preflight: a dead run's staged copies, which its part-2 is done with, are trashed -- the watched folder is kept";;
+    *) t_bad "preflight: a dead run's staged copies, which its part-2 is done with, are trashed" "$_pr_o // $(cat "$_pr/copies.out")";;
+  esac
+
+  # ...and 'reset' is no different: a dead trigger with a live part-2 is a
+  # live run (it said "never interrupts real work" and did)
+  _pr_world; rm -rf "$_pr/lib/mutex"; rm -f "$_pr/part-ended"
+  /bin/sh -c 'sleep 4; touch "$1"' "my-ocr-sandbox --part-2" "$_pr/part-ended" & _pr_part=$!
+  sleep 1
+  _pr_o="$(
+    t_reset_sandbox "$_pr"
+    do_reset go >"$_pr/reset2.out" 2>&1; echo "RESET-RC=$?"
+    [ -s "$QUEUED_FILE_MOVES_LOG" ] && echo "QUEUE-KEPT"
+    [ -e "$_pr/pub/my-ocr.pre_,ocr.in_TMP-path/doc.#1.pdf" ] && echo "COPY-KEPT"
+  )"
+  wait "$_pr_part" 2>/dev/null
+  case "$_pr_o" in
+    *"RESET-RC=1"*QUEUE-KEPT*COPY-KEPT*) t_ok "reset: refuses while a dead run's part-1/part-2 is still at work";;
+    *) t_bad "reset: refuses while a dead run's part-1/part-2 is still at work" "$_pr_o // $(cat "$_pr/reset2.out")";;
+  esac
+
+  # trigger-OCR runs it right after taking the mutex: before self-heal and
+  # before it creates any shared file (both runs wrote the same flagfile), and
+  # before it would refuse
+  # shellcheck disable=SC2016  # matching literal source text
+  if awk '/^do_trigger_ocr\(\) \{/,/^\}/' "$0" \
+     | awk '/^  WE_HOLD_OCRAPP_MUTEX=1$/{m=NR} /^  preflight_dead_queue \|\| err /{r=NR}
+            /^  self_heal$/{s=NR} /touch "\$PARTx_ERRORED_FLAGFILE"/{f=NR} /err 177 /{e=NR}
+            END{exit !(m && r && s && f && e && m < r && r < s && r < f && r < e)}'; then
+    t_ok "preflight: trigger-OCR runs it right after the mutex, before any shared state and before refusing"
+  else
+    t_bad "preflight: trigger-OCR runs it right after the mutex, before any shared state and before refusing" "order broken in do_trigger_ocr"
+  fi
+
+  # ...and the other end of a run: its cleanup releases the mutex LAST. Released
+  # first, the next run took its turn and then lost its staging and its queue
+  # log to this cleanup's rm -Rf / rm -f.
+  # shellcheck disable=SC2016  # matching literal source text
+  if awk '/^cleanup\(\) \{/,/^\}/' "$0" \
+     | awk '/rm -Rf "\$a\/"/{s=NR} /rm -f "\$QUEUED_FILE_MOVES_LOG"/{q=NR} /rmdir "\$OCRAPP_MUTEX_DIR"/{m=NR; c++}
+            END{exit !(s && q && m && c == 1 && s < m && q < m)}'; then
+    t_ok "cleanup: the mutex is released only after the shared staging and queue log are gone"
+  else
+    t_bad "cleanup: the mutex is released only after the shared staging and queue log are gone" "order broken in cleanup()"
+  fi
+}
+
+# A run removes what it creates: the errored flag was scheduled for cleanup only
+# when a part had written an error into it, so every SUCCESSFUL run left it
+# behind, empty -- and 'reset' right after any normal run was never empty.
+rt_errflag_cleanup() {
+  # shellcheck disable=SC2016  # matching literal source text
+  if awk '/^do_trigger_ocr\(\) \{/,/^\}/' "$0" \
+     | awk '/^  schedule_for_cleanup "\$PARTx_ERRORED_FLAGFILE"$/{s=NR} /^  touch "\$PARTx_ERRORED_FLAGFILE"/{t=NR}
+            END{exit !(s && t && s < t)}'; then
+    t_ok "errored flag: the run that creates it schedules its removal (a clean run leaves nothing)"
+  else
+    t_bad "errored flag: the run that creates it schedules its removal (a clean run leaves nothing)" "only removed after an error"
+  fi
+}
+
+# --version in ANOTHER clone of this tool's repo. The proof that a repository is
+# the tool's own was the stamped SCRIPT_COMMIT -- a commit the amend replaces and
+# that is therefore never pushed. So every checkout but the one that stamped
+# (the scan host's) was taken for a foreign repo and fell back to the stamp. The
+# proof is the stamped PARENT now. The stamp itself is recreated here -- the
+# real one runs this suite first -- and checked separately below. The case the
+# proof exists for must still hold: a copy in a foreign repo reports NOT its tags.
+rt_version_clone() {
+  _vc="$T_TMP/vclone"; rm -rf "$_vc"; mkdir -p "$_vc/src" "$_vc/foreign"
+  cp "$0" "$_vc/src/$US"
+  (
+    cd "$_vc/src" && git init -q && git config user.email t@example.invalid \
+      && git config user.name t && git add -- "$US" && git commit -qm one \
+      && git tag v1.0 && echo "# two" >>"$US" && git commit -qam two \
+      && _vx="$(git rev-parse --short HEAD)" && _vp="$(git rev-parse --short HEAD~1)" \
+      && sed -e "s|^SCRIPT_COMMIT=\"[^\"]*\"|SCRIPT_COMMIT=\"$_vx\"|" \
+             -e "s|^SCRIPT_PARENT=\".*\"|SCRIPT_PARENT=\"$_vp\"|" "$US" >"$US.tmp" \
+      && mv "$US.tmp" "$US" && chmod +x "$US" && git commit -q --amend -a --no-edit
+  ) || { t_bad "--version in another clone: set-up" "could not build the test repo"; return; }
+  # --no-local: a clone from a PATH copies the object store wholesale, the
+  # unpushed pre-amend commit included -- and then the old proof passed too.
+  # A clone over a transport gets only what is reachable, as one from GitHub.
+  git clone -q --no-local "$_vc/src" "$_vc/clone" 2>/dev/null
+  _vc_head="$(git -C "$_vc/clone" rev-parse --short HEAD)"
+  _vc_o="$("$_vc/clone/$US" --version 2>&1)"
+  case "$_vc_o" in
+    *"v1.0-1-g$_vc_head"*) t_ok "--version in another clone names git's HEAD ($_vc_head), not the stamp";;
+    *) t_bad "--version in another clone names git's HEAD ($_vc_head), not the stamp" "got: $_vc_o";;
+  esac
+  (
+    cd "$_vc/foreign" && git init -q && git config user.email t@example.invalid \
+      && git config user.name t && echo x >x && git add x && git commit -qm x \
+      && git tag v9.9 && cp "$_vc/src/$US" . && git add -- "$US" && git commit -qm copy
+  ) >/dev/null 2>&1
+  _vc_o="$("$_vc/foreign/$US" --version 2>&1)"
+  case "$_vc_o" in
+    *v9.9*) t_bad "--version in a FOREIGN repo does not report that repo's tag" "got: $_vc_o";;
+    *) t_ok "--version in a FOREIGN repo does not report that repo's tag";;
+  esac
+  # the real stamp writes the parent, and refuses to install without it
+  # shellcheck disable=SC2016  # matching literal source text
+  if awk '/^do_stamp_version\(\)/,/^}/' "$0" | grep -q 's|^SCRIPT_PARENT=' \
+     && awk '/^do_stamp_version\(\)/,/^}/' "$0" | grep -q 'grep -q "^SCRIPT_PARENT='; then
+    t_ok "stamp-version records SCRIPT_PARENT, and checks it landed"
+  else
+    t_bad "stamp-version records SCRIPT_PARENT, and checks it landed" "do_stamp_version() does not"
+  fi
+}
+
+# A part that fails writes its error into the flag a LIVE run watches, and the
+# live run aborts on it (err 066). The suite started parts with the real flag:
+# 760 lines of test errors had piled up in it on horse, and a suite run on the
+# scan host during a real OCR would have ended that OCR.
+rt_parts_sandboxed() {
+  _ps_real="$PARTx_ERRORED_FLAGFILE"
+  _ps_before="$(wc -c <"$_ps_real" 2>/dev/null | tr -d ' ')"
+  MY_OCR_CONFIG="$T_TMP/sandbox.conf" "$0" --move-failed-to /nonexistent/quarantine --part-1 --no-log >/dev/null 2>&1
+  _ps_after="$(wc -c <"$_ps_real" 2>/dev/null | tr -d ' ')"
+  if [ "$_ps_before" = "$_ps_after" ] && [ -s "$T_TMP/partx-errored.flag" ]; then
+    t_ok "a failing part started by the suite writes to the suite's flag, not the live one [live ${_ps_before:-absent} -> ${_ps_after:-absent} bytes]"
+  else
+    t_bad "a failing part started by the suite writes to the suite's flag, not the live one" "live flag ${_ps_before:-absent} -> ${_ps_after:-absent} bytes, sandbox flag $( [ -s "$T_TMP/partx-errored.flag" ] && echo written || echo empty)"
+  fi
+}
+
+t_has() { for _th_f in "$1"/*"$2"*; do [ -e "$_th_f" ] && return 0; done; return 1; } # $1 = dir, $2 = part of a name
+
+t_rt_env() { # the retry's world -- called INSIDE a subshell only
+  OCRAPP_PATH="$1/no-such-app.app"; OCRAPP_DOCSTORE_BASE="$1/docstore"
+  OCRAPP_STATEFILE="$1/lib/state"; TRASH_DIR="$1/trash"
+  COLLECT_INP_PATH="stage"; TMP_PRE_INP_PATH="$1/tmp-stage"
+  my_notify="$1/bin/notify"; STUCK_MARKER_DIR="$1/desk"
+}
+
+# Point 4: a stalled chunk is handed over ONCE more, with the machinery put
+# back first -- and never when a document of it was already filed, since the
+# second hand-over would OCR that one again. Point 5: an incident that ends
+# well says so in one mail and takes its markers off the Desktop.
+rt_stall_retry() {
+  _rt="$T_TMP/retry"
+  _rt_world() {
+    rm -rf "$_rt"; mkdir -p "$_rt/lib" "$_rt/pub/stage" "$_rt/bin" "$_rt/trash" "$_rt/desk" "$_rt/docstore"
+    printf 'doc a\n' >"$_rt/pub/stage/a.#1.pdf"; printf 'doc b\n' >"$_rt/pub/stage/b.#1.pdf"
+    printf 'a\tA\n' >"$_rt/lib/files-2-move"; printf 'b\tB\n' >>"$_rt/lib/files-2-move"
+    printf '%s\n' "$_rt/pub/stage/a.#1.pdf" >"$_rt/lib/lock"
+    printf 'the stalled attempt\n' >"$_rt/lib/f1"
+    printf '#!/bin/sh\nprintf "%%s|" "$@" >>"%s/mails"; echo >>"%s/mails"\n' "$_rt" "$_rt" >"$_rt/bin/notify"
+    chmod +x "$_rt/bin/notify"
+  }
+  _rt_world
+  _rt_o="$(
+    t_reset_sandbox "$_rt"; t_rt_env "$_rt"
+    retry_stalled_chunk 2 >"$_rt/ok.out" 2>&1; echo "RC=$?"
+    [ -f "$_rt/pub/stage/a.#1.pdf" ] && [ -f "$_rt/pub/stage/b.#1.pdf" ] && echo "HANDED-OVER-IN-PLACE"
+    [ -s "$_rt/lib/lock" ] || echo "LOCK-EMPTIED"
+    [ -s "$_rt/lib/f1" ] || echo "FLAG-CLEARED"
+  )"
+  case "$_rt_o" in
+    *"RC=0"*HANDED-OVER-IN-PLACE*LOCK-EMPTIED*FLAG-CLEARED*) t_ok "retry: the same staged chunk is handed over again, lockfile emptied, the stalled attempt's error cleared";;
+    *) t_bad "retry: the same staged chunk is handed over again, lockfile emptied, the stalled attempt's error cleared" "$_rt_o // $(cat "$_rt/ok.out")";;
+  esac
+  # one of the two already filed: no second hand-over, nothing touched
+  _rt_world; printf 'b\tB\n' >"$_rt/lib/files-2-move"
+  _rt_o="$(
+    t_reset_sandbox "$_rt"; t_rt_env "$_rt"
+    retry_stalled_chunk 2 >"$_rt/part.out" 2>&1; echo "RC=$?"
+    [ -s "$_rt/lib/lock" ] && echo "LOCK-KEPT"
+  )"
+  case "$_rt_o" in
+    *"RC=1"*LOCK-KEPT*) t_ok "retry: refused once a document of the chunk is filed -- it would be OCRed twice";;
+    *) t_bad "retry: refused once a document of the chunk is filed" "$_rt_o // $(cat "$_rt/part.out")";;
+  esac
+  # both stall endings try it once, before their error, and only once
+  # shellcheck disable=SC2016  # matching literal source text
+  if awk '/^do_trigger_ocr\(\) \{/,/^\}/' "$0" \
+     | awk '/retry_stalled_chunk "\$QUEUED_FILE_MOVES_LOG_CNT"/{r++; if (!a) a=NR; else b=NR}
+            /err 128 /{e1=NR} /err 158 /{e2=NR} /if \[ -z "\$_retried" \]; then/{g++}
+            END{exit !(r == 2 && g == 2 && a < e1 && b < e2)}'; then
+    t_ok "retry: both stall endings (app gone, app stuck) retry once before their error"
+  else
+    t_bad "retry: both stall endings (app gone, app stuck) retry once before their error" "not wired as expected in do_trigger_ocr"
+  fi
+  # RESOLVED: one mail, markers to the Trash; nothing at all when nothing alerted
+  _rt_world
+  _rt_o="$(
+    t_reset_sandbox "$_rt"; t_rt_env "$_rt"
+    alert_resolved "quiet run" >/dev/null 2>&1
+    [ -s "$_rt/mails" ] && echo "MAILED-WITHOUT-INCIDENT"
+    alert_stuck "stalled" "my-ocr STUCK -- retrying" >/dev/null 2>&1
+    alert_resolved "the queue emptied" >"$_rt/res.out" 2>&1
+    t_has "$_rt/desk" STUCK || echo "MARKERS-OFF-DESKTOP"
+    t_has "$_rt/trash" STUCK && echo "MARKERS-IN-TRASH"
+    grep -c "my-ocr RESOLVED" "$_rt/mails" | sed 's/^/RESOLVED-MAILS=/'
+  )"
+  case "$_rt_o" in
+    *MAILED-WITHOUT-INCIDENT*) t_bad "resolved: nothing is sent when nothing alerted" "$_rt_o";;
+    *MARKERS-OFF-DESKTOP*MARKERS-IN-TRASH*"RESOLVED-MAILS=1"*) t_ok "resolved: ONE mail, and the incident's markers go to the Trash (nothing sent when nothing alerted)";;
+    *) t_bad "resolved: ONE mail, and the incident's markers go to the Trash" "$_rt_o // $(cat "$_rt/res.out")";;
+  esac
+  # shellcheck disable=SC2016  # matching literal source text
+  if awk '/^do_trigger_ocr\(\) \{/,/^\}/' "$0" | awk '/^  done$/{d=NR} /^  alert_resolved /{r=NR} END{exit !(d && r && d < r)}'; then
+    t_ok "resolved: a run that alerted and then finished sends it"
+  else
+    t_bad "resolved: a run that alerted and then finished sends it" "alert_resolved is not called after the wait loop"
+  fi  # A FineReader killed early leaves a document whose batch file names no path
+  # yet -- only its page sources, copies of what it was handed. Ours when every
+  # one is byte-identical to this run's staged document; anything else stays.
+  _rt_leftover() { # $1 = content of its page source
+    _rt_l="$_rt/docstore/com.abbyy.FineReaderPro12.00/Untitled.FR12.0"
+    rm -rf "$_rt/docstore"; mkdir -p "$_rt_l"
+    printf '\005/g\134' >"$_rt_l/_FRBatch.pac"; printf '%s\n' "$1" >"$_rt_l/{0003}.source"
+  }
+  printf '#!/bin/dash\nshift 2>/dev/null\nrm -rf "$@"\n' >"$_rt/bin/trash"; chmod +x "$_rt/bin/trash"
+  _rt_leftover "doc a"
+  _rt_o="$( t_reset_sandbox "$_rt"; t_rt_env "$_rt"; OCRAPP_BUNDLE_ID="com.abbyy.FineReaderPro"
+            ocrapp_clear_stale_batch "$S_PATH" 2>&1; [ -d "$_rt_l" ] || echo "LEFTOVER-CLEARED" )"
+  case "$_rt_o" in
+    *"byte-identical copies"*LEFTOVER-CLEARED*) t_ok "leftover: one holding only copies of this run's staged document is cleared, though it names no path";;
+    *) t_bad "leftover: one holding only copies of this run's staged document is cleared, though it names no path" "$_rt_o";;
+  esac
+  _rt_leftover "someone else's page"
+  _rt_o="$( t_reset_sandbox "$_rt"; t_rt_env "$_rt"; OCRAPP_BUNDLE_ID="com.abbyy.FineReaderPro"
+            ocrapp_clear_stale_batch "$S_PATH" 2>&1; [ -d "$_rt_l" ] && echo "LEFTOVER-KEPT" )"
+  case "$_rt_o" in
+    *"LEFT ALONE"*LEFTOVER-KEPT*) t_ok "leftover: one holding a page source that is NOT ours is left alone";;
+    *) t_bad "leftover: one holding a page source that is NOT ours is left alone" "$_rt_o";;
+  esac
+  # one marker per incident, holding its timeline
+  _rt_world
+  _rt_o="$(
+    t_reset_sandbox "$_rt"; t_rt_env "$_rt"
+    alert_stuck "first" "my-ocr STUCK" >/dev/null 2>&1
+    alert_stuck "second" "my-ocr STUCK -- retrying" >/dev/null 2>&1
+    alert_stuck "third" "my-ocr STUCK -- gave up" >/dev/null 2>&1
+    set -- "$_rt/desk"/*STUCK*; echo "MARKERS=$#"
+    grep -c "my-ocr STUCK" "$1" | sed 's/^/LINES=/'
+  )"
+  case "$_rt_o" in
+    *"MARKERS=1"*"LINES=3"*) t_ok "markers: ONE per incident, every alert of it added to that file";;
+    *) t_bad "markers: ONE per incident, every alert of it added to that file" "$_rt_o";;
+  esac
+  # after a retry, the 'queue has not moved' notice is not a new mail
+  # shellcheck disable=SC2016  # matching literal source text
+  _rt_blk="$(awk '/if \[ "\$stalled" -ge "\$next_alert" \]; then/,/next_alert=\$\(\( \$stalled/' "$0")"
+  if printf '%s\n' "$_rt_blk" | awk '/elif \[ -n "\$_retry_done" \]; then/{r=NR} /alert_stuck/{a=NR} END{exit !(r && a && r < a)}'; then
+    t_ok "mails: after a retry the not-moved notice is logged, not mailed -- the next mail is the outcome"
+  else
+    t_bad "mails: after a retry the not-moved notice is logged, not mailed" "the notice block mails regardless"
+  fi
+}
+
+# Point 6: 'status' names what runs that are gone left behind, each with its
+# raw value -- and does not call an EMPTY staging folder debris: every part
+# creates one, and it is harmless.
+rt_status_health() {
+  _sh="$T_TMP/health"; rm -rf "$_sh"; mkdir -p "$_sh/lib" "$_sh/pub" "$_sh/tmp-stage" "$_sh/docstore"
+  _sh_o="$( t_reset_sandbox "$_sh"; t_rt_env "$_sh"; do_status "" 2>&1 | grep '^HEALTH' )"
+  case "$_sh_o" in
+    "HEALTH    ok   ["*"staging none"*) t_ok "health: a clean world, and an EMPTY staging folder, read ok";;
+    *) t_bad "health: a clean world, and an EMPTY staging folder, read ok" "$_sh_o";;
+  esac
+  printf 'x ERROR 066 from a gone run\n' >"$_sh/lib/f1"; printf 'doc\n' >"$_sh/tmp-stage/a.pdf"
+  _sh_o="$( t_reset_sandbox "$_sh"; t_rt_env "$_sh"; do_status "" 2>&1 | grep '^HEALTH' )"
+  case "$_sh_o" in
+    "HEALTH    ATTENTION"*"error flag"*"staging folder with documents"*"error flag 1 line(s)"*"staging $_sh/tmp-stage"*)
+      t_ok "health: an error flag and a staging folder with documents are named, with their raw values";;
+    *) t_bad "health: an error flag and a staging folder with documents are named, with their raw values" "$_sh_o";;
+  esac
+}
+
+# Third-party Automator actions: macOS refuses the workflow before its first
+# step when they are off, and NOTHING says so -- the new scan host lost four
+# days of scans that way. status and setup read the marker and name the fix.
+t_3p_marker() { AUTOMATOR_3PP_MARKER="$1"; } # INSIDE a subshell only
+rt_automator_3pp() {
+  _3d="$T_TMP/3pp"; mkdir -p "$_3d"; printf 'a' >"$_3d/marker"
+  _3o="$( t_3p_marker "$_3d/marker"; automator_3pp_state; echo "RC=$?"; do_status "" 2>&1 | grep '^AUTOMATOR' )"
+  case "$_3o" in
+    *"marker 'a'"*"RC=0"*"AUTOMATOR third-party actions enabled   [marker 'a']"*) t_ok "third-party: the marker present reads as enabled, with its raw value";;
+    *) t_bad "third-party: the marker present reads as enabled, with its raw value" "$_3o";;
+  esac
+  _3o="$( t_3p_marker "$_3d/absent"; automator_3pp_state; echo "RC=$?"; do_status "" 2>&1 | grep '^AUTOMATOR' )"
+  case "$_3o" in
+    *"marker absent"*"RC=1"*"AUTOMATOR third-party actions OFF"*"Third-Party Automator Actions"*) t_ok "third-party: no marker reads as OFF, and status names the menu item that fixes it";;
+    *) t_bad "third-party: no marker reads as OFF, and status names the menu item that fixes it" "$_3o";;
+  esac
+  # setup still wires everything, but must not call itself OK
+  printf 'AUTOMATOR_3PP_MARKER="%s"\n' "$_3d/absent" >"$_3d/off.conf"
+  _3o="$(MY_OCR_CONFIG="$_3d/off.conf" "$0" setup 2>&1 </dev/null)"
+  case "$_3o" in
+    *"preflight OK"*) t_bad "third-party: with it OFF, setup does not say 'preflight OK'" "$(printf '%s' "$_3o" | grep -E 'third-party|>>> ')";;
+    *"third-party   OFF"*) t_ok "third-party: with it OFF, setup says so and does not say 'preflight OK'";;
+    *) t_bad "third-party: with it OFF, setup says so and does not say 'preflight OK'" "$(printf '%s' "$_3o" | grep -E 'third-party|>>> ')";;
+  esac
+  # and a run whose hand-overs never fire names it as the cause
+  # shellcheck disable=SC2016  # matching literal source text
+  if awk '/^do_trigger_ocr\(\) \{/,/^\}/' "$0" \
+     | awk '/never started -- two hand-overs/{n=NR} /automator_3pp_state/{c=NR} /AUTOMATOR_3PP_HOWTO/{h=NR} /err 159 /{e=NR}
+            END{exit !(n && c && h && e && n < c && c < h && h < e)}'; then
+    t_ok "third-party: 'never started' names the setting when it is OFF"
+  else
+    t_bad "third-party: 'never started' names the setting when it is OFF" "err 159 does not consult it"
+  fi
+}
+
+rt_reset_log_last() {
+  # the documents part of reset lives in reset_stranded(), shared with the
+  # pre-flight repair -- the order has to hold there
+  _rl="$(awk '/^reset_stranded\(\)/,/^\}/' "$0")"
+  _rl_docs="$(printf '%s\n' "$_rl" | grep -n 'retry them with' | head -n 1 | cut -d: -f1)"
+  _rl_log="$(printf '%s\n' "$_rl" | grep -n 'removed the queued-moves log' | head -n 1 | cut -d: -f1)"
+  if [ -n "$_rl_docs" ] && [ -n "$_rl_log" ] && [ "$_rl_log" -gt "$_rl_docs" ]; then
+    t_ok "reset removes the queued-moves log only AFTER the stranded documents are handled"
+  else
+    t_bad "reset removes the queued-moves log only AFTER the stranded documents are handled" \
+          "log removed at line ${_rl_log:-?}, documents handled at ${_rl_docs:-?}"
+  fi
+}
+
+rt_stall_recovery() {
+  _c="$(printf '  0:02.02\n' | cpu_from_ps)"
+  if [ "$_c" = "202" ]; then t_ok "cpu: '0:02.02' is 202 hundredths"
+  else t_bad "cpu: '0:02.02' is 202 hundredths" "got '$_c'"; fi
+  _c="$(printf ' 1:23:45\n' | cpu_from_ps)"
+  if [ "$_c" = "502500" ]; then t_ok "cpu: '1:23:45' (h:m:s) is 502500 hundredths"
+  else t_bad "cpu: '1:23:45' (h:m:s) is 502500 hundredths" "got '$_c'"; fi
+  # several pids add up -- the app is more than one process
+  _c="$(printf '  0:01.00\n  0:02.50\n' | cpu_from_ps)"
+  if [ "$_c" = "350" ]; then t_ok "cpu: several pids are summed (350)"
+  else t_bad "cpu: several pids are summed (350)" "got '$_c'"; fi
+  # a WORKING app must never be called frozen: 0.01s of work is a change
+  if [ "$(printf '  0:02.02\n' | cpu_from_ps)" != "$(printf '  0:02.03\n' | cpu_from_ps)" ]; then
+    t_ok "cpu: one hundredth of work is visible, so a busy app is never called idle"
+  else
+    t_bad "cpu: one hundredth of work is visible, so a busy app is never called idle" \
+          "whole-second rounding would freeze a working app"
+  fi
+  # the loop must consult it, and must be switchable off
+  if awk '/OCRAPP_IDLE_GIVEUP/{n++} END{exit !(n>=2)}' "$0"; then
+    t_ok "the wait loop consults cpu time, and OCRAPP_IDLE_GIVEUP=0 disables it"
+  else
+    t_bad "the wait loop consults cpu time, and OCRAPP_IDLE_GIVEUP=0 disables it" "not wired in"
+  fi
+
+  # "stuck" is a RATE, not zero. Measured on ada: an app sitting on a crash
+  # dialog still burned 0.3 s of cpu per minute, so a test for cpu time
+  # UNCHANGED never fired and the pipeline stalled anyway. Real work was 36 s
+  # per minute. These numbers are that measurement, kept as a test.
+  _bud="$(( 3 * 100 / 60 ))"                       # the default budget, hundredths/s
+  _tick="$(( 30 / 5 ))"                            # 0.3 s/min over a 5 s look = 30 hundredths... /5s
+  if [ "$_bud" -ge 1 ]; then t_ok "stall: the budget is at least one hundredth per second ($_bud)"
+  else t_bad "stall: the budget is at least one hundredth per second" "got $_bud"; fi
+  # a dialog-bound app (0.3 s/min = 0.5 hundredths per second) must count as stuck
+  if [ 1 -le "$_bud" ]; then t_ok "stall: 0.3 s/min (a dialog-bound app) is inside the budget -- counted as stuck"
+  else t_bad "stall: 0.3 s/min (a dialog-bound app) is inside the budget -- counted as stuck" "budget=$_bud"; fi
+  # real work (36 s/min = 60 hundredths per second) must NOT
+  if [ 60 -gt "$_bud" ]; then t_ok "stall: 36 s/min (real OCR work) is far outside it -- never called stuck"
+  else t_bad "stall: 36 s/min (real OCR work) is far outside it -- never called stuck" "budget=$_bud"; fi
+  # The periodic "queue has not moved" notice mailed STUCK for every healthy
+  # batch that outlasted the first interval. It may alert only when the cpu
+  # evidence says the app is NOT working -- and that evidence must exist on the
+  # FIRST look, which is the one the first alert fires on.
+  # shellcheck disable=SC2016  # matching literal source text
+  _cs_blk="$(awk '/if \[ "\$stalled" -ge "\$next_alert" \]; then/,/next_alert=\$\(\( \$stalled/' "$0")"
+  if printf '%s\n' "$_cs_blk" | awk '/_cpu_busy/{b=NR} /alert_stuck/{a=NR} END{exit !(b && a && b < a)}'; then
+    t_ok "stall: the periodic notice alerts only when the cpu says the app is NOT working"
+  else
+    t_bad "stall: the periodic notice alerts only when the cpu says the app is NOT working" \
+          "alert_stuck is not guarded by _cpu_busy in the notice block"
+  fi
+  # shellcheck disable=SC2016  # matching literal source text
+  if grep -q '_cpu_was="\$_cpu_now"; sleep 1; _cpu_now="\$(ocrapp_cpu_secs)"' "$0"; then
+    t_ok "stall: the first look takes two samples, so the first alert has evidence"
+  else
+    t_bad "stall: the first look takes two samples, so the first alert has evidence" "single sample on the first look"
+  fi
+  # A helper this script does not define is a call that fails on EVERY look.
+  # 'isInt' is my-scan's, and my-ocr called it once: the budget guard printed
+  # 'isInt: not found' on every pass of the wait loop for as long as it existed.
+  # Lines of this check are skipped by the '_cs_' filter: the names have to be
+  # written out here, and a test that matched its own pattern would report them
+  # for ever.
+  _cs_undef=""
+  for _cs_f in isInt isNum pe det msg quiet_out; do
+    grep -q "^$_cs_f()" "$0" && continue                    # defined here: fine
+    grep -v '_cs_' "$0" | grep -qE "(^|[;&|}]|&&|\|\|)[[:space:]]*${_cs_f}[[:space:]]+[^=]" \
+      && _cs_undef="$_cs_undef $_cs_f"
+  done
+  if [ -z "$_cs_undef" ]; then
+    t_ok "stall: every helper the script calls is one it defines"
+  else
+    t_bad "stall: every helper the script calls is one it defines" "undefined here:$_cs_undef"
+  fi
+  # shellcheck disable=SC2016  # matching literal source text
+  if awk '/^wait_for_|_cpu_bud/{print}' "$0" | grep -q '_cpu_now - _cpu_was'; then
+    t_ok "stall: it compares the cpu USED since the last look, not equality"
+  else
+    t_bad "stall: it compares the cpu USED since the last look, not equality" "still an equality test"
+  fi
+}
+
+rt_bundle_pids() {
+  # LIVE: the recognition does not run in the process that carries the app's
+  # name -- it runs in helper processes inside the same bundle. Counting only
+  # the named one made a 25-page batch that was genuinely working look frozen,
+  # and it was TERMed mid-OCR. So: a busy helper must be SEEN, and a process
+  # that merely mentions the bundle path must not be.
+  _bp="$(mktemp -d /tmp/my-ocr.bundle.XXXXXX)" || { t_bad "bundle pids: no tmpdir" "mktemp failed"; return 1; }
+  mkdir -p "$_bp/Contents"
+  # A SYMLINK to a real binary, not a script: an interpreted file is listed as
+  # '/bin/dash <path>', so its command line starts with the INTERPRETER and a
+  # helper built that way would not exercise the anchored match at all.
+  ln -s /usr/bin/yes "$_bp/Contents/Helper"
+
+  _bp_was_name="$OCRAPP_NAME"; _bp_was_path="$OCRAPP_PATH"
+  OCRAPP_NAME="my-ocr-no-such-app"      # the NAMED process is deliberately absent
+  OCRAPP_PATH="$_bp"
+  "$_bp/Contents/Helper" >/dev/null 2>&1 & _bp_h=$!
+  # MENTIONS the path without belonging to the bundle. The trailing ':' keeps a
+  # shell alive: with a single command dash EXECS it and the mention disappears
+  # from the command line, so the case would pass while testing nothing.
+  /bin/dash -c "sleep 20; : '$_bp/Contents/Helper'" & _bp_m=$!
+  # ...and one launched the way the real app launches its helpers: argv[0]
+  # BEGINS with a literal double quote. Without this case the suite passed
+  # while every helper of a live run went uncounted.
+  /usr/bin/perl -e 'exec {"/usr/bin/yes"} "\"$ARGV[0]\"" or exit 1' \
+                 "$_bp/Contents/Helper" >/dev/null 2>&1 & _bp_q=$!
+  sleep 1
+  if kill -0 "$_bp_h" 2>/dev/null && kill -0 "$_bp_m" 2>/dev/null && kill -0 "$_bp_q" 2>/dev/null; then
+    t_ok "bundle pids: all three probe processes are alive ($_bp_h, $_bp_m, $_bp_q)"
+  else
+    t_bad "bundle pids: all three probe processes are alive" \
+          "helper=$_bp_h mention=$_bp_m quoted=$_bp_q -- one died, so the cases below prove nothing"
+  fi
+  if ocrapp_all_pids | grep -qx "$_bp_q"; then
+    t_ok "bundle pids: a helper whose argv[0] starts with a quote is counted ($_bp_q)"
+  else
+    t_bad "bundle pids: a helper whose argv[0] starts with a quote is counted" \
+          "found only: $(ocrapp_all_pids | xargs echo) -- this is how every live helper went uncounted"
+  fi
+
+  if ocrapp_all_pids | grep -qx "$_bp_h"; then
+    t_ok "bundle pids: a busy helper of the bundle is counted ($_bp_h)"
+  else
+    t_bad "bundle pids: a busy helper of the bundle is counted" "found only: $(ocrapp_all_pids | xargs echo)"
+  fi
+  if ocrapp_all_pids | grep -qx "$_bp_m"; then
+    t_bad "bundle pids: a process that only NAMES the bundle is not counted" "matched pid $_bp_m"
+  else
+    t_ok "bundle pids: a process that only NAMES the bundle is not counted"
+  fi
+  # and the cpu it burns must be VISIBLE -- that is what keeps the app alive
+  _bp_c1="$(ocrapp_cpu_secs)"; sleep 2; _bp_c2="$(ocrapp_cpu_secs)"
+  if [ "$_bp_c2" -gt "$_bp_c1" ]; then
+    t_ok "bundle pids: helper cpu advances, so a working app is never called idle ($_bp_c1 -> $_bp_c2)"
+  else
+    t_bad "bundle pids: helper cpu advances, so a working app is never called idle" "$_bp_c1 -> $_bp_c2"
+  fi
+
+  kill "$_bp_h" "$_bp_m" "$_bp_q" 2>/dev/null; wait "$_bp_h" "$_bp_m" "$_bp_q" 2>/dev/null
+  OCRAPP_NAME="$_bp_was_name"; OCRAPP_PATH="$_bp_was_path"
+  rm -rf "$_bp"
+}
+
+rt_counts_reconcile() {
+  # the ordinary case: 5 handed over, 2 still queued -> 3 done
+  _c="$(ocr_ok_cnt 5 2)"
+  if [ "$_c" = "3" ]; then t_ok "counts: 5 handed to the OCR, 2 queued -> 3 OCRed"
+  else t_bad "counts: 5 handed to the OCR, 2 queued -> 3 OCRed" "got '$_c'"; fi
+  # nothing handed over, nothing queued
+  _c="$(ocr_ok_cnt 0 0)"
+  if [ "$_c" = "0" ]; then t_ok "counts: an empty run reports 0, not a blank"
+  else t_bad "counts: an empty run reports 0, not a blank" "got '$_c'"; fi
+  # the real defect: a queue log holding a DEAD run's lines
+  _c="$(ocr_ok_cnt 0 2)"
+  case "$_c" in
+    "MISMATCH 2") t_ok "counts: 2 queued but 0 handed over is a MISMATCH, never '-2 SUCCESSFULLY OCRed'";;
+    -*) t_bad "counts: 2 queued but 0 handed over is a MISMATCH, never '-2 SUCCESSFULLY OCRed'" \
+              "it still prints a NEGATIVE count: '$_c'";;
+    *) t_bad "counts: 2 queued but 0 handed over is a MISMATCH, never '-2 SUCCESSFULLY OCRed'" "got '$_c'";;
+  esac
+  # ...and no arithmetic may reach the summary without going through it
+  # shellcheck disable=SC2016  # matching literal source text
+  if grep -q 'TOTAL_FILES2OCR_CNT - \$left_cnt' "$0"; then
+    t_bad "counts: the summary subtracts through ocr_ok_cnt, not inline" "a raw subtraction is still printed"
+  else
+    t_ok "counts: the summary subtracts through ocr_ok_cnt, not inline"
+  fi
+}
+
+rt_ocrapp_quit() {
+  # it must be a no-op, and instant, when the app is not running at all
+  _q_t0=$(date +%s)
+  ( OCRAPP_NAME="no-such-process-xyzzy"; ocrapp_quit ) >/dev/null 2>&1
+  _q_el=$(( $(date +%s) - _q_t0 ))
+  if [ "$_q_el" -le 2 ]; then t_ok "closing an app that is not running returns at once (${_q_el}s)"
+  else t_bad "closing an app that is not running returns at once" "took ${_q_el}s"; fi
+  # NO path may signal the OCR app without trying 'quit' first: strip the
+  # helper out of the source and nothing signalling it may remain.
+  # shellcheck disable=SC2016  # the literal source text is what is searched for
+  _q_outside="$(awk '/^ocrapp_quit\(\) \{/{skip=1} skip&&/^\}/{skip=0;next} !skip' "$0" \
+                | grep -c 'pkill -[0-9x].*OCRAPP_NAME')"
+  if [ "$_q_outside" = "0" ]; then
+    t_ok "every signal to the OCR app lives inside ocrapp_quit, after 'quit' was tried"
+  else
+    t_bad "every signal to the OCR app lives inside ocrapp_quit, after 'quit' was tried" \
+          "$_q_outside signal(s) bypass it"
+  fi
+  # and the helper must actually ask the app to quit, by bundle id
+  if awk '/^ocrapp_quit\(\) \{/,/^\}/' "$0" | grep -q 'to quit'; then
+    t_ok "it asks the application to quit before any signal"
+  else
+    t_bad "it asks the application to quit before any signal" "no AppleScript quit in the helper"
+  fi
+}
+
+rt_stale_batch() {
+  _sb_t="$T_TMP/stale-batch"; mkdir -p "$_sb_t/bin"
+  # a stub trash, so a test never puts anything in the user's Trash
+  printf '#!/bin/dash\nshift 2>/dev/null\nrm -rf "$@"\n' >"$_sb_t/bin/trash"
+  chmod +x "$_sb_t/bin/trash"
+  _sb_stage="$_sb_t/stage"
+  # build one document whose pages all came from staging, and one that did not
+  _mk() { # $1 = doc dir, $2.. = source paths written into the batch file
+    mkdir -p "$1/0001/Image"; _d="$1"; shift
+    # BINARY, like the real thing: a high byte in front of every path, so a
+    # tr without LC_ALL=C fails here exactly as it does on a real batch file.
+    for _p in "$@"; do printf '\377\376W%s\377' "$_p" >>"$_d/_FRBatch.pac"; done
+  }
+  # shellcheck disable=SC2030  # deliberate: the subshell is what keeps these
+  # overrides out of the rest of the suite
+  (
+    OCRAPP_DOCSTORE_BASE="$_sb_t/store"; OCRAPP_BUNDLE_ID="com.test.app"
+    c_trash="$_sb_t/bin/trash"; OCRAPP_NAME="no-such-process-xyzzy"
+    _mine="$_sb_t/store/com.test.app12.00/Untitled.FR12.0"
+    _mk "$_mine" "$_sb_stage/a.#1.pdf" "$_sb_stage/b.#1.pdf"
+    _o="$(ocrapp_clear_stale_batch "$_sb_stage" 2>&1)"
+    if [ ! -d "$_mine" ]; then echo "OK1 $_o"; else echo "BAD1 $_o"; fi
+
+    # A document of YOURS is a path that EXISTS AS A FILE. It has to be a real
+    # one: a made-up path that exists nowhere references nothing, and using one
+    # here would let this case pass without testing the rule.
+    mkdir -p "$_sb_t/yours"; printf 'a document of yours\n' >"$_sb_t/yours/their-thesis.pdf"
+    _mixed="$_sb_t/store/com.test.app12.00/Untitled.FR12.0"
+    _mk "$_mixed" "$_sb_stage/a.#1.pdf" "$_sb_t/yours/their-thesis.pdf"
+    _o="$(ocrapp_clear_stale_batch "$_sb_stage" 2>&1)"
+    if [ -d "$_mixed" ]; then echo "OK2 $_o"; else echo "BAD2 $_o"; fi
+    rm -rf "$_mixed"
+
+    # The corpus a REAL batch file yields: full staging paths beside fragments
+    # of them, because the format stores a length byte in front of each path.
+    # Demanding that every one be under staging refused for ever, and a
+    # leftover blocked two consecutive runs on ada while nothing looked wrong.
+    _frag="$_sb_t/store/com.test.app12.00/Untitled.FR12.0"
+    _mk "$_frag" "$_sb_stage/2026-09-23_1023.11___scan.#1.pdf" \
+        "/" "/Users" "/Users/" "/5K" "/g\\" "/me/Public/,ocr.i" "/2026-09-23_1023.11"
+    _o="$(ocrapp_clear_stale_batch "$_sb_stage" 2>&1)"
+    if [ ! -d "$_frag" ]; then echo "OK4 $_o"; else echo "BAD4 $_o"; fi
+
+    # ...but fragments ALONE map it to nothing, so there is no claim on it
+    _none="$_sb_t/store/com.test.app12.00/Untitled.FR12.0"
+    _mk "$_none" "/" "/Users" "/5K"
+    _o="$(ocrapp_clear_stale_batch "$_sb_stage" 2>&1)"
+    if [ -d "$_none" ]; then echo "OK5 $_o"; else echo "BAD5 $_o"; fi
+    rm -rf "$_none"
+
+    _nopac="$_sb_t/store/com.test.app12.00/Untitled.FR12.0"
+    mkdir -p "$_nopac/0001/Image"
+    _o="$(ocrapp_clear_stale_batch "$_sb_stage" 2>&1)"
+    if [ -d "$_nopac" ]; then echo "OK3 $_o"; else echo "BAD3 $_o"; fi
+  ) >"$_sb_t/out" 2>&1
+  _r="$(cat "$_sb_t/out")"
+  case "$_r" in
+    *"OK1"*"cleared leftover document [2 of 2 path(s) from staging"*) t_ok "a leftover whose pages all came from staging is cleared";;
+    *) t_bad "a leftover whose pages all came from staging is cleared" "out='$_r'";;
+  esac
+  case "$_r" in
+    *"OK2"*"their-thesis.pdf"*"LEFT ALONE"*) t_ok "one file of yours and the whole document is LEFT ALONE, named in the output";;
+    *) t_bad "one file of yours and the whole document is LEFT ALONE, named in the output" "out='$_r'";;
+  esac
+  case "$_r" in
+    *"OK4"*"cleared leftover document [1 of 8 path(s) from staging"*)
+      t_ok "the fragments a real batch file yields do not block the clearing";;
+    *) t_bad "the fragments a real batch file yields do not block the clearing" "out='$_r'";;
+  esac
+  case "$_r" in
+    *"OK5"*"names no path under"*"LEFT ALONE"*)
+      t_ok "fragments alone map a leftover to nothing -- LEFT ALONE";;
+    *) t_bad "fragments alone map a leftover to nothing -- LEFT ALONE" "out='$_r'";;
+  esac
+  case "$_r" in
+    *"OK3"*"no readable batch file"*"LEFT ALONE"*) t_ok "no batch file to read means no decision -- LEFT ALONE, and it says why";;
+    *) t_bad "no batch file to read means no decision -- LEFT ALONE, and it says why" "out='$_r'";;
+  esac
+  # shellcheck disable=SC2016  # the literal source text is what is searched for
+  if awk '/^do_trigger_ocr\(\) \{/,/^\}/' "$0" | grep -q 'ocrapp_clear_stale_batch "\$S_PATH"'; then
+    t_ok "trigger-OCR clears it against my-ocr's own staging path"
+  else
+    t_bad "trigger-OCR clears it against my-ocr's own staging path" "the helper is not called before the run"
+  fi
+}
+
+rt_window_restore() {
+  _wr="$T_TMP/window-restore"; mkdir -p "$_wr"
+  _o1="$( ocrapp_no_window_restore "$_wr/unset" 2>&1 )"
+  _v1="$(/usr/bin/defaults read "$_wr/unset" ApplePersistenceIgnoreState 2>/dev/null)"
+  case "$_v1:$_o1" in
+    "1:"*"window restore off (was: unset)"*) t_ok "window restore is turned off and the output says what it was";;
+    *) t_bad "window restore is turned off and the output says what it was" "value='$_v1' out='$_o1'";;
+  esac
+  _o2="$( ocrapp_no_window_restore "$_wr/unset" 2>&1 )"
+  if [ -z "$_o2" ]; then t_ok "the run after a run changes nothing and prints nothing"
+  else t_bad "the run after a run changes nothing and prints nothing" "out='$_o2'"; fi
+  /usr/bin/defaults write "$_wr/on" ApplePersistenceIgnoreState -bool NO
+  _o3="$( ocrapp_no_window_restore "$_wr/on" 2>&1 )"
+  _v3="$(/usr/bin/defaults read "$_wr/on" ApplePersistenceIgnoreState 2>/dev/null)"
+  case "$_v3:$_o3" in
+    "1:"*"(was: 0)"*) t_ok "an explicit 'reopen windows' setting is overridden too";;
+    *) t_bad "an explicit 'reopen windows' setting is overridden too" "value='$_v3' out='$_o3'";;
+  esac
+  # shellcheck disable=SC2016  # the literal source text is what is searched for
+  if awk '/^do_trigger_ocr\(\) \{/,/^\}/' "$0" | grep -q 'ocrapp_no_window_restore "\$OCRAPP_BUNDLE_ID"'; then
+    t_ok "trigger-OCR applies it to the OCR app's own domain"
+  else
+    t_bad "trigger-OCR applies it to the OCR app's own domain" "the helper is not called before the run"
+  fi
+}
+
+rt_concurrency_state() {
+  # 1. per-invocation scratch names
+  if awk "/^ *PROVIDED_FILES_FILELIST=/" "$0" | grep -q '[$][$]'; then
+    t_ok "PROVIDED_FILES_FILELIST is per-invocation"
+  else
+    t_bad "PROVIDED_FILES_FILELIST is per-invocation" \
+      "a shared name lets one instance's cleanup() delete another's input list"
+  fi
+  if awk "/^ *ENCRYPTED_PDFS_FILELIST=/" "$0" | grep -q '[$][$]'; then
+    t_ok "ENCRYPTED_PDFS_FILELIST is per-invocation"
+  else
+    t_bad "ENCRYPTED_PDFS_FILELIST is per-invocation" "same race as the filelist"
+  fi
+
+  # reset must never interrupt a live run, and never delete a document
+  _tr="$(awk '/^do_reset\(\) \{/,/^\}/' "$0")"
+  if printf '%s' "$_tr" | grep -q 'run_is_alive'; then
+    t_ok "reset refuses while a run is live"
+  else
+    t_bad "reset refuses while a run is live" "it would pull the rug out from real work"
+  fi
+  if printf '%s' "$_tr" | grep -q 'rm -f.*S_PATH\|rm -rf'; then
+    t_bad "reset never deletes a document" "it removes rather than moves"
+  else
+    t_ok "reset never deletes a document, it moves them to RESET_RETRY_TO"
+  fi
+  if awk '/^do_trigger_ocr\(\) \{/,/^\}/' "$0" | grep -q '^  self_heal'; then
+    t_ok "trigger-OCR self-heals leftovers before it starts"
+  else
+    t_bad "trigger-OCR self-heals leftovers before it starts" \
+      "a crashed run's files would poison the next one"
+  fi
+
+  # the cleanup REGISTRY must be per-run too, or one instance deletes another's
+  if awk "/^CLEANUP_FILELIST_FILE=/" "$0" | grep -q '[$][$]'; then
+    t_ok "the cleanup registry is per-invocation"
+  else
+    t_bad "the cleanup registry is per-invocation" \
+      "keyed by mode alone, one instance's cleanup() deletes another's files"
+  fi
+
+  # --version must identify the exact bytes, and a released number is never reused
+  if grep -q '^SCRIPT_VERSION="' "$0" && grep -q '^SCRIPT_COMMIT=' "$0"; then
+    t_ok "--version carries a version and a commit slot"
+  else
+    t_bad "--version carries a version and a commit slot" "a stale deployed copy stays invisible"
+  fi
+  _v="$("$0" --version 2>/dev/null)"
+  case "$_v" in
+    *"build "*) t_ok "--version prints a build id taken from the file itself";;
+    *) t_bad "--version prints a build id taken from the file itself" "got: $_v";;
+  esac
+  # The number NAMES the release these bytes are based on; only a release
+  # commit sets it. Whether this build IS that release is what the describe
+  # string in '--version' says, so the check here is that the number still
+  # names the nearest tag.
+  # the REAL file's directory, as --version itself resolves it: run through the
+  # farm link /LINKS/bin/my-ocr, dirname "$0" is /LINKS/bin -- another repo, with
+  # no tags -- and the check compared the tool's answer with a stranger's.
+  _vd="$(_self_dir)"
+  if git -C "$_vd" rev-parse --git-dir >/dev/null 2>&1; then
+    _vnear="$(git -C "$_vd" describe --tags --abbrev=0 2>/dev/null)"
+    if [ -z "$_vnear" ]; then
+      t_ok "no release tag yet -- nothing for the version to name"
+    elif [ "$_vnear" = "$SCRIPT_VERSION" ]; then
+      t_ok "version $SCRIPT_VERSION names the release it is based on"
+    elif git -C "$_vd" diff HEAD~1 HEAD -- "$US" 2>/dev/null | grep -q "^+SCRIPT_VERSION=\"$SCRIPT_VERSION\""; then
+      # the RELEASE commit itself: it sets the number, and its tag can only
+      # follow the stamp -- which runs this suite first. Any later commit
+      # without the tag still fails below.
+      t_ok "version $SCRIPT_VERSION is set by this release commit -- its tag follows the stamp"
+    else
+      t_bad "version $SCRIPT_VERSION does not name the nearest tag $_vnear" \
+        "set SCRIPT_VERSION to $_vnear, or tag this release"
+    fi
+    case "$("$0" --version 2>/dev/null)" in
+      *unreleased*|*"the $_vnear tag"*) t_ok "--version says whether these bytes are that release";;
+      *) t_bad "--version says whether these bytes are that release" "got: $("$0" --version 2>/dev/null)";;
+    esac
+  else
+    t_ok "version check skipped (not a git checkout)"
+  fi
+
+  # A DECLARED input type must actually be usable. c_convert comes from a
+  # per-host config file; where that file did not define it, JPEG/PNG ran ''
+  # and died with 127 while setup still said "preflight OK".
+  if grep -q 'for _cc in /opt/homebrew/bin/convert' "$0"; then
+    t_ok "convert is autodetected when the host config does not define it"
+  else
+    t_bad "convert is autodetected when the host config does not define it" \
+      "JPEG/PNG would fail with 127 on an empty command"
+  fi
+  if grep -q 'err 152' "$0"; then
+    t_ok "an image type refuses clearly when convert is missing"
+  else
+    t_bad "an image type refuses clearly when convert is missing" "it would run ''"
+  fi
+  if awk '/^do_setup\(\) \{/,/^\}/' "$0" | grep -q 'NOT SET'; then
+    t_ok "setup reports an UNSET helper instead of skipping it"
+  else
+    t_bad "setup reports an UNSET helper instead of skipping it" \
+      "preflight would say OK while a declared capability is broken"
+  fi
+
+  # a caller that names files must never be left waiting on an idle pipe
+  if awk '/^do_trigger_ocr\(\) \{/,/^\}/' "$0" \
+       | grep -q 'if \[ ! -t 0 \] && \[ "\$PROVIDED_FILES_CNT" -eq 0 \]'; then
+    t_ok "stdin is not read when filenames were given another way"
+  else
+    t_bad "stdin is not read when filenames were given another way" \
+      "my-ocr would block for ever on an open pipe, holding the OCR mutex"
+  fi
+
+  # per-invocation names must be cleaned up, or they accumulate for ever
+  if awk '/^do_trigger_ocr\(\) \{/,/^\}/' "$0" \
+       | grep -q 'schedule_for_cleanup "\$ENCRYPTED_PDFS_FILELIST"'; then
+    t_ok "the per-invocation encrypted-list is scheduled for cleanup"
+  else
+    t_bad "the per-invocation encrypted-list is scheduled for cleanup" \
+      "a \$\$-named file that is never removed leaks one file per run"
+  fi
+
+  # 2. nothing is created before the mutex is held. Compare line numbers inside
+  #    do_trigger_ocr: the mkdir must come FIRST.
+  _tc="$(awk '/^do_trigger_ocr\(\) \{/,/^\}/' "$0" \
+          | awk '/mkdir "\$OCRAPP_MUTEX_DIR"/ { m=NR }
+                 /touch "\$ENCRYPTED_PDFS_FILELIST"/ { if (!t) t=NR }
+                 END { print (m>0 && t>0 && m<t) ? "ok" : "bad m=" m " t=" t }')"
+  if [ "$_tc" = "ok" ]; then
+    t_ok "trigger-OCR creates no working state before it holds the mutex"
+  else
+    t_bad "trigger-OCR creates no working state before it holds the mutex" "$_tc"
+  fi
+}
+
+# A PDF with N pages and a given Producer -- enough for pdfinfo to read both.
+t_mkpdf() { # $1 = file, $2 = pages, $3 = producer, $4 = text ("" = no text layer)
+  /usr/bin/python3 - "$1" "$2" "$3" "${4-Hello OCR}" <<'_EOMK_'
+import sys
+path, npages, producer = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+text = sys.argv[4] if len(sys.argv) > 4 else ""
+objs, page_ids = [], []
+objs.append(None)                                    # 1: catalog, filled below
+objs.append(None)                                    # 2: pages,   filled below
+nxt = 3
+stream_id = font_id = None
+if text:
+    body = ("BT /F1 24 Tf 40 100 Td (%s) Tj ET" % text).encode()
+    stream_id = nxt; nxt += 1
+    font_id   = nxt; nxt += 1
+for _ in range(npages):
+    page_ids.append(nxt); nxt += 1
+producer_id = nxt
+for pid in page_ids:
+    extra = ""
+    if text:
+        extra = " /Contents %d 0 R /Resources << /Font << /F1 %d 0 R >> >>" % (stream_id, font_id)
+    else:
+        extra = " /Resources << >>"
+    objs.append((pid, ("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 200]%s >>" % extra).encode()))
+kids = " ".join("%d 0 R" % p for p in page_ids)
+fixed = [(1, b"<< /Type /Catalog /Pages 2 0 R >>"),
+         (2, ("<< /Type /Pages /Kids [%s] /Count %d >>" % (kids, npages)).encode())]
+if text:
+    fixed.append((stream_id, b"<< /Length %d >>\nstream\n" % len(body) + body + b"\nendstream"))
+    fixed.append((font_id, b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"))
+fixed.append((producer_id, ("<< /Producer (%s) >>" % producer).encode()))
+allobjs = sorted(fixed + [o for o in objs if isinstance(o, tuple)], key=lambda t: t[0])
+out = b"%PDF-1.4\n"; offs = {}
+for num, payload in allobjs:
+    offs[num] = len(out); out += b"%d 0 obj\n" % num + payload + b"\nendobj\n"
+x = len(out); top = max(offs) + 1
+out += b"xref\n0 %d\n" % top + b"0000000000 65535 f \n"
+for n in range(1, top):
+    out += b"%010d 00000 n \n" % offs.get(n, 0)
+out += ("trailer\n<< /Size %d /Root 1 0 R /Info %d 0 R >>\nstartxref\n%d\n%%%%EOF\n"
+        % (top, producer_id, x)).encode()
+open(path, "wb").write(out)
+_EOMK_
+}
+
+# The result REPLACES the original and the original is trashed a moment
+# earlier, so this check is the only thing standing between a mangled OCR and
+# a lost document.
+rt_verify_result() {
+  if [ -z "$c_pdfinfo" ] || [ ! -x "$c_pdfinfo" ]; then
+    t_ok "result verification: skipped, no pdfinfo on this host"; return 0
+  fi
+  _vd="$T_TMP/verify"; mkdir -p "$_vd"
+  t_mkpdf "$_vd/in3.pdf"  3 "SomeScanner"
+  t_mkpdf "$_vd/out1.pdf" 1 "FineReader"
+  t_mkpdf "$_vd/out3.pdf" 3 "FineReader"
+  t_mkpdf "$_vd/out5.pdf" 5 "FineReader"
+  t_mkpdf "$_vd/notours.pdf" 3 "SomethingElse"
+  t_mkpdf "$_vd/notext.pdf"  3 "FineReader" ""
+
+  if verify_ocr_result "$_vd/out1.pdf" "$_vd/in3.pdf"; then
+    t_bad "verify: a result that LOST pages is refused" "3 in, 1 out was accepted -- that is a lost document"
+  else
+    case "$VERIFY_WHY" in
+      *"LOST pages"*) t_ok "verify: a result that LOST pages is refused ($VERIFY_WHY)";;
+      *) t_bad "verify: a result that LOST pages is refused" "refused, but for the wrong reason: $VERIFY_WHY";;
+    esac
+  fi
+
+  if verify_ocr_result "$_vd/out3.pdf" "$_vd/in3.pdf"; then
+    t_ok "verify: an equal-page result is accepted"
+  else
+    t_bad "verify: an equal-page result is accepted" "$VERIFY_WHY"
+  fi
+
+  # MORE pages is legitimate: the OCR app splits a sheet holding several pages
+  if verify_ocr_result "$_vd/out5.pdf" "$_vd/in3.pdf" >/dev/null; then
+    t_ok "verify: MORE pages out is accepted (page splitting is a feature)"
+  else
+    t_bad "verify: MORE pages out is accepted (page splitting is a feature)" "$VERIFY_WHY"
+  fi
+
+  if verify_ocr_result "$_vd/notours.pdf" "$_vd/in3.pdf"; then
+    t_bad "verify: a result not produced by the OCR app is refused" "it was accepted"
+  else
+    t_ok "verify: a result not produced by the OCR app is refused"
+  fi
+
+  : >"$_vd/empty.pdf"
+  if verify_ocr_result "$_vd/empty.pdf" "$_vd/in3.pdf"; then
+    t_bad "verify: an unparseable result is refused" "an empty file was accepted"
+  else
+    t_ok "verify: an unparseable result is refused"
+  fi
+
+  # A structurally damaged result: valid header, truncated body. pdfinfo can
+  # be fooled by this shape; qpdf is what catches it.
+  head -c 400 "$_vd/out3.pdf" >"$_vd/cut.pdf" 2>/dev/null
+  if verify_ocr_result "$_vd/cut.pdf" "$_vd/in3.pdf"; then
+    t_bad "verify: a structurally damaged result is refused" "a truncated PDF was accepted"
+  else
+    t_ok "verify: a structurally damaged result is refused ($VERIFY_WHY)"
+  fi
+
+  # NO TEXT IS NOT A REFUSAL -- it is a finding about the page. This test used
+  # to assert the opposite, which is how a photograph scanned on the flatbed
+  # was filed under FAILED as though the tool had broken.
+  if [ -n "$c_pdftotext" ] && [ -x "$c_pdftotext" ]; then
+    if verify_ocr_result "$_vd/notext.pdf" "$_vd/in3.pdf"; then
+      if [ -n "$VERIFY_NOTEXT" ]; then
+        t_ok "verify: a NO-text result is ACCEPTED and flagged as 'nothing found'"
+      else
+        t_bad "verify: a NO-text result is ACCEPTED and flagged as 'nothing found'" \
+              "accepted, but not flagged -- the summary cannot report it"
+      fi
+    else
+      t_bad "verify: a NO-text result is ACCEPTED and flagged as 'nothing found'" \
+            "refused: $VERIFY_WHY"
+    fi
+
+    # ADVERSARIAL: accepting "no text" must not become a blanket pass. A result
+    # that ALSO lost pages is still broken, and must still be refused -- or the
+    # new rule waves real damage through on the no-text path.
+    t_mkpdf "$_vd/notext1.pdf" 1 "FineReader" ""
+    if verify_ocr_result "$_vd/notext1.pdf" "$_vd/in3.pdf"; then
+      t_bad "verify: no-text AND lost pages is still refused" \
+            "3 in, 1 out with no text was accepted -- damage now rides in on the no-text path"
+    else
+      case "$VERIFY_WHY" in
+        *"LOST pages"*) t_ok "verify: no-text AND lost pages is still refused ($VERIFY_WHY)";;
+        *) t_bad "verify: no-text AND lost pages is still refused" "wrong reason: $VERIFY_WHY";;
+      esac
+    fi
+  fi
+
+  # A refusal must be a CLEAN rollback: bad result gone, original kept and
+  # quarantined, user told. Any one of the three missing turns a refusal into
+  # a silent loss or a stale file the next run trips over.
+  _vr="$(awk '/^do_part_2\(\)/,/^\}/' "$0")"
+  if printf '%s' "$_vr" | grep -q 'c_trash" -- "\$ocred_fp"'; then
+    t_ok "refusal: the bad result is trashed, not left in the out-path"
+  else
+    t_bad "refusal: the bad result is trashed, not left in the out-path" \
+      "the next run would find it sitting there"
+  fi
+  if printf '%s' "$_vr" | grep -q 'MOVE_FAILED_TO/\$'; then
+    t_ok "refusal: the original is quarantined, not left looking pending"
+  else
+    t_bad "refusal: the original is quarantined, not left looking pending" ""
+  fi
+  if printf '%s' "$_vr" | grep -q 'OCR REFUSED'; then
+    t_ok "refusal: the user is told"
+  else
+    t_bad "refusal: the user is told" "a silently refused document is a lost one"
+  fi
+
+  # ...and it must run BEFORE anything is trashed, or it protects nothing
+  _vc="$(awk '/^do_part_2\(\)/,/^\}/' "$0" \
+        | awk '/verify_ocr_result/ { v=NR }
+               /mv\" -- \"\$orig_fp\"|c_trash\" -- \"\$orig_fp/ { if (!t) t=NR }
+               END { print (v>0 && (t==0 || v<t)) ? "ok" : "bad v=" v " t=" t }')"
+  if [ "$_vc" = "ok" ]; then
+    t_ok "verify: the check runs before the original is trashed"
+  else
+    t_bad "verify: the check runs before the original is trashed" \
+      "$_vc -- checking after the trash protects nothing"
+  fi
+}
+
+# Tagging overwrites a document that is in no other danger, so it has to be
+# provably lossless: same pages, still sound, still recognisable afterwards.
+rt_tag_in_place() {
+  if [ -z "$c_qpdf" ] || [ ! -x "$c_qpdf" ] || [ ! -x /usr/bin/python3 ]; then
+    t_ok "tag in place: skipped, no qpdf/python3 on this host"; return 0
+  fi
+  _td="$T_TMP/tag"; mkdir -p "$_td"
+  t_mkpdf "$_td/doc.pdf" 3 "SomeScanner" ""
+
+  if tag_as_ocred "$_td/doc.pdf"; then
+    _tp="$("$c_pdfinfo" "$_td/doc.pdf" 2>/dev/null | awk -F': *' '/^Producer:/{print $2; exit}')"
+    case "$_tp" in
+      *"$OCRAPP_PRODUCER_TAG"*) t_ok "tag: the ORIGINAL carries the Producer tag afterwards";;
+      *) t_bad "tag: the ORIGINAL carries the Producer tag afterwards" "Producer is '$_tp'";;
+    esac
+    _tn="$("$c_pdfinfo" "$_td/doc.pdf" 2>/dev/null | awk '/^Pages:/{print $2; exit}')"
+    if [ "$_tn" = "3" ]; then t_ok "tag: every page survives (3/3)"
+    else t_bad "tag: every page survives (3/3)" "got '$_tn'"; fi
+    "$c_qpdf" --check "$_td/doc.pdf" >/dev/null 2>&1
+    case "$?" in
+      0|3) t_ok "tag: the tagged file still passes qpdf --check";;
+      *)   t_bad "tag: the tagged file still passes qpdf --check" "it does not";;
+    esac
+    if case "$_tp" in *"$OCRAPP_PRODUCER_TAG"*) true ;; *) false ;; esac; then
+      t_ok "tag: a tagged document reads as already OCRed, so it is never re-OCRed"
+    else
+      t_bad "tag: a tagged document reads as already OCRed, so it is never re-OCRed" \
+            "'$_tp' would be OCRed again on every run"
+    fi
+  else
+    t_bad "tag: a PDF can be tagged in place" "$TAG_WHY"
+  fi
+
+  # both sites that ask "is this OCR output?" must ask it the SAME way
+  # shellcheck disable=SC2016  # matching literal source text: $ must not expand
+  if [ "$(grep -cF '*"$OCRAPP_PRODUCER_TAG"*' "$0")" -ge 2 ]; then
+    t_ok "tag: detection and verification both use the contains-match"
+  else
+    t_bad "tag: detection and verification both use the contains-match" \
+          "an exact match would re-OCR every tagged document"
+  fi
+}
+
+rt_status_and_setup() {
+  _pre_mutex=""; [ -d "$OCRAPP_MUTEX_DIR" ] && _pre_mutex=1
+  _o="$("$0" --status 2>&1)"
+  case "$_o" in
+    *"OCR       "*) t_ok "--status reports the OCR state";;
+    *) t_bad "--status reports the OCR state" "$(printf '%s' "$_o" | head -1)";;
+  esac
+  _post_mutex=""; [ -d "$OCRAPP_MUTEX_DIR" ] && _post_mutex=1
+  [ "$_pre_mutex" = "$_post_mutex" ] \
+    && t_ok "--status takes no lock" \
+    || t_bad "--status takes no lock" "the mutex directory changed"
+
+  # setup must refuse to wire a Folder Action to an OCR app that is absent
+  if awk '/^do_setup\(\)/,/^}/' "$0" | grep -q 'OCRAPP_PATH'; then
+    t_ok "setup checks the OCR application is installed"
+  else
+    t_bad "setup checks the OCR application is installed" \
+          "a missing app would only surface on the first real scan"
+  fi
+  if awk '/^do_setup\(\)/,/^}/' "$0" | grep -q 'ExportToPdf.action'; then
+    t_ok "setup checks the OCR Automator action is present"
+  else
+    t_bad "setup checks the OCR Automator action is present" "the workflow step cannot load without it"
+  fi
+  _o="$("$0" setup 2>&1)"
+  case "$_o" in
+    *"DRY RUN"*) t_ok "setup is dry-run unless told 'go'";;
+    *) t_bad "setup is dry-run unless told 'go'" "$(printf '%s' "$_o" | head -1)";;
+  esac
+
+  # As root every path is /Users/root/... and the Folder Action lands in a
+  # session no scan reaches -- and setup would CREATE those paths, so the
+  # wrong thing would look like the right one.
+  if awk '/^do_setup\(\)/,/^}/' "$0" | grep -q 'id -u.*= *"0"'; then
+    t_ok "setup refuses to run as root"
+  else
+    t_bad "setup refuses to run as root" "it would wire up /Users/root/..."
+  fi
+  if awk '/^do_trigger_ocr\(\)/,/^}/' "$0" | grep -q 'id -u.*= *"0"'; then
+    t_ok "trigger-OCR refuses to run as root"
+  else
+    t_bad "trigger-OCR refuses to run as root" "AUTOMATOR would never run"
+  fi
+}
+
+# --- --test-mail goes the STUCK alert's way, and a failure is not a pass.
+#     Runs a COPY of this file whose my_notify is a stub: no real mail, ever.
+rt_test_mail() {
+  _d="$T_TMP/testmail"; mkdir -p "$_d"; _a="$_d/notify.args"
+  cat >"$_d/my-notify.stub" <<'_EOSTUB_'
+#!/bin/dash
+_d="$(dirname "$0")"
+printf '%s\n' "$@" --- >>"$_d/notify.args"
+exit "$(cat "$_d/notify.rc" 2>/dev/null || echo 0)"
+_EOSTUB_
+  chmod +x "$_d/my-notify.stub"
+  sed -e "s|^  my_notify=.*|  my_notify=\"$_d/my-notify.stub\"|" "$0" >"$_d/my-ocr"
+  chmod +x "$_d/my-ocr"
+  if ! grep -q "^  my_notify=\"$_d/my-notify.stub\"" "$_d/my-ocr"; then
+    t_bad "test-mail: stub my-notify wired in" "my_notify line not found -- refusing to risk a real mail"
+    return 0
+  fi
+
+  # sent: ONE my-notify call, notification + mail; no file argument is touched
+  _o="$("$_d/my-ocr" --test-mail /nonexistent/not-a-file 2>&1 </dev/null)"; _r=$?
+  case "$_r|$_o" in
+    "0|"*"test mail sent to the my-notify default recipient [my-notify rc 0]"*)
+      t_ok "test-mail: sent, and says so [rc 0]";;
+    *) t_bad "test-mail: sent, and says so [rc 0]" "rc=$_r: $(printf '%s' "$_o" | tail -n 1)";;
+  esac
+  _calls="$(grep -c '^---$' "$_a" 2>/dev/null)"
+  _args="$(tr '\n' '|' <"$_a" 2>/dev/null)"
+  # the copy is named my-ocr, so that is the name in its subject
+  case "$_calls|$_args" in
+    "1|--|my-ocr test mail|"*"|--mail|my-ocr test mail|"*)
+      t_ok "test-mail: one my-notify call, the same '-- ... --mail ...' as STUCK";;
+    *) t_bad "test-mail: one my-notify call, the same '-- ... --mail ...' as STUCK" "calls=$_calls args=$_args";;
+  esac
+  if grep -q '^Host:  ' "$_a" && grep -q '^User:  ' "$_a" && grep -q '^Time:  ' "$_a" \
+     && grep -q '^Config:  ' "$_a"; then
+    t_ok "test-mail: the body names host, user, time and the config"
+  else
+    t_bad "test-mail: the body names host, user, time and the config" "$_args"
+  fi
+
+  # my-notify fails: non-zero, and its rc is shown
+  rm -f "$_a"; echo 3 >"$_d/notify.rc"
+  _o="$("$_d/my-ocr" --test-mail 2>&1 </dev/null)"; _r=$?
+  rm -f "$_d/notify.rc"
+  case "$_r|$_o" in
+    0\|*) t_bad "test-mail: a failing my-notify fails the test, with its rc" "rc=0";;
+    *"ERROR 155"*"[my-notify rc 3]"*) t_ok "test-mail: a failing my-notify fails the test, with its rc";;
+    *) t_bad "test-mail: a failing my-notify fails the test, with its rc" "$(printf '%s' "$_o" | tail -n 1)";;
+  esac
+
+  # no my-notify at all: a failure, not a silent pass
+  sed -e "s|^  my_notify=.*|  my_notify=\"$_d/absent\"|" "$0" >"$_d/my-ocr.nonotify"
+  _o="$(dash "$_d/my-ocr.nonotify" --test-mail 2>&1 </dev/null)"; _r=$?
+  case "$_r|$_o" in
+    0\|*) t_bad "test-mail: a missing my-notify fails" "rc=0";;
+    *"ERROR 154"*) t_ok "test-mail: a missing my-notify fails (err 154)";;
+    *) t_bad "test-mail: a missing my-notify fails" "$(printf '%s' "$_o" | tail -n 1)";;
+  esac
+}
+
+# A REFUSAL is not a FAILURE. One refused page used to report the whole run as
+# broken: the queue entry it leaves on purpose tripped err 053 -> the errored
+# flagfile -> err 066 -> exit 1 -> my-scan's err 069; and the summary called a
+# page with nothing to OCR "1/1 files *FAILED* to be OCRed".
+rt_refusal_reporting() {
+  _rv="$(awk '/^do_part_2\(\)/,/^\}/' "$0")"
+
+  if printf '%s' "$_rv" | grep -q 'REFUSED_FILES_LOG'; then
+    t_ok "refusal: it is recorded, so the summary can tell refused from failed"
+  else
+    t_bad "refusal: it is recorded, so the summary can tell refused from failed" \
+          "nothing distinguishes the two"
+  fi
+
+  if printf '%s' "$_rv" | grep -q '_refused_cnt'; then
+    t_ok "refusal: err 053 tolerates the queue entry a refusal leaves behind"
+  else
+    t_bad "refusal: err 053 tolerates the queue entry a refusal leaves behind" \
+          "one refused page reports the whole run as broken"
+  fi
+
+  if grep -q 'REFUSED -- the OCR ran' "$0"; then
+    t_ok "summary: a refusal is reported as REFUSED, with its reason"
+  else
+    t_bad "summary: a refusal is reported as REFUSED, with its reason" "still only *FAILED*"
+  fi
+
+  # shellcheck disable=SC2016  # matching literal source text: $ must not expand
+  if grep -q 'if \[ "\$failed_cnt" -gt 0 \]; then' "$0"; then
+    t_ok "summary: '*FAILED* to be OCRed' is printed only when something failed"
+  else
+    t_bad "summary: '*FAILED* to be OCRed' is printed only when something failed" \
+          "a refused-only run still claims files FAILED"
+  fi
+
+  # the result was trashed, so pointing at the out-path sends you to an empty
+  # directory -- the message must say where the DOCUMENT is
+  if printf '%s' "$_rv" | grep -q 'Look at them in'; then
+    t_bad "refusal: the user is not sent to an empty out-path" "it still says 'Look at them in'"
+  else
+    t_ok "refusal: the user is not sent to an empty out-path"
+  fi
+
+  # the tagging branch skips the normal path's last_file assignment, so it must
+  # make its own -- this raised err 035 on a run that had just succeeded
+  if printf '%s' "$_rv" | awk '/VERIFY_NOTEXT/,/^      fi/' | grep -q 'last_file='; then
+    t_ok "no text: the tagging branch sets last_file (no spurious err 035)"
+  else
+    t_bad "no text: the tagging branch sets last_file (no spurious err 035)" \
+          "part-2 will end with no last_file and error on a successful run"
+  fi
+  if printf '%s' "$_rv" | grep -q 'VERIFY_NOTEXT'; then
+    t_ok "no text: filed as its own outcome, not sent down the refusal path"
+  else
+    t_bad "no text: filed as its own outcome, not sent down the refusal path" "not wired in"
+  fi
+  if grep -q 'NO TEXT to find' "$0"; then
+    t_ok "summary: 'no text' is reported on its own line, inside the OCRed total"
+  else
+    t_bad "summary: 'no text' is reported on its own line, inside the OCRed total" "not reported"
+  fi
+
+  # the refusal list belongs to ONE round, or yesterday's refusals are counted
+  # shellcheck disable=SC2016  # matching literal source text: $ must not expand
+  if printf '%s' "$_rv" | grep -q ': >"\$REFUSED_FILES_LOG"'; then
+    t_ok "refusal: the list is emptied at the start of each round"
+  else
+    t_bad "refusal: the list is emptied at the start of each round" \
+          "a stale list would mask a real failure as a refusal"
+  fi
+}
+
+# A finished OCR whose move failed is NOT a failure. Quarantining it filed
+# five good documents under FAILED and stranded their results (2026-09-18).
+rt_stranded_not_failed() {
+  _cl="$(awk '/Every file that completed had its line deleted/,/quarantined in/' "$0")"
+  if printf '%s' "$_cl" | grep -q 'out_fp'; then
+    t_ok "quarantine: the out-path is consulted before calling a document failed"
+  else
+    t_bad "quarantine: the out-path is consulted before calling a document failed" \
+          "a finished document with an unfiled result is still quarantined"
+  fi
+  if printf '%s' "$_cl" | grep -q 'NOT a failure'; then
+    t_ok "quarantine: a stranded result is reported as such, not as a failure"
+  else
+    t_bad "quarantine: a stranded result is reported as such, not as a failure" "not wired in"
+  fi
+  # ...and the loop must read the WHOLE record, not just column 1
+  # shellcheck disable=SC2016  # matching literal source text: $ must not expand
+  if printf '%s' "$_cl" | grep -q 'cut -f1 "\$QUEUED_FILE_MOVES_LOG"'; then
+    t_bad "quarantine: the loop reads every field of the queue record" \
+          "still 'cut -f1' -- the out-path is not even read"
+  else
+    t_ok "quarantine: the loop reads every field of the queue record"
+  fi
+}
+
+# A test defined but left out of the run list never runs -- silently.
+rt_run_list_is_complete() {
+  _g_def=$(grep -c '^rt_[a-z0-9_]*() *{' "$0")
+  if [ "$_g_def" = "$_rt_n" ]; then t_ok "every test function is in the run list"
+  else t_bad "every test function is in the run list ($_g_def defined, $_rt_n listed)"; fi
+}
+
+do_run_tests() {
+  T_TMP="$(mktemp -d /tmp/my-ocr.tests.XXXXXX)" || { echo "mktemp failed"; return 1; }
+  # A part-1/part-2 started by a test writes its error into the error flag a
+  # LIVE run watches -- where it aborts that run (err 066). Tests that start a
+  # part run it with this config, which moves the flag and the staging folder
+  # into the suite's own directory.
+  printf 'PARTx_ERRORED_FLAGFILE="%s"\nTMP_PRE_INP_PATH="%s"\n' \
+    "$T_TMP/partx-errored.flag" "$T_TMP/pre-staging" >"$T_TMP/sandbox.conf"
+  # the tests, in order: one literal call each, in ONE list -- run twice:
+  # first _rt only counts (and returns 1, so no test runs), then it reports.
+  # TAP-style: "1..N" first, then "ok K - name" / "not ok K - name"
+  _rt_tests() {
+    _rt shebang && rt_shebang
+    _rt err_codes_unique && rt_err_codes_unique
+    _rt dash_syntax && rt_dash_syntax
+    _rt file_option && rt_file_option
+    _rt cleanup_pattern_interpreter_agnostic && rt_cleanup_pattern_interpreter_agnostic
+    _rt help_claims && rt_help_claims
+    _rt no_ocr_marker && rt_no_ocr_marker
+    _rt reveal_policy && rt_reveal_policy
+    _rt move_failed_to && rt_move_failed_to
+    _rt parts_sandboxed && rt_parts_sandboxed
+    _rt stall_retry && rt_stall_retry
+    _rt status_health && rt_status_health
+    _rt automator_3pp && rt_automator_3pp
+    _rt wait_is_evidence_based && rt_wait_is_evidence_based
+    _rt mutex && rt_mutex
+    _rt concurrency_state && rt_concurrency_state
+    _rt verify_result && rt_verify_result
+    _rt refusal_reporting && rt_refusal_reporting
+    _rt tag_in_place && rt_tag_in_place
+    _rt stranded_not_failed && rt_stranded_not_failed
+    _rt status_and_setup && rt_status_and_setup
+    _rt test_mail && rt_test_mail
+    _rt window_restore && rt_window_restore
+    _rt stale_batch && rt_stale_batch
+    _rt ocrapp_quit && rt_ocrapp_quit
+    _rt counts_reconcile && rt_counts_reconcile
+    _rt stall_recovery && rt_stall_recovery
+    _rt bundle_pids && rt_bundle_pids
+    _rt reset_log_last && rt_reset_log_last
+    _rt reset_stable && rt_reset_stable
+    _rt preflight_repair && rt_preflight_repair
+    _rt errflag_cleanup && rt_errflag_cleanup
+    _rt version_clone && rt_version_clone
+    _rt trap_term && rt_trap_term
+    _rt fa_restart && rt_fa_restart
+    _rt workflow_export && rt_workflow_export
+    _rt config_file && rt_config_file
+    _rt split_pref && rt_split_pref
+    _rt trash_by_mv && rt_trash_by_mv
+    _rt open_cmd && rt_open_cmd
+    _rt nudge && rt_nudge
+    _rt staging_sweep && rt_staging_sweep
+    _rt stranded_verdict && rt_stranded_verdict
+    _rt run_list_is_complete && rt_run_list_is_complete
+  }
+  _rt_n=0
+  _rt() { _rt_n=$((_rt_n + 1)); return 1; }
+  _rt_tests
+  echo "1..$_rt_n"
+  echo "# $US --run-tests   ($(head -n 1 "$0"))"
+  _rt_k=0; _rt_prev=""; _rt_bad=0
+  _rt() {   # closes the test before it, opens the next
+    if [ -n "$_rt_prev" ]; then
+      _rt_k=$((_rt_k + 1))
+      if [ "$T_FAIL" = "$_rt_bad" ]; then echo "ok $_rt_k - $_rt_prev"; else echo "not ok $_rt_k - $_rt_prev"; fi
+    fi
+    _rt_prev=$1; _rt_bad=$T_FAIL
+  }
+  _rt_tests
+  _rt ""
+  rm -rf "$T_TMP"
+  echo "  ----"
+  printf '  %d passed, %d failed\n' "$T_PASS" "$T_FAIL"
+  [ "$T_FAIL" -eq 0 ]
+}
+
+#######################################################
+
+# ---- config: --create-config acts and exits; otherwise find one and source it
+CONFIG_FILE=""; _cf_create=""; _cf_to=""; _cf_prev=""
+for arg in "$@"; do
+  case "$_cf_prev" in
+    --config) CONFIG_FILE="$arg" ;;
+    --create-config) case "$arg" in -*) ;; *) _cf_to="$arg" ;; esac ;;
+  esac
+  case "$arg" in
+    --config=*)        CONFIG_FILE="${arg#--config=}" ;;
+    --create-config)   _cf_create=1 ;;
+    --create-config=*) _cf_create=1; _cf_to="${arg#--create-config=}" ;;
+  esac
+  _cf_prev="$arg"
+done
+[ "$_cf_prev" = "--config" ] && err 162 "--config needs a <FILE>"
+if [ -n "$_cf_create" ]; then
+  [ -z "$_cf_to" ] && { default_config_content; exit 0; }
+  [ -e "$_cf_to" ] && err 163 "'$_cf_to' exists -- refusing to overwrite it. Compare instead:  $US --create-config | diff - '$_cf_to'"
+  default_config_content >"$_cf_to" || err 164 "could not write '$_cf_to'"
+  echo " >>> wrote the default config to '$_cf_to'"
+  exit 0
+fi
+[ -n "$MY_OCR_CONFIG" ] && CONFIG_FILE="$MY_OCR_CONFIG"
+if [ -n "$CONFIG_FILE" ]; then
+  [ -r "$CONFIG_FILE" ] || err 165 "config '$CONFIG_FILE' is not a readable file"
+else
+  while IFS= read -r _cf_p; do
+    [ -f "$_cf_p" ] && [ -r "$_cf_p" ] && { CONFIG_FILE="$_cf_p"; break; }
+  done <<_EOCF_
+$(config_search_paths)
+_EOCF_
+fi
+# shellcheck disable=SC1090  # the path is only known at run time
+[ -n "$CONFIG_FILE" ] && { . "$CONFIG_FILE" || err 166 "sourcing config '$CONFIG_FILE' failed"; }
+
+[ $# -eq 0 -a -t 0 ] && usage
+
+WHAT=;
+CLI_LOG=""
+for arg in "$@"; do
+  #echo "$$|DBG: PRELIMINARY-PARM-LOOP: arg='$arg'"
+  case "$arg" in
+    -D|--debug)  VRB=1; DBG=1;;
+    -V|--verbose)  VRB=1;;
+    -F|--force)  FORCE_OCR=1;;
+    --move-failed-to) ;; # value consumed in the main loop
+    -h|--help)  usage;;
+    --run-tests) RUN_TESTS=1;;
+    --test-mail) DO_TEST_MAIL=1;;
+    # 'status' as a bare word too: 'setup' is one, my-scan spells it that way,
+    # and without it a bare 'status' is taken for a FILENAME TO OCR.
+    --status|-S|status) DO_STATUS=1;;
+    setup|install) DO_SETUP=1;;
+    uninstall) DO_UNINSTALL=1;;
+    reset) DO_RESET=1;;
+    --version) DO_VERSION=1;;
+    stamp-version) DO_STAMP=1;;
+    --no-log) CLI_LOG=0;;
+    --log) CLI_LOG=1;;
+    --part-1) [ -n "$WHAT" ] && err 009 "Only one parameter possible. Got: '$WHAT' and '$arg'."; WHAT="part-1";;
+    --part-2) [ -n "$WHAT" ] && err 084 "Only one parameter possible. Got: '$WHAT' and '$arg'."; WHAT="part-2";;
+  esac
+done
+
+[ -n "$RUN_TESTS" ] && { do_run_tests; exit $?; }
+# --test-mail sends one alert and touches no state, takes no lock, OCRs nothing
+[ -n "$DO_TEST_MAIL" ] && { do_test_mail; exit $?; }
+
+# --status and setup are read-mostly and must never take the OCR lock, so they
+# run before anything else and exit.
+if [ -n "$DO_STATUS" ]; then do_status ""; exit 0; fi
+if [ -n "$DO_SETUP" ]; then
+  _sg=""; for _a in "$@"; do [ "$_a" = "go" ] && _sg="go"; done
+  do_setup "$_sg"; exit $?
+fi
+# --version and stamp-version touch no state and take no lock
+[ -n "$DO_VERSION" ] && { do_version; exit 0; }
+[ -n "$DO_STAMP" ]   && { do_stamp_version; exit $?; }
+if [ -n "$DO_RESET" ]; then
+  _rg=""; for _a in "$@"; do [ "$_a" = "go" ] && _rg="go"; done
+  do_reset "$_rg"; exit $?
+fi
+if [ -n "$DO_UNINSTALL" ]; then
+  _sg=""; for _a in "$@"; do [ "$_a" = "go" ] && _sg="go"; done
+  do_uninstall "$_sg"; exit $?
+fi
+
+[ -z "$WHAT" ] && WHAT="trigger-OCR" # == default action
+[ -e "$DBG_FLAGFILE" ] && VRB=1 && DBG=1;
+[ -e "$FORCE_FLAGFILE" ] && FORCE_OCR=1;
+[ ! -t 0 ] && t=yes || t=no; [ $DBG ] && echo "$$|DBG: WHAT='$WHAT', STDIN ? = '$t'."
+
+schedule_for_cleanup "$PROVIDED_FILES_FILELIST"
+touch "$PROVIDED_FILES_FILELIST" || err 005 "Failed '$PROVIDED_FILES_FILELIST' (PROVIDED_FILES_FILELIST: touch, chmod :my-system, chown g-w,o-rwx)"
+
+mode="all";
+PROVIDED_FILES_CNT=0;
+while [ $# -gt 0 ]; do
+  arg="$1"; shift
+  #echo "$$|DBG: MAIN-PARM-LOOP: mode='$mode' arg='$arg'"
+  case "$mode" in
+    "all")
+      case "$arg" in
+        -D|--debug)  continue;; # ignore here
+        -V|--verbose)  continue;; # ignore here
+        -F|--force) continue;; # ignore here
+        --move-failed-to) [ -z "$1" ] && err 133 "Argument '$arg' needs a <DIR>"
+                          MOVE_FAILED_TO="$1"; shift;;
+        -h|--help) continue;; # ignore here
+        --log|--no-log) continue;; # ignore here
+        --config) shift; continue;; # value consumed at start-up, never a file to OCR
+        --config=*) continue;;
+        --part-1) continue;; # ignore here
+        --part-2) continue;; # ignore here
+        -f|--file)  [ -z "$1" ] && err 093 "Argument '$arg' needs parameter";
+                    [ -s "$1" ] || err 094 "Parameter to '$arg' '$1' needs to be file with size >0 ($(ls -la "$1"))"
+                    FILELIST_PARAM="$1"; shift;
+                    FILELIST_CNT=$( wc -l < "$FILELIST_PARAM" | tr -d ' ' )
+                    [ $FILELIST_CNT -le 0 ] && err 095 "FILELIST_CNT='$FILELIST_CNT'";;
+        --) mode="only-files";; 
+        *) [ -e "$arg" ] || err 081 "Provided argument '$arg', should be a file, but it does not seem to be one. Please fix."
+           PROVIDED_FILES_CNT=$(( $PROVIDED_FILES_CNT + 1 ));
+           [ $DBG ] && echo "$$|DBG: MAIN-PARAM-LOOP: [all-params-mode] Appending arg #$PROVIDED_FILES_CNT '$arg' to PROVIDED_FILES_FILELIST '$PROVIDED_FILES_FILELIST'"
+           echo "$arg" >> "$PROVIDED_FILES_FILELIST";;
+      esac;;
+
+    "only-files")
+      [ -e "$arg" ] || err 082 "Provided argument '$arg', should be a file, but it does not seem to be one. Please fix."
+      PROVIDED_FILES_CNT=$(( $PROVIDED_FILES_CNT + 1 ));
+      [ $DBG ] && echo "$$|DBG: MAIN-PARAM-LOOP: [only-files-mode] Appending arg #$PROVIDED_FILES_CNT '$arg' to PROVIDED_FILES_FILELIST '$PROVIDED_FILES_FILELIST'"
+      echo "$arg" >> "$PROVIDED_FILES_FILELIST";;
+
+  esac
+done
+
+# --move-failed-to is parsed in the loop above, so it can only be checked
+# here -- but still BEFORE any work, never during cleanup.
+[ -n "$MOVE_FAILED_TO" ] && [ ! -d "$MOVE_FAILED_TO" ] && \
+  err 131 "MOVE_FAILED_TO '$MOVE_FAILED_TO' is not a directory.
+Create it, or leave it empty to keep failed files where they are."
+
+# Determine LOG:
+case "$WHAT" in
+  part-1|part-2) [ "$CLI_LOG" = "0" ] && LOG="";;  # only if --no-log,  LOG is OFF  (ON  by default)
+  trigger-OCR)   [ "$CLI_LOG" != "1" ] && LOG="";; # only if NOT --log, LOG is ON   (OFF by default)
+esac
+[ $DBG ] && echo "$$|DBG: CLI_LOG='$CLI_LOG', LOG='$LOG'."
+
+case "$WHAT" in
+  part-1|part-2) [ -z "$LOG" ] && err 003 "do_part_1() currently only works (with stdout output) if Logging is ENABLED!";;
+esac
+
+[ $DBG ] && { t="$DBG_GOTTEN_FILES_FILELIST$WHAT"; if [ -s "$t" ]; then printf "">"$t" || err 101 "FAILED [$?] to empty file '$t' (USER='$WHOAMI')"; fi; }
+
+#[ -d "$TMP_PRE_INP_PATH" ] && err 170 "TMP_PATH '$TMP_PRE_INP_PATH' (TMP_PRE_INP_PATH) already exists. Should not be." # why not.. ? ;)
+mkdir -p "$TMP_PRE_INP_PATH" || err 169 "FAILED [$?] creating TMP_PRE_INP_PATH '$TMP_PRE_INP_PATH' (mkdir -p). Should not be."
+TMP_PRE_INP_PATH_REALPATH=$("$c_realpath" "$TMP_PRE_INP_PATH") || err 109
+COLLECT_INP_PATH="${TMP_PRE_INP_PATH_REALPATH##*/}"
+[ -z "$COLLECT_INP_PATH" ] && err 110 "TMP_PRE_INP_PATH='$TMP_PRE_INP_PATH' --> realpath=='$TMP_PRE_INP_PATH_REALPATH', last_part_of_realpath='$lCOLLECT_INP_PATH'. Should not be."
+
+# set up the trap for a clean exit:
+# 15 (TERM) is the one that matters most and was missing: it is what kill,
+# pkill and launchd send, and every TERMed run died WITHOUT cleanup -- leaving
+# its mutex, its run files and an orphaned 'tail -f' behind (seven of them on
+# ada, the oldest over a day old). 9 (KILL) is not listed: it cannot be trapped,
+# and listing it claimed a cleanup that could never happen.
+for i in 0 1 2 3 4 5 6 7 8 15; do trap "cleanup \"TRAP\" $i;" $i; done;
+
+if [ -n "$LOG" ]; then
+  touch "$LOG" || err 043 "Failed '$LOG' (LOG: touch, chmod :my-system, chown g-w,o-rwx)"
+
+  # reset AUTOMATOR_LOG when called with 'part-1'
+  if [ -s "$AUTOMATOR_LOG" -a "$WHAT" = "part-1" ]; then # -s instead of -e to allow creation of empty AUTOMATOR_LOG in do_trigger_ocr() !
+    mv "$AUTOMATOR_LOG" "${AUTOMATOR_LOG}.bkp" || err 052 "Failed creating backup of last AUTOMATOR_LOG '$AUTOMATOR_LOG'"
+    touch "$AUTOMATOR_LOG" || err 050 "Failed '$AUTOMATOR_LOG' (LOG: touch, chmod :my-system, chown g-w,o-rwx)"
+  fi
+
+  # redirect_stdout_stderr():
+  case "$WHAT" in
+    part-1|part-2)   if [ -e "$STDOUT_FIFO" ]; then rm -f "$STDOUT_FIFO" || err 054 "Failed removing '$STDOUT_FIFO'"; fi
+                     mkfifo "$STDOUT_FIFO" || err 055 "Failed [$?] creating STDOUT_FIFO: mkfifo '$STDOUT_FIFO' ?!";
+                     tee -a "$LOG" -a "$AUTOMATOR_LOG" <"$STDOUT_FIFO" &
+                     schedule_for_cleanup "$!" "$STDOUT_FIFO"
+                     exec 3<&1 && exec 1>"$STDOUT_FIFO" && exec 2>&1 || err 046;;
+    trigger-OCR)     exec 3<&1 && exec 1>>"$LOG" && exec 2>&1 || err 057;;
+                     # save stdout to descriptor #3 && redirect stdout > LOG && redirect stderr > stdout
+                     # but keep stdin open! :)
+  esac
+fi
+
+
+[ "$WHAT" = "part-1" ] && echo "$$|______________________________________" >>"$LOG" # <<< only to '$LOG' :))
+[ -n "$VRB$DBG" -o "$WHAT" = "trigger-OCR" ] && echo "$$|$( date +"%Y-%m-%d_%H%M.%S") [$WHAT]"
+
+[ -e "$DBG_FLAGFILE" ] && printf "$$| Forced debug output (DBG=1) as DBG_FLAGFILE '$DBG_FLAGFILE' was found!\n$$|\n"
+
+case "$WHAT" in
+  part-1) do_part_1;;
+  part-2) do_part_2;;
+  trigger-OCR) do_trigger_ocr;;
+  *) err 018 "Invalid part '$WHAT'. Please see --help.";;
+esac
+
+[ -n "$VRB$DBG" -o "$WHAT" = "trigger-OCR" ] && echo "$$|$(date +"%Y-%m-%d_%H%M.%S") DONE [$WHAT]"
+
+[ "$WHAT" = "part-1" ] && printf "$$|\n$$|     $OCRAPP_NAME ...\n"
+
+#[ -n "$RES_CAT_FILE" -a -n "$DBG" ] && echo "$$|DBG: cat '$RES_CAT_FILE' (to restored stdout)"
+
+# restore stdout from descriptor #3 and close fd #3
+if [ -n "$LOG" ]; then exec 1<&3 && exec 3<&- || err 039; fi
+
+#if [ -n "$RES_CAT_FILE" ]; then cat "$RES_CAT_FILE" || err 089; fi
+
+exit 0
