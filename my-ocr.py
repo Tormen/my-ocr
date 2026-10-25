@@ -530,6 +530,21 @@ def tag_producer(tools: Dict[str, str], path: Path, producer: str) -> str:
 # 2026-10-24).
 # The group must be NAMED: without one, DEVONthink opens a group SELECTOR
 # dialog and waits for a click nobody makes.
+# A DEVONthink that the call itself starts answers before its databases are
+# open: "Can't get inbox." (-1728, horse 2026-10-25, the first call after
+# launch). So every script that reaches the Inbox first waits for it -- up to
+# 60 s, after which the Inbox call fails and says so.
+_AS_WAIT_INBOX: Final = '''\
+        repeat 60 times
+          try
+            get inbox
+            exit repeat
+          on error number -1728
+            delay 1
+          end try
+        end repeat
+'''
+
 _AS_OCR: Final = '''\
 -- my-ocr:ocr
 on run argv
@@ -540,7 +555,7 @@ on run argv
   try
     with timeout of secs seconds
       tell application id "DNtp"
-        set g to create location "''' + DT_GROUP + '''" in inbox
+''' + _AS_WAIT_INBOX + '''        set g to create location "''' + DT_GROUP + '''" in inbox
         set r to ocr file inPath to g waiting for reply true
         if r is missing value then return "ERR" & sep & "0" & sep & "DEVONthink's OCR returned no document"
         set u to uuid of r
@@ -569,7 +584,7 @@ on run argv
   try
     with timeout of 120 seconds
       tell application id "DNtp"
-        if not (exists record at "''' + DT_GROUP + '''" in inbox) then return "OK" & sep & "0"
+''' + _AS_WAIT_INBOX + '''        if not (exists record at "''' + DT_GROUP + '''" in inbox) then return "OK" & sep & "0"
         set g to get record at "''' + DT_GROUP + '''" in inbox
         set n to count of children of g
         repeat with c in (children of g)
@@ -2086,6 +2101,17 @@ def t_applescript_words(t: T) -> None:
                 f"{name}: the separator is made before the tell block")
 
 
+def t_waits_for_inbox(t: T) -> None:
+    """Started by the call itself, DEVONthink answers before its Inbox is open
+    and the run stopped on "Can't get inbox." (horse, 2026-10-25). The stub
+    engine cannot see that -- this test can: each script waits before its
+    first word about the Inbox."""
+    for name in ("_AS_OCR", "_AS_SWEEP"):
+        script: str = globals()[name]
+        body = script.split('tell application id "DNtp"', 1)[1]
+        t.check(body.lstrip("\n").startswith(_AS_WAIT_INBOX), f"{name} waits for the Inbox first")
+
+
 def t_err_codes_unique(t: T) -> None:
     src = Path(os.path.realpath(__file__)).read_text(encoding="utf-8")
     codes = re.findall(r'(?:err|StopRun)\("(\d{5})"', src) + re.findall(r'ERROR (\d{5}) \[', src)
@@ -2099,7 +2125,8 @@ TESTS: Final[List[Callable[[T], None]]] = [
     t_no_text_keeps_original, t_engine_error_is_one_document, t_engine_unreachable_stops_untouched,
     t_timeout_retry_resolves, t_timeout_twice_stops, t_original_never_absent, t_skips, t_stdin_only_when_no_names,
     t_mutex, t_status, t_reset_two_phase, t_config_read_never_run, t_create_config, t_output_layers, t_ctrl_c,
-    t_bug_trace, t_test_mail, t_version, t_help_claims, t_python39_grammar, t_applescript_words, t_err_codes_unique,
+    t_bug_trace, t_test_mail, t_version, t_help_claims, t_python39_grammar, t_applescript_words, t_waits_for_inbox,
+    t_err_codes_unique,
 ]
 
 
