@@ -133,7 +133,9 @@ from v1.1 is its own name in the workflow it writes.
 
 ## Requirements
 
-- macOS with DEVONthink Pro 4 and its ABBYY FineReader OCR add-on. The first
+- macOS with DEVONthink Pro 4 and its ABBYY FineReader OCR add-on (DEVONthink >
+  Install Add-ons, per user). Without the add-on my-ocr refuses to start and
+  touches nothing; `my-ocr status` shows it on its ADD-ON line. The first
   run asks for the macOS Automation consent to control DEVONthink -- answer it
   once at the Mac, or allow it in System Settings > Privacy & Security >
   Automation.

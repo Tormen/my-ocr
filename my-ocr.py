@@ -70,6 +70,11 @@ class Outside:
     each one at a stand-in."""
 
     dt_app: Path = Path("/Applications/DEVONthink.app")
+    # DEVONthink's ABBYY OCR add-on, installed per user by DEVONthink > Install
+    # Add-ons. Without it DEVONthink logs "Unable to OCR document" and its
+    # `ocr file` never answers (horse, 2026-10-25: 2 x 600 s, then the scan
+    # was filed as FAILED for what was the engine's fault).
+    dt_ocr_helper: Path = Path.home() / "Library/Application Support/DEVONthink/Abbyy/DTOCRHelper.app"
     osascript: str = "/usr/bin/osascript"
     # osascript gets OCR_TIMEOUT plus this before it is killed: AppleScript's own
     # 'with timeout' fires first and says so; the kill is for a DEVONthink that
@@ -687,7 +692,6 @@ def dt_settings() -> Dict[str, str]:
 
     langs = prefs.get("OCRPlugin.OCRLanguages")
     return {
-        "add-on": "installed" if prefs.get("InstallAddOns-ABBYY FineReader OCR") else "not recorded",
         "languages": ",".join(str(x) for x in cast(List[object], langs)) if isinstance(langs, list) else "?",
         "deskew": box("OCRPlugin.AutoCorrectSkew"),
         "orientation": box("OCRPlugin.AutoRotate"),
@@ -1143,10 +1147,13 @@ def cmd_ocr(s: Settings, c: Cli) -> int:
     names = gather(c)
     if not EXT.dt_app.is_dir():
         err("00020", f"DEVONthink is not installed at {EXT.dt_app} -- my-ocr OCRs with it (brew install --cask devonthink)")
+    if not EXT.dt_ocr_helper.is_dir():
+        err("00021", f"DEVONthink's ABBYY OCR add-on is missing ({EXT.dt_ocr_helper}) -- install it in DEVONthink > "
+                     "Install Add-ons; nothing was touched")
     try:
         s.state_dir.mkdir(parents=True, exist_ok=True)
     except OSError as e:
-        err("00021", f"cannot create STATE_DIR {s.state_dir}: {e.strerror}")
+        err("00022", f"cannot create STATE_DIR {s.state_dir}: {e.strerror}")
     mutex = take_mutex(s)
     work = s.state_dir / "work" / str(os.getpid())
     t = Tally()
@@ -1171,7 +1178,7 @@ def cmd_ocr(s: Settings, c: Cli) -> int:
             phase("clearing DEVONthink's my-ocr group")
             a = osa(_AS_SWEEP, [], 120)
             if not a.ok:
-                stop = StopRun("00022", engine_problem(a) or f"DEVONthink did not answer [{a.number}: {a.text}]")
+                stop = StopRun("00023", engine_problem(a) or f"DEVONthink did not answer [{a.number}: {a.text}]")
             elif a.fields[:1] != ("0",):
                 OUT.msg(f"    > removed {a.fields[0]} leftover record(s) from DEVONthink's {DT_GROUP} group")
         for k, it in enumerate(items, 1):
@@ -1222,8 +1229,10 @@ def cmd_status(s: Settings) -> int:
         pids = dt_running()
         OUT.result(f"ENGINE    DEVONthink installed, {'running [pid ' + pids + ']' if pids else 'not running'}   [{EXT.dt_app}]")
         st = dt_settings()
-        OUT.result(f"SETTINGS  languages {st['languages']}, deskew {st['deskew']}, page orientation {st['orientation']}, "
-                   f"OCR add-on {st['add-on']}   [{DT_DEFAULTS}]")
+        OUT.result(f"SETTINGS  languages {st['languages']}, deskew {st['deskew']}, page orientation {st['orientation']}"
+                   f"   [{DT_DEFAULTS}]")
+        OUT.result(f"ADD-ON    ABBYY OCR installed   [{EXT.dt_ocr_helper}]" if EXT.dt_ocr_helper.is_dir() else
+                   f"ADD-ON    ABBYY OCR MISSING -- OCR cannot run (DEVONthink > Install Add-ons)   [{EXT.dt_ocr_helper}]")
     else:
         OUT.result(f"ENGINE    DEVONthink NOT INSTALLED at {EXT.dt_app} -- OCR cannot run (brew install --cask devonthink)")
     # what my-ocr takes, as `file --brief` names it -- my-scan reads this line
@@ -1308,7 +1317,7 @@ def cmd_test_mail(s: Settings) -> int:
             f"Config:  {s.files[0] if s.files else 'none (built-in defaults)'}\nVersion: {version_line()}")
     rc = send_alert(f"{SCRIPT_NAME} test mail", "test alert -- a test mail went out too", body)
     if rc != 0:
-        err("00023", f"test mail NOT sent to the my-notify default recipient [my-notify rc {rc}]")
+        err("00024", f"test mail NOT sent to the my-notify default recipient [my-notify rc {rc}]")
     OUT.result(f" >>> test mail sent to the my-notify default recipient [my-notify rc {rc}]")
     return 0
 
@@ -1322,7 +1331,7 @@ def create_config(target: Optional[str]) -> int:
         with p.open("x", encoding="utf-8") as f:
             f.write(DEFAULT_CONFIG)
     except FileExistsError:
-        err("00024", f"{p} exists -- never written over (compare: {SCRIPT_NAME} --create-config | diff - {p})")
+        err("00025", f"{p} exists -- never written over (compare: {SCRIPT_NAME} --create-config | diff - {p})")
     OUT.result(f" >>> wrote the default config to {p}")
     return 0
 
@@ -1434,7 +1443,7 @@ def parse_cli(argv: Sequence[str]) -> Cli:
             elif not rest and c.command == "reset" and a == "go":
                 c.go = True
             elif not rest and not c.files and a in GONE_VERBS and not os.path.lexists(a):
-                err("00025", f"'{a}' {GONE_VERBS[a]}")
+                err("00026", f"'{a}' {GONE_VERBS[a]}")
             else:
                 c.files.append(a)
                 c.files_given = True
@@ -1462,10 +1471,10 @@ def parse_cli(argv: Sequence[str]) -> Cli:
         elif key in ("-f", "--file", "--move-failed-to", "--config"):
             v = val if eq else next(it, None)
             if not v:
-                err("00026", f"{key} needs a value ({SCRIPT_NAME} --help)")
+                err("00027", f"{key} needs a value ({SCRIPT_NAME} --help)")
             if key == "--move-failed-to":
                 if not Path(v).is_dir():
-                    err("00027", f"--move-failed-to '{v}' is not a folder -- create it, or leave it out to keep "
+                    err("00028", f"--move-failed-to '{v}' is not a folder -- create it, or leave it out to keep "
                                  f"failed documents where they are")
                 c.move_failed_to = v
             elif key == "--config":
@@ -1477,9 +1486,9 @@ def parse_cli(argv: Sequence[str]) -> Cli:
         else:
             verb = a.lstrip("-")
             hint = f" -- you mean `{SCRIPT_NAME} {verb}`" if verb in ("reset",) else f" ({SCRIPT_NAME} --help)"
-            err("00028", f"no such option '{a}'{hint}")
+            err("00029", f"no such option '{a}'{hint}")
     if c.command in ("status", "reset") and c.files:
-        err("00029", f"'{c.command}' takes no files: {' '.join(c.files)[:60]}")
+        err("00030", f"'{c.command}' takes no files: {' '.join(c.files)[:60]}")
     return c
 
 
@@ -1492,7 +1501,7 @@ def setup_output(s: Settings, c: Cli, argv: Sequence[str]) -> None:
             s.logfile.parent.mkdir(parents=True, exist_ok=True)
             OUT.log = s.logfile.open("a", encoding="utf-8")
         except OSError as e:
-            err("00030", f"cannot write the LOGFILE {s.logfile}: {e.strerror} (-L runs without one)")
+            err("00031", f"cannot write the LOGFILE {s.logfile}: {e.strerror} (-L runs without one)")
         OUT.record(f"==== {SCRIPT_NAME} {shlex.join(argv)}   [in {Path.cwd()}]")
 
 
@@ -1513,7 +1522,7 @@ def run(argv: Sequence[str]) -> int:
     if c.move_failed_to is not None:
         s = dataclasses.replace(s, move_failed_to=c.move_failed_to)
     elif s.move_failed_to and not Path(s.move_failed_to).is_dir():
-        err("00031", f"MOVE_FAILED_TO '{s.move_failed_to}' is not a folder ({s.files[0] if s.files else 'config'})")
+        err("00032", f"MOVE_FAILED_TO '{s.move_failed_to}' is not a folder ({s.files[0] if s.files else 'config'})")
     setup_output(s, c, argv)
     if c.command == "test-mail":
         return cmd_test_mail(s)
@@ -1547,7 +1556,7 @@ def main(argv: Sequence[str]) -> int:
                   f"document in hand; run it again to go on")
         return 143
     except OSError as e:
-        OUT.error(f"ERROR 00032 [1]: while {_phase}: {e.strerror or e}" + (f": {e.filename}" if e.filename else ""))
+        OUT.error(f"ERROR 00033 [1]: while {_phase}: {e.strerror or e}" + (f": {e.filename}" if e.filename else ""))
         return 1
     except Exception as e:   # a bug: one line here, the trace in a file  # noqa: BLE001
         where = trace_file()
@@ -1555,7 +1564,7 @@ def main(argv: Sequence[str]) -> int:
             where.write_text(f"{version_line()}\nargv: {list(argv)}\n\n{traceback.format_exc()}", encoding="utf-8")
         except OSError:
             where = Path("(not written)")
-        OUT.error(f"ERROR 00033 [70]: unexpected {type(e).__name__} while {_phase} -- the trace: {where}")
+        OUT.error(f"ERROR 00034 [70]: unexpected {type(e).__name__} while {_phase} -- the trace: {where}")
         return 70
     finally:
         if OUT.log is not None:
@@ -1650,6 +1659,7 @@ class T:
         (folder / "Trash").mkdir()
         (folder / "failed").mkdir()
         (folder / "app").mkdir()
+        (folder / "helper").mkdir()
         for name, text in (("osascript", _T_ENGINE), ("my-notify", _T_NOTIFY)):
             (folder / name).write_text(text, encoding="utf-8")
             (folder / name).chmod(0o755)
@@ -1830,6 +1840,20 @@ def t_engine_unreachable_stops_untouched(t: T) -> None:
     t.check("ERROR" in errs and errs.count("\n") == 1, f"ONE error line: {errs!r}")
 
 
+def t_no_addon_refuses_untouched(t: T) -> None:
+    """Without the OCR add-on DEVONthink never answers: the run must refuse
+    before asking it, and leave every document where it was -- not wait
+    twice and file the document as FAILED."""
+    a = t_mkpdf(t.dir / "a.pdf", 1, "S")
+    (t.dir / "helper").rmdir()
+    rc, _, errs = t.ocr("--move-failed-to", str(t.dir / "failed"), str(a))
+    t.check(rc == 1 and "Install Add-ons" in errs and errs.count("\n") == 1, f"ONE error naming the fix: rc {rc} {errs!r}")
+    t.check(a.is_file() and not any((t.dir / "failed").iterdir()), "the document is untouched")
+    t.check(t.calls("engine") == [], "DEVONthink was not asked")
+    _, out, _ = t.ocr("status")
+    t.check(any(x.startswith("ADD-ON    ABBYY OCR MISSING") for x in out.splitlines()), f"status says so: {out}")
+
+
 def t_timeout_retry_resolves(t: T) -> None:
     a = t_mkpdf(t.dir / "a.pdf", 1, "S")
     t.plan("hang", "ok " + str(t_mkpdf(t.dir / "res.pdf", 1, "")))
@@ -1932,6 +1956,7 @@ def t_status(t: T) -> None:
     rc, out, _ = t.ocr("status")
     t.check(rc == 0 and out.splitlines()[0] == "OCR       idle", f"idle: {out}")
     t.check("TYPES     PDF, JPEG, PNG, TIFF" in out.splitlines(), f"the types my-scan takes from it: {out}")
+    t.check(any(x.startswith("ADD-ON    ABBYY OCR installed") for x in out.splitlines()), f"the add-on: {out}")
     t.check(not (t.dir / "state").exists(), "status creates nothing")
     m = t.dir / "state" / "mutex"
     m.mkdir(parents=True)
@@ -2123,6 +2148,7 @@ def t_err_codes_unique(t: T) -> None:
 TESTS: Final[List[Callable[[T], None]]] = [
     t_verify_result, t_tag_in_place, t_ocr_replaces_in_place, t_image_becomes_pdf, t_refused_rolls_back,
     t_no_text_keeps_original, t_engine_error_is_one_document, t_engine_unreachable_stops_untouched,
+    t_no_addon_refuses_untouched,
     t_timeout_retry_resolves, t_timeout_twice_stops, t_original_never_absent, t_skips, t_stdin_only_when_no_names,
     t_mutex, t_status, t_reset_two_phase, t_config_read_never_run, t_create_config, t_output_layers, t_ctrl_c,
     t_bug_trace, t_test_mail, t_version, t_help_claims, t_python39_grammar, t_applescript_words, t_waits_for_inbox,
@@ -2135,6 +2161,7 @@ def use_test_seams(folder: str) -> None:
     d = Path(folder)
     EXT.dt_app, EXT.osascript, EXT.my_notify, EXT.trash_dir, EXT.osa_grace = \
         d / "app", str(d / "osascript"), str(d / "my-notify"), d / "Trash", 1
+    EXT.dt_ocr_helper = d / "helper"
 
 
 def run_tests(name_filter: str) -> int:
