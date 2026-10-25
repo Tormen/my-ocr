@@ -581,7 +581,10 @@ end run
 '''
 
 # What a run killed in the middle left in my-ocr's own group -- that group
-# only, never another record.
+# only, never another record. The children are read ONCE (`get`) and deleted
+# from that list: a loop over the live `children of g` shifts under its own
+# deletes -- "Can't get item 2 of every child" (horse, 2026-10-25, two
+# leftovers).
 _AS_SWEEP: Final = '''\
 -- my-ocr:sweep
 on run argv
@@ -591,9 +594,10 @@ on run argv
       tell application id "DNtp"
 ''' + _AS_WAIT_INBOX + '''        if not (exists record at "''' + DT_GROUP + '''" in inbox) then return "OK" & sep & "0"
         set g to get record at "''' + DT_GROUP + '''" in inbox
-        set n to count of children of g
-        repeat with c in (children of g)
-          delete record c
+        set kids to get children of g
+        set n to count of kids
+        repeat with i from 1 to n
+          delete record (item i of kids)
         end repeat
         return "OK" & sep & n
       end tell
@@ -2137,6 +2141,13 @@ def t_waits_for_inbox(t: T) -> None:
         t.check(body.lstrip("\n").startswith(_AS_WAIT_INBOX), f"{name} waits for the Inbox first")
 
 
+def t_sweep_reads_children_once(t: T) -> None:
+    """Deleting while looping over the live `children of g` fails at the second
+    leftover. The stub engine cannot see that -- this test can."""
+    t.check("repeat with c in (children of g)" not in _AS_SWEEP and "set kids to get children of g" in _AS_SWEEP,
+            "the sweep deletes from a list read once")
+
+
 def t_err_codes_unique(t: T) -> None:
     src = Path(os.path.realpath(__file__)).read_text(encoding="utf-8")
     codes = re.findall(r'(?:err|StopRun)\("(\d{5})"', src) + re.findall(r'ERROR (\d{5}) \[', src)
@@ -2151,7 +2162,7 @@ TESTS: Final[List[Callable[[T], None]]] = [
     t_no_addon_refuses_untouched,
     t_timeout_retry_resolves, t_timeout_twice_stops, t_original_never_absent, t_skips, t_stdin_only_when_no_names,
     t_mutex, t_status, t_reset_two_phase, t_config_read_never_run, t_create_config, t_output_layers, t_ctrl_c,
-    t_bug_trace, t_test_mail, t_version, t_help_claims, t_python39_grammar, t_applescript_words, t_waits_for_inbox,
+    t_bug_trace, t_test_mail, t_version, t_help_claims, t_python39_grammar, t_applescript_words, t_waits_for_inbox, t_sweep_reads_children_once,
     t_err_codes_unique,
 ]
 
