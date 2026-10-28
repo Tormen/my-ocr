@@ -131,6 +131,17 @@ v1.1 that drove ABBYY FineReader Pro 12 through an Automator Folder Action
 FineReader's Automator step works, and is called directly; the only change
 from v1.1 is its own name in the workflow it writes.
 
+**Its Automator workflow runs as a Folder Action -- never from a
+LaunchDaemon.** `/usr/bin/automator` does not run a workflow itself: it hands
+it to Automator Runner, a helper that exists only inside the user's GUI login
+session. A job in `/Library/LaunchDaemons` runs in the system context --
+`UserName` changes the user, not the session -- so there `automator` exits
+255, "Couldn't communicate with a helper application", whatever the workflow
+does (ada, 2026-09-02: the old `eu.no-panic.folderAction_my-ocr`). macOS
+Folder Actions run in the session, which is why `setup` attaches the workflow
+to `,ocr.in` that way. The same holds for any Automator job, e.g. a scan
+pick-up.
+
 ## Requirements
 
 - macOS with DEVONthink Pro 4 and its ABBYY FineReader OCR add-on (DEVONthink >
