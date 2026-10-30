@@ -127,9 +127,14 @@ Recognition languages and the auto-corrections are DEVONthink's own settings
 `my-ocr-finereader.sh`, deployed as `my-ocr-finereader`, is the shell my-ocr
 v1.1 that drove ABBYY FineReader Pro 12 through an Automator Folder Action
 (`setup [go]`, `uninstall [go]`, `reset [go]`, `status`, its own
-`--run-tests`; `my-ocr-finereader --help`). It is kept for Macs where
-FineReader's Automator step works, and is called directly; the only change
-from v1.1 is its own name in the workflow it writes.
+`--run-tests`; `my-ocr-finereader --help`). It is called directly; the only
+change from v1.1 is its own name in the workflow it writes.
+
+Where it works: on macOS 26 (horse, 2026-10-25: a review scan in 47 s). On
+macOS 27 (ada) Automator drops FineReader's step while it runs -- the Intel
+action loader fails building the step's interface -- so ada uses DEVONthink
+only. FineReader 12 is an Intel app, and Rosetta ends with macOS 28 (Apple,
+support 102527): this engine has an end date, DEVONthink is the one that lasts.
 
 **Its Automator workflow runs as a Folder Action -- never from a
 LaunchDaemon.** `/usr/bin/automator` does not run a workflow itself: it hands
