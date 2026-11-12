@@ -2121,22 +2121,31 @@ def t_ctrl_c(t: T) -> None:
     (m / "owner").write_text(f"pid={os.getpid()} at=x doing=x\n", encoding="utf-8")
     doc = t_mkpdf(t.dir / "a.pdf", 1, "S")
     t.config('MUTEX_TIMEOUT="60"\n')
-    p = subprocess.Popen([sys.executable, os.path.realpath(__file__), "--config", str(t.dir / "conf"), str(doc)],
-                         stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                         env={**os.environ, "MY_OCR_T_DIR": str(t.dir), "MY_OCR_T_SEAMS": str(t.dir)})
-    time.sleep(2)
+
+    def waiting() -> subprocess.Popen[str]:
+        """A run that has SAID it waits for the mutex -- never one a fixed sleep
+        guesses is there: a signal landing before main installs its handlers
+        kills it with no line at all (rc -15 on a loaded host)."""
+        p = subprocess.Popen([sys.executable, os.path.realpath(__file__), "--config", str(t.dir / "conf"), str(doc)],
+                             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                             env={**os.environ, "MY_OCR_T_DIR": str(t.dir), "MY_OCR_T_SEAMS": str(t.dir)})
+        assert p.stdout is not None, "stdout is a pipe"
+        for line in p.stdout:
+            if "another OCR is running" in line:
+                break
+        return p
+
+    p = waiting()
     p.send_signal(signal.SIGINT)
     _, errs = p.communicate(timeout=30)
     t.check(p.returncode == 130 and "interrupted (Ctrl-C) while waiting for the OCR mutex" in errs
             and "Traceback" not in errs and len(errs.strip().splitlines()) == 1, f"rc {p.returncode}: {errs!r}")
     t.check((m / "owner").is_file(), "another run's mutex is left alone")
-    p = subprocess.Popen([sys.executable, os.path.realpath(__file__), "--config", str(t.dir / "conf"), str(doc)],
-                         stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                         env={**os.environ, "MY_OCR_T_DIR": str(t.dir), "MY_OCR_T_SEAMS": str(t.dir)})
-    time.sleep(2)
+    p = waiting()
     p.send_signal(signal.SIGTERM)
     _, errs = p.communicate(timeout=30)
-    t.check(p.returncode == 143 and "stopped (SIGTERM)" in errs and "Traceback" not in errs, f"SIGTERM: {errs!r}")
+    t.check(p.returncode == 143 and "stopped (SIGTERM)" in errs and "Traceback" not in errs,
+            f"SIGTERM: rc {p.returncode}: {errs!r}")
 
 
 def t_bug_trace(t: T) -> None:
