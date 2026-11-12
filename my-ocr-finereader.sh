@@ -4784,16 +4784,23 @@ rt_version_clone() {
 # A part that fails writes its error into the flag a LIVE run watches, and the
 # live run aborts on it (err 066). The suite started parts with the real flag:
 # 760 lines of test errors had piled up in it on horse, and a suite run on the
-# scan host during a real OCR would have ended that OCR.
+# scan host during a real OCR would have ended that OCR. The "live" flag here
+# is a copy's own, under a site.conf of the test's: the machine's real flag is
+# never read, so the result cannot depend on the host running the suite.
 rt_parts_sandboxed() {
-  _ps_real="$PARTx_ERRORED_FLAGFILE"
-  _ps_before="$(wc -c <"$_ps_real" 2>/dev/null | tr -d ' ')"
-  MY_OCR_CONFIG="$T_TMP/sandbox.conf" "$0" --move-failed-to /nonexistent/quarantine --part-1 --no-log >/dev/null 2>&1
-  _ps_after="$(wc -c <"$_ps_real" 2>/dev/null | tr -d ' ')"
-  if [ "$_ps_before" = "$_ps_after" ] && [ -s "$T_TMP/partx-errored.flag" ]; then
-    t_ok "a failing part started by the suite writes to the suite's flag, not the live one [live ${_ps_before:-absent} -> ${_ps_after:-absent} bytes]"
+  _ps_d="$T_TMP/parts-sandboxed"; mkdir -p -- "$_ps_d/data/$WHOAMI" "$_ps_d/log/$WHOAMI"
+  printf 'DATA_BASE_DIR="%s"\nLOG_BASE_DIR="%s"\n' "$_ps_d/data" "$_ps_d/log" >"$_ps_d/site.conf"
+  sed "s#^SITE_CONF=.*#SITE_CONF=\"$_ps_d/site.conf\"#" "$0" >"$_ps_d/$US" && chmod 755 "$_ps_d/$US"
+  printf 'PARTx_ERRORED_FLAGFILE="%s"\nTMP_PRE_INP_PATH="%s"\n' "$_ps_d/suite.flag" "$_ps_d/pre-staging" >"$_ps_d/sandbox.conf"
+  _ps_live="$_ps_d/data/${US%.*}.PARTx-ERRORED.flagfile"
+  echo "an earlier line of the live run" >"$_ps_live"
+  _ps_before="$(wc -c <"$_ps_live" | tr -d ' ')"
+  MY_OCR_CONFIG="$_ps_d/sandbox.conf" "$_ps_d/$US" --move-failed-to /nonexistent/quarantine --part-1 --no-log >/dev/null 2>&1
+  _ps_after="$(wc -c <"$_ps_live" | tr -d ' ')"
+  if [ "$_ps_before" = "$_ps_after" ] && [ -s "$_ps_d/suite.flag" ]; then
+    t_ok "a failing part started by the suite writes to the suite's flag, not the live one [live $_ps_before -> $_ps_after bytes]"
   else
-    t_bad "a failing part started by the suite writes to the suite's flag, not the live one" "live flag ${_ps_before:-absent} -> ${_ps_after:-absent} bytes, sandbox flag $( [ -s "$T_TMP/partx-errored.flag" ] && echo written || echo empty)"
+    t_bad "a failing part started by the suite writes to the suite's flag, not the live one" "live flag $_ps_before -> $_ps_after bytes, suite flag $( [ -s "$_ps_d/suite.flag" ] && echo written || echo empty)"
   fi
 }
 
