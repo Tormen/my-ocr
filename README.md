@@ -103,10 +103,17 @@ would block for ever while holding the OCR mutex.
 
 `my-ocr --create-config` prints the default config; `--create-config <FILE>`
 writes it (never over an existing file). The first found of `$MY_OCR_CONFIG`,
-`--config <FILE>`, `/LINKS/default/my-ocr.conf`, `/LINKS/default/my-ocr`,
+`--config <FILE>`, `$CONFIG_SEARCH_DIR/my-ocr.conf`, `$CONFIG_SEARCH_DIR/my-ocr`,
 `~/.my-ocr.conf`, `/etc/my-ocr.conf`, `/usr/local/etc/my-ocr.conf` is read --
 as `KEY="value"` lines, never run. The printed text IS the defaults, so a file
 holding only the lines it changes is complete.
+
+`/LINKS/default/site.conf`, when it exists, is read first -- the site's
+values for every tool, as plain `KEY="value"` lines giving
+`CONFIG_SEARCH_DIR` (searched as above) and `DATA_BASE_DIR` / `LOG_BASE_DIR`
+(the bases of `STATE_DIR` and `LOGFILE` below, and of the FineReader engine's
+state and log files). Without it: `/var/db`, `/var/log`, no search directory.
+There but unreadable is an error, never the fallback.
 
 | key | default | meaning |
 |---|---|---|
@@ -115,8 +122,8 @@ holding only the lines it changes is complete.
 | `REVEAL_IN_FINDER` | `auto` | `auto` (runs started from a terminal), `always`, `never` |
 | `OCR_TIMEOUT` | `600` | s DEVONthink gets for one document, before the one retry |
 | `MUTEX_TIMEOUT` | `1800` | s a run waits for its turn |
-| `STATE_DIR` | `/var/lib/mine/$USER/my-ocr` | the mutex and each run's work folder |
-| `LOGFILE` / `LOG` | `/var/log/mine/$USER/my-ocr.log` / `""` | the record of a run; `-l` keeps one for that run |
+| `STATE_DIR` | `$DATA_BASE_DIR/$USER/my-ocr` | the mutex and each run's work folder |
+| `LOGFILE` / `LOG` | `$LOG_BASE_DIR/$USER/my-ocr.log` / `""` | the record of a run; `-l` keeps one for that run |
 | `STUCK_MARKER_DIR` | `$HOME/Desktop` | where the STUCK marker lands |
 
 Recognition languages and the auto-corrections are DEVONthink's own settings

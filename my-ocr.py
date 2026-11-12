@@ -82,6 +82,8 @@ class Outside:
     osa_grace: int = 30
     my_notify: str = "/LINKS/bin/my-notify"
     trash_dir: Path = Path.home() / ".Trash"
+    # the site's values for every tool (read_site); none = the neutral ones
+    site_conf: Path = Path("/LINKS/default/site.conf")
 
 
 EXT = Outside()
@@ -192,12 +194,13 @@ OCR_TIMEOUT="600"
 MUTEX_TIMEOUT="1800"
 
 ## my-ocr's own state: the mutex and each run's work folder (copies only --
-## never an original)
-STATE_DIR="/var/lib/mine/$USER/my-ocr"
+## never an original). $DATA_BASE_DIR and $LOG_BASE_DIR are the site's
+## (my-ocr --help), /var/db and /var/log without it.
+STATE_DIR="$DATA_BASE_DIR/$USER/my-ocr"
 
 ## the record of every run -- it gets every line, also under -Q.
 ## LOG="" keeps none (-l / --log turns it on for one run)
-LOGFILE="/var/log/mine/$USER/my-ocr.log"
+LOGFILE="$LOG_BASE_DIR/$USER/my-ocr.log"
 LOG=""
 
 ## where a STUCK alert also leaves a file, so it is still there tomorrow
@@ -226,11 +229,43 @@ class Settings:
         assert self.ocr_timeout > 0 and self.mutex_timeout >= 0, "checked where the config is read"
 
 
-def config_search_paths() -> List[Path]:
+@dataclass(frozen=True)
+class Site:
+    """The site's values for every tool (EXT.site_conf); the defaults are the
+    neutral ones a host without that file runs on."""
+
+    data_base_dir: str = "/var/db"
+    log_base_dir: str = "/var/log"
+    config_search_dir: str = ""      # "" = no site directory is searched
+
+
+def read_site() -> Site:
+    """EXT.site_conf, parsed -- plain KEY="value" lines, never run, nothing
+    expanded. Absent: the neutral Site. There but unreadable: an error, never
+    the fallback -- this user would keep its state apart from everyone else's."""
+    p = EXT.site_conf
+    if not p.exists():
+        return Site()
+    try:
+        text = p.read_text(encoding="utf-8")
+    except OSError as e:
+        err("00001", f"cannot read {p}: {e.strerror} -- the site's directories for every tool")
+    for n, line in enumerate(text.splitlines(), 1):
+        if not line.strip().startswith("#") and ("$" in line or "`" in line):
+            err("00002", f"{p}:{n}: plain values only -- no $NAME, no $(...)")
+    names: Dict[str, str] = {}
+    read_config_text(text, str(p), names)
+    neutral = Site()
+    return Site(data_base_dir=names.get("DATA_BASE_DIR", neutral.data_base_dir),
+                log_base_dir=names.get("LOG_BASE_DIR", neutral.log_base_dir),
+                config_search_dir=names.get("CONFIG_SEARCH_DIR", neutral.config_search_dir))
+
+
+def config_search_paths(site: Site) -> List[Path]:
     """Where the config is looked for, in order (after $MY_OCR_CONFIG and --config)."""
-    site = Path(os.environ.get("LINKS", "/LINKS")) / "default"
-    return [site / f"{SCRIPT_NAME}.conf", site / SCRIPT_NAME, Path.home() / f".{SCRIPT_NAME}.conf",
-            Path("/etc") / f"{SCRIPT_NAME}.conf", Path("/usr/local/etc") / f"{SCRIPT_NAME}.conf"]
+    d = [Path(site.config_search_dir) / n for n in (f"{SCRIPT_NAME}.conf", SCRIPT_NAME)] if site.config_search_dir else []
+    return d + [Path.home() / f".{SCRIPT_NAME}.conf", Path("/etc") / f"{SCRIPT_NAME}.conf",
+                Path("/usr/local/etc") / f"{SCRIPT_NAME}.conf"]
 
 
 _KEY_LINE: Final = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
@@ -239,7 +274,7 @@ _NAME_REF: Final = re.compile(r"\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Z
 
 def _expand(text: str, names: Dict[str, str], where: str) -> str:
     if "$(" in text or "`" in text:
-        err("00001", f"{where}: a command substitution -- my-ocr reads its config, it never runs it")
+        err("00003", f"{where}: a command substitution -- my-ocr reads its config, it never runs it")
 
     def one(m: re.Match[str]) -> str:
         name = m.group(1) or m.group(2)
@@ -251,7 +286,7 @@ def _expand(text: str, names: Dict[str, str], where: str) -> str:
             return getpass.getuser()
         if name == "HOME":
             return str(Path.home())
-        err("00002", f"{where}: ${name} is not set (a key above, or the environment)")
+        err("00004", f"{where}: ${name} is not set (a key above, or the environment)")
 
     return _NAME_REF.sub(one, text)
 
@@ -266,7 +301,7 @@ def parse_value(raw: str, names: Dict[str, str], where: str) -> str:
         if c == "'":
             j = raw.find("'", i + 1)
             if j < 0:
-                err("00003", f"{where}: a ' is not closed")
+                err("00005", f"{where}: a ' is not closed")
             out.append(raw[i + 1:j])
             i = j + 1
         elif c == '"':
@@ -278,13 +313,13 @@ def parse_value(raw: str, names: Dict[str, str], where: str) -> str:
                 part.append(raw[j])
                 j += 1
             if j >= len(raw):
-                err("00004", f"{where}: a \" is not closed")
+                err("00006", f"{where}: a \" is not closed")
             out.append(_expand("".join(part), names, where))
             i = j + 1
         elif c in " \t":
             rest = raw[i:].strip()
             if rest and not rest.startswith("#"):
-                err("00005", f"{where}: more than one word -- quote the value")
+                err("00007", f"{where}: more than one word -- quote the value")
             break
         else:
             m = re.match(r"[^'\" \t]+", raw[i:])
@@ -306,7 +341,7 @@ def read_config_text(text: str, where: str, names: Dict[str, str]) -> List[str]:
             continue
         m = _KEY_LINE.match(s)
         if m is None:
-            err("00006", f"{where}:{n}: not a KEY=\"value\" line -- my-ocr reads its config, it never runs it: {s[:60]}")
+            err("00008", f"{where}:{n}: not a KEY=\"value\" line -- my-ocr reads its config, it never runs it: {s[:60]}")
         names[m.group(1)] = parse_value(m.group(2), names, f"{where}:{n}")
         keys.append(m.group(1))
     return keys
@@ -314,7 +349,7 @@ def read_config_text(text: str, where: str, names: Dict[str, str]) -> List[str]:
 
 def _seconds(value: str, key: str, where: str, least: int) -> int:
     if not value.isdigit() or int(value) < least:
-        err("00007", f"{where}: {key}=\"{value}\" -- a whole number of seconds, at least {least}")
+        err("00009", f"{where}: {key}=\"{value}\" -- a whole number of seconds, at least {least}")
     return int(value)
 
 
@@ -322,22 +357,25 @@ def load_settings(override: Optional[str]) -> Settings:
     """The defaults, then the first config found on top -- a host with none
     runs on the defaults."""
     phase("reading the config")
-    names: Dict[str, str] = {}
+    site = read_site()
+    # the bases the defaults are written in -- set here, so an exported
+    # variable of the same name never takes their place
+    names: Dict[str, str] = {"DATA_BASE_DIR": site.data_base_dir, "LOG_BASE_DIR": site.log_base_dir}
     defaults = read_config_text(DEFAULT_CONFIG, "the built-in defaults", names)
     chosen = override or os.environ.get("MY_OCR_CONFIG")
     found: Optional[Path] = None
     if chosen:
         if not Path(chosen).is_file():
-            err("00008", f"config '{chosen}' not found (--config / $MY_OCR_CONFIG)")
+            err("00010", f"config '{chosen}' not found (--config / $MY_OCR_CONFIG)")
         found = Path(chosen)
     else:
-        found = next((p for p in config_search_paths() if p.is_file()), None)
+        found = next((p for p in config_search_paths(site) if p.is_file()), None)
     files: Tuple[Path, ...] = ()
     if found is not None:
         try:
             text = found.read_text(encoding="utf-8")
         except OSError as e:
-            err("00009", f"cannot read the config {found}: {e.strerror}")
+            err("00011", f"cannot read the config {found}: {e.strerror}")
         for key in read_config_text(text, str(found), names):
             if key not in defaults:
                 OUT.warn(f"{found}: {key} is not a my-ocr setting -- ignored ('{SCRIPT_NAME} --create-config' lists them)")
@@ -345,10 +383,10 @@ def load_settings(override: Optional[str]) -> Settings:
     where = str(found) if found is not None else "the built-in defaults"
     reveal = names["REVEAL_IN_FINDER"]
     if reveal not in ("auto", "always", "never"):
-        err("00010", f"{where}: REVEAL_IN_FINDER=\"{reveal}\" -- auto, always or never")
+        err("00012", f"{where}: REVEAL_IN_FINDER=\"{reveal}\" -- auto, always or never")
     log = names["LOG"]
     if log not in ("", "0", "1"):
-        err("00011", f"{where}: LOG=\"{log}\" -- \"1\" (on) or \"\" (off)")
+        err("00013", f"{where}: LOG=\"{log}\" -- \"1\" (on) or \"\" (off)")
     return Settings(
         files=files,
         move_failed_to=names["MOVE_FAILED_TO"],
@@ -379,7 +417,7 @@ def required_tools() -> Dict[str, str]:
     found = {n: _tool(n) for n in ("pdfinfo", "pdftotext", "qpdf")}
     missing = [n for n, p in found.items() if p is None]
     if missing:
-        err("00012", f"{', '.join(missing)} not found -- every result is checked with them before it "
+        err("00014", f"{', '.join(missing)} not found -- every result is checked with them before it "
                      f"replaces an original (brew install poppler qpdf)")
     return {n: p for n, p in found.items() if p is not None}
 
@@ -780,7 +818,7 @@ def free_name(folder: Path, name: str) -> Path:
         p = folder / (f"{stem}{extra}.{ext}" if ext else f"{stem}{extra}")
         if not (p.exists() or p.is_symlink()):
             return p
-    err("00013", f"no free name for '{name}' in {folder}")
+    err("00015", f"no free name for '{name}' in {folder}")
 
 
 def trash(path: Path, name: Optional[str] = None) -> bool:
@@ -903,11 +941,11 @@ def ocr_one(run: Run, original: Path, kind: str, pages_in: Optional[int]) -> Don
     a = ask_devonthink(run, copy, out)
     if a.timed_out:
         where = quarantine(run.s, original)
-        raise StopRun("00014", f"'{original.name}' defeated DEVONthink twice -- {where}. {a.text}")
+        raise StopRun("00016", f"'{original.name}' defeated DEVONthink twice -- {where}. {a.text}")
     if not a.ok:
         problem = engine_problem(a)
         if problem:
-            raise StopRun("00015", problem)
+            raise StopRun("00017", problem)
         return Done("failed", original, f"DEVONthink could not OCR it [{a.number}: {a.text}] -- {quarantine(run.s, original)}")
     if len(a.fields) >= 3 and a.fields[2] != "deleted":
         OUT.warn(f"DEVONthink kept its record of '{original.name}' (uuid {a.fields[1]}) -- the next run removes it")
@@ -1060,7 +1098,7 @@ def take_mutex(s: Settings) -> Path:
                         f"(at most {s.mutex_timeout}s)")
                 said = True
             if waited >= s.mutex_timeout:
-                err("00016", f"waited {waited}s for the OCR mutex {mutex} -- it is held by {line or 'an unknown run'}")
+                err("00018", f"waited {waited}s for the OCR mutex {mutex} -- it is held by {line or 'an unknown run'}")
             time.sleep(1)
             waited += 1
 
@@ -1103,15 +1141,15 @@ def gather(c: Cli) -> List[str]:
         try:
             names += [x for x in Path(c.file_list).read_text(encoding="utf-8").splitlines() if x.strip()]
         except OSError as e:
-            err("00017", f"--file {c.file_list}: {e.strerror}")
+            err("00019", f"--file {c.file_list}: {e.strerror}")
     if not names and not c.files_given and not c.file_list:
         if sys.stdin.isatty():
-            err("00018", f"no <FILE> to OCR -- name them, pipe them in, or use --file ({SCRIPT_NAME} --help)")
+            err("00020", f"no <FILE> to OCR -- name them, pipe them in, or use --file ({SCRIPT_NAME} --help)")
         phase("reading the names on stdin")
         names = [x.rstrip("\n") for x in sys.stdin if x.strip()]
     for n in names:
         if not os.path.lexists(n):
-            err("00019", f"'{n}' does not exist")
+            err("00021", f"'{n}' does not exist")
     return names
 
 
@@ -1150,14 +1188,14 @@ def cmd_ocr(s: Settings, c: Cli) -> int:
     tools = required_tools()
     names = gather(c)
     if not EXT.dt_app.is_dir():
-        err("00020", f"DEVONthink is not installed at {EXT.dt_app} -- my-ocr OCRs with it (brew install --cask devonthink)")
+        err("00022", f"DEVONthink is not installed at {EXT.dt_app} -- my-ocr OCRs with it (brew install --cask devonthink)")
     if not EXT.dt_ocr_helper.is_dir():
-        err("00021", f"DEVONthink's ABBYY OCR add-on is missing ({EXT.dt_ocr_helper}) -- install it in DEVONthink > "
+        err("00023", f"DEVONthink's ABBYY OCR add-on is missing ({EXT.dt_ocr_helper}) -- install it in DEVONthink > "
                      "Install Add-ons; nothing was touched")
     try:
         s.state_dir.mkdir(parents=True, exist_ok=True)
     except OSError as e:
-        err("00022", f"cannot create STATE_DIR {s.state_dir}: {e.strerror}")
+        err("00024", f"cannot create STATE_DIR {s.state_dir}: {e.strerror}")
     mutex = take_mutex(s)
     work = s.state_dir / "work" / str(os.getpid())
     t = Tally()
@@ -1182,7 +1220,7 @@ def cmd_ocr(s: Settings, c: Cli) -> int:
             phase("clearing DEVONthink's my-ocr group")
             a = osa(_AS_SWEEP, [], 120)
             if not a.ok:
-                stop = StopRun("00023", engine_problem(a) or f"DEVONthink did not answer [{a.number}: {a.text}]")
+                stop = StopRun("00025", engine_problem(a) or f"DEVONthink did not answer [{a.number}: {a.text}]")
             elif a.fields[:1] != ("0",):
                 OUT.msg(f"    > removed {a.fields[0]} leftover record(s) from DEVONthink's {DT_GROUP} group")
         for k, it in enumerate(items, 1):
@@ -1321,7 +1359,7 @@ def cmd_test_mail(s: Settings) -> int:
             f"Config:  {s.files[0] if s.files else 'none (built-in defaults)'}\nVersion: {version_line()}")
     rc = send_alert(f"{SCRIPT_NAME} test mail", "test alert -- a test mail went out too", body)
     if rc != 0:
-        err("00024", f"test mail NOT sent to the my-notify default recipient [my-notify rc {rc}]")
+        err("00026", f"test mail NOT sent to the my-notify default recipient [my-notify rc {rc}]")
     OUT.result(f" >>> test mail sent to the my-notify default recipient [my-notify rc {rc}]")
     return 0
 
@@ -1335,7 +1373,7 @@ def create_config(target: Optional[str]) -> int:
         with p.open("x", encoding="utf-8") as f:
             f.write(DEFAULT_CONFIG)
     except FileExistsError:
-        err("00025", f"{p} exists -- never written over (compare: {SCRIPT_NAME} --create-config | diff - {p})")
+        err("00027", f"{p} exists -- never written over (compare: {SCRIPT_NAME} --create-config | diff - {p})")
     OUT.result(f" >>> wrote the default config to {p}")
     return 0
 
@@ -1395,8 +1433,11 @@ OPTIONS
 
 CONFIG  KEY="value" lines, read and never run -- the first found of
   $MY_OCR_CONFIG, --config <FILE>,
-  {', '.join(str(p).replace(str(Path.home()), "~", 1) for p in config_search_paths())}
+  {', '.join(str(p).replace(str(Path.home()), "~", 1) for p in config_search_paths(Site(config_search_dir="$CONFIG_SEARCH_DIR")))}
   None found: the defaults that --create-config prints.
+  {EXT.site_conf}, when there, is read first: the site's CONFIG_SEARCH_DIR,
+  and DATA_BASE_DIR / LOG_BASE_DIR, under which STATE_DIR and LOGFILE lie
+  by default (without it: /var/db, /var/log, no search directory).
 
 EXIT  0 the run finished (each document's outcome is in the report);
       1 an error -- one line on stderr; 130 Ctrl-C; 143 SIGTERM;
@@ -1447,7 +1488,7 @@ def parse_cli(argv: Sequence[str]) -> Cli:
             elif not rest and c.command == "reset" and a == "go":
                 c.go = True
             elif not rest and not c.files and a in GONE_VERBS and not os.path.lexists(a):
-                err("00026", f"'{a}' {GONE_VERBS[a]}")
+                err("00028", f"'{a}' {GONE_VERBS[a]}")
             else:
                 c.files.append(a)
                 c.files_given = True
@@ -1475,10 +1516,10 @@ def parse_cli(argv: Sequence[str]) -> Cli:
         elif key in ("-f", "--file", "--move-failed-to", "--config"):
             v = val if eq else next(it, None)
             if not v:
-                err("00027", f"{key} needs a value ({SCRIPT_NAME} --help)")
+                err("00029", f"{key} needs a value ({SCRIPT_NAME} --help)")
             if key == "--move-failed-to":
                 if not Path(v).is_dir():
-                    err("00028", f"--move-failed-to '{v}' is not a folder -- create it, or leave it out to keep "
+                    err("00030", f"--move-failed-to '{v}' is not a folder -- create it, or leave it out to keep "
                                  f"failed documents where they are")
                 c.move_failed_to = v
             elif key == "--config":
@@ -1490,9 +1531,9 @@ def parse_cli(argv: Sequence[str]) -> Cli:
         else:
             verb = a.lstrip("-")
             hint = f" -- you mean `{SCRIPT_NAME} {verb}`" if verb in ("reset",) else f" ({SCRIPT_NAME} --help)"
-            err("00029", f"no such option '{a}'{hint}")
+            err("00031", f"no such option '{a}'{hint}")
     if c.command in ("status", "reset") and c.files:
-        err("00030", f"'{c.command}' takes no files: {' '.join(c.files)[:60]}")
+        err("00032", f"'{c.command}' takes no files: {' '.join(c.files)[:60]}")
     return c
 
 
@@ -1505,7 +1546,7 @@ def setup_output(s: Settings, c: Cli, argv: Sequence[str]) -> None:
             s.logfile.parent.mkdir(parents=True, exist_ok=True)
             OUT.log = s.logfile.open("a", encoding="utf-8")
         except OSError as e:
-            err("00031", f"cannot write the LOGFILE {s.logfile}: {e.strerror} (-L runs without one)")
+            err("00033", f"cannot write the LOGFILE {s.logfile}: {e.strerror} (-L runs without one)")
         OUT.record(f"==== {SCRIPT_NAME} {shlex.join(argv)}   [in {Path.cwd()}]")
 
 
@@ -1526,7 +1567,7 @@ def run(argv: Sequence[str]) -> int:
     if c.move_failed_to is not None:
         s = dataclasses.replace(s, move_failed_to=c.move_failed_to)
     elif s.move_failed_to and not Path(s.move_failed_to).is_dir():
-        err("00032", f"MOVE_FAILED_TO '{s.move_failed_to}' is not a folder ({s.files[0] if s.files else 'config'})")
+        err("00034", f"MOVE_FAILED_TO '{s.move_failed_to}' is not a folder ({s.files[0] if s.files else 'config'})")
     setup_output(s, c, argv)
     if c.command == "test-mail":
         return cmd_test_mail(s)
@@ -1560,7 +1601,7 @@ def main(argv: Sequence[str]) -> int:
                   f"document in hand; run it again to go on")
         return 143
     except OSError as e:
-        OUT.error(f"ERROR 00033 [1]: while {_phase}: {e.strerror or e}" + (f": {e.filename}" if e.filename else ""))
+        OUT.error(f"ERROR 00035 [1]: while {_phase}: {e.strerror or e}" + (f": {e.filename}" if e.filename else ""))
         return 1
     except Exception as e:   # a bug: one line here, the trace in a file  # noqa: BLE001
         where = trace_file()
@@ -1568,7 +1609,7 @@ def main(argv: Sequence[str]) -> int:
             where.write_text(f"{version_line()}\nargv: {list(argv)}\n\n{traceback.format_exc()}", encoding="utf-8")
         except OSError:
             where = Path("(not written)")
-        OUT.error(f"ERROR 00034 [70]: unexpected {type(e).__name__} while {_phase} -- the trace: {where}")
+        OUT.error(f"ERROR 00036 [70]: unexpected {type(e).__name__} while {_phase} -- the trace: {where}")
         return 70
     finally:
         if OUT.log is not None:
@@ -2004,12 +2045,50 @@ def t_config_read_never_run(t: T) -> None:
 
 def t_create_config(t: T) -> None:
     rc, out, _ = t.run(["--create-config"])
-    names: Dict[str, str] = {}
+    names: Dict[str, str] = {"DATA_BASE_DIR": "/d", "LOG_BASE_DIR": "/l"}   # as load_settings sets them
     t.check(rc == 0 and read_config_text(out, "x", names) != [], "the default config parses")
     p = t.dir / "new.conf"
     rc, _, _ = t.run(["--create-config", str(p)])
     rc2, _, errs = t.run([f"--create-config={p}"])
     t.check(rc == 0 and p.is_file() and rc2 == 1 and "never written over" in errs, errs)
+
+
+def t_site_conf_gives_the_bases_and_the_search(t: T) -> None:
+    """The site file, and nothing else, moves the defaults and the search."""
+    user = os.environ.get("USER") or getpass.getuser()
+    empty = t.dir / "empty.conf"
+    empty.write_text("", encoding="utf-8")
+    os.environ["DATA_BASE_DIR"] = "/elsewhere"   # an exported name must not take the site's place
+    try:
+        s = load_settings(str(empty))
+        t.check((str(s.state_dir), str(s.logfile)) == (f"/var/db/{user}/my-ocr", f"/var/log/{user}/my-ocr.log"),
+                f"no site file: the neutral bases, the environment ignored: {s.state_dir} {s.logfile}")
+        t.check(config_search_paths(read_site())[0] == Path.home() / ".my-ocr.conf", "no site file: no site directory")
+        farm = t.dir / "farm"
+        farm.mkdir()
+        (farm / "my-ocr").write_text('OCR_TIMEOUT="7"\n', encoding="utf-8")   # the bare name counts too
+        EXT.site_conf.write_text('# no $(...), no $VAR -- a comment may say so\nDATA_BASE_DIR="/srv/data"\n'
+                                 f'LOG_BASE_DIR="/srv/log"\nCONFIG_SEARCH_DIR="{farm}"\nOTHER_KEY="x"\n',
+                                 encoding="utf-8")
+        s = load_settings(None)
+        t.check(s.files == (farm / "my-ocr",) and s.ocr_timeout == 7, f"the site's search directory is read first: {s.files}")
+        t.check((str(s.state_dir), str(s.logfile)) == (f"/srv/data/{user}/my-ocr", f"/srv/log/{user}/my-ocr.log"),
+                f"the site's bases: {s.state_dir} {s.logfile}")
+        t.check(config_search_paths(read_site())[:2] == [farm / "my-ocr.conf", farm / "my-ocr"], "<tool>.conf first")
+        EXT.site_conf.write_text('DATA_BASE_DIR="$HOME/x"\n', encoding="utf-8")
+        try:
+            read_site()
+            t.check(False, "a $NAME in a site value is refused")
+        except OcrError as e:
+            t.check("plain values only" in e.text, e.text)
+        EXT.site_conf.chmod(0)
+        try:
+            read_site()
+            t.check(False, "there but unreadable is an error, never the fallback")
+        except OcrError as e:
+            t.check("cannot read" in e.text, e.text)
+    finally:
+        del os.environ["DATA_BASE_DIR"]
 
 
 def t_output_layers(t: T) -> None:
@@ -2161,7 +2240,8 @@ TESTS: Final[List[Callable[[T], None]]] = [
     t_no_text_keeps_original, t_engine_error_is_one_document, t_engine_unreachable_stops_untouched,
     t_no_addon_refuses_untouched,
     t_timeout_retry_resolves, t_timeout_twice_stops, t_original_never_absent, t_skips, t_stdin_only_when_no_names,
-    t_mutex, t_status, t_reset_two_phase, t_config_read_never_run, t_create_config, t_output_layers, t_ctrl_c,
+    t_mutex, t_status, t_reset_two_phase, t_config_read_never_run, t_create_config,
+    t_site_conf_gives_the_bases_and_the_search, t_output_layers, t_ctrl_c,
     t_bug_trace, t_test_mail, t_version, t_help_claims, t_python39_grammar, t_applescript_words, t_waits_for_inbox, t_sweep_reads_children_once,
     t_err_codes_unique,
 ]
@@ -2173,6 +2253,7 @@ def use_test_seams(folder: str) -> None:
     EXT.dt_app, EXT.osascript, EXT.my_notify, EXT.trash_dir, EXT.osa_grace = \
         d / "app", str(d / "osascript"), str(d / "my-notify"), d / "Trash", 1
     EXT.dt_ocr_helper = d / "helper"
+    EXT.site_conf = d / "site.conf"     # absent unless a test writes it
 
 
 def run_tests(name_filter: str) -> int:

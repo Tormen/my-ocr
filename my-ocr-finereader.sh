@@ -1,6 +1,6 @@
 #!/bin/dash
 
-# 178 == highest used errCode
+# 180 == highest used errCode
 
 US="${0##*/}";   # get filename without path
 
@@ -27,11 +27,40 @@ SCRIPT_PARENT="61cc323"
 WHOAMI="$(/usr/bin/whoami)"
 [ "$USER" = "$WHOAMI" ] || err 126 "USER '$USER' ? != ? '$WHOAMI' WHOAMI"
 
+err() { ERR_CODE="$1"; [ -z "$2" ] && local msg="Please fix." || local msg="$2"; [ -z "$3" ] && local exitCode=1 || local exitCode="$3";
+  #echo "$$|DBG: err() WHAT='$WHAT'"
+  case "$WHAT" in part-1|part-2) # if --part-1 | --part-2  --> (i) NFY     --> (ii) create PARTx_ERRORED_FLAGFILE (for do_trigger_ocr() to find)!
+    if [ $NFY ]; then
+      (echo "$$|"; echo "$$|LAUNCHING: \"$my_notify\" -- \"with below ERROR $ERR_CODE\"") 1>&2
+      "$my_notify" -- "ERROR $ERR_CODE [$exitCode]:" "$msg"
+    fi
+    echo "$$|$( date +"%Y-%m-%d_%H%M.%S") [$WHAT] ERROR $ERR_CODE [$exitCode]: $msg" >>"$PARTx_ERRORED_FLAGFILE" \
+    || ( echo "$$|"; echo "$$|err() :: FAILED [$?] TO Create FLAGFILE '$PARTx_ERRORED_FLAGFILE'" ) 1>&2;;
+  esac
+  ( echo "$$|"; echo "$$|$( date +"%Y-%m-%d_%H%M.%S") [$WHAT] ERROR $ERR_CODE [$exitCode]: $msg" ) 1>&2
+  exit $exitCode;
+}
+
+# The site's values for every tool, from SITE_CONF -- the one site path this
+# tool reads: DATA_BASE_DIR and LOG_BASE_DIR, under which every state and log
+# file below lies, and CONFIG_SEARCH_DIR (config_search_paths). The neutral
+# values come first, so an exported variable never takes their place. There
+# but unreadable is an error, never the fallback.
+SITE_CONF="/LINKS/default/site.conf"
+read_site() {
+  DATA_BASE_DIR="/var/db"; LOG_BASE_DIR="/var/log"; CONFIG_SEARCH_DIR=""
+  [ -e "$SITE_CONF" ] || return 0
+  [ -r "$SITE_CONF" ] || err 179 "cannot read '$SITE_CONF' -- the site's directories for every tool; its group must include $WHOAMI"
+  # shellcheck disable=SC1090  # the path is only known at run time
+  . "$SITE_CONF" || err 180 "'$SITE_CONF' failed to load"
+}
+read_site
+
 #LOG=""
-LOG="/var/log/mine/${WHOAMI}/${US%.*}.log" # == LOGFILE
-AUTOMATOR_LOG="/var/log/mine/${WHOAMI}/${US%.*}.AUTOMATOR.log"
-STDOUT_FIFO="/var/log/mine/${WHOAMI}/${US%.*}.stdout.fifo"
-DBG_GOTTEN_FILES_FILELIST="/var/log/mine/${WHOAMI}/${US%.*}.DBG_got-files-list." # $WHAT will be appended
+LOG="$LOG_BASE_DIR/${WHOAMI}/${US%.*}.log" # == LOGFILE
+AUTOMATOR_LOG="$LOG_BASE_DIR/${WHOAMI}/${US%.*}.AUTOMATOR.log"
+STDOUT_FIFO="$LOG_BASE_DIR/${WHOAMI}/${US%.*}.stdout.fifo"
+DBG_GOTTEN_FILES_FILELIST="$LOG_BASE_DIR/${WHOAMI}/${US%.*}.DBG_got-files-list." # $WHAT will be appended
 DBG=""
 VRB=""
 #DBG=1
@@ -101,8 +130,8 @@ FILELIST_CNT=0; # number of files in the FILELIST
   # queues on the mutex while the other runs -- and a SHARED name meant the
   # holder's cleanup() deleted the waiter's input list. The waiter then woke up
   # with no files and died in realpath "" (ERROR 059).
-  PROVIDED_FILES_FILELIST="/var/lib/mine/${WHOAMI}/${US%.*}.$$.filelist"
-  #AUTOMATOR_FILELIST="/var/lib/mine/${US%.*}.automator-filelist" <<< will be created by the AUTOMATOR script and then passed to --part-1/--part-2 via --file!
+  PROVIDED_FILES_FILELIST="$DATA_BASE_DIR/${WHOAMI}/${US%.*}.$$.filelist"
+  #AUTOMATOR_FILELIST="$DATA_BASE_DIR/${US%.*}.automator-filelist" <<< will be created by the AUTOMATOR script and then passed to --part-1/--part-2 via --file!
 
   TMP_PRE_INP_PATH="/tmp/my-ocr.pre_,ocr.in_TMP-path" # == TMP_PATH, we first collect all files in, before moving this DIR into INP_PATH
   # ^^ COLLECT_INP_PATH will be set to last_part_of_path of TMP_PRE_INP_PATH
@@ -113,7 +142,7 @@ FILELIST_CNT=0; # number of files in the FILELIST
   WRONG_FILETYPE_CNT=0;
   IGNORED_CNT=0;
   ENCRYPTED_CNT=0;
-  ENCRYPTED_PDFS_FILELIST="/var/lib/mine/${WHOAMI}/${US%.*}.$$.encrypted-pdfs.filelist"  # per-invocation, see PROVIDED_FILES_FILELIST
+  ENCRYPTED_PDFS_FILELIST="$DATA_BASE_DIR/${WHOAMI}/${US%.*}.$$.encrypted-pdfs.filelist"  # per-invocation, see PROVIDED_FILES_FILELIST
 
   ERR_CODE="" # will be set by function_err()
 
@@ -124,22 +153,22 @@ FILELIST_CNT=0; # number of files in the FILELIST
 
   # FLAGFILES ARE *NOT* flagged with ${WHOAMI} - to be cross user active!:
 
-  OCRAPP_LOCKFILE="/var/lib/mine/${WHOAMI}/${US%.*}.$OCRAPP_NAME.lock" # == LOGFILE
+  OCRAPP_LOCKFILE="$DATA_BASE_DIR/${WHOAMI}/${US%.*}.$OCRAPP_NAME.lock" # == LOGFILE
   WE_CREATED_OCRAPP_LOCKFILE="" # <<< used by cleanup()
   # A SEPARATE, atomic mutex. OCRAPP_LOCKFILE cannot serve as one: it is also
   # the 'placing-files' barrier AND the data file that part-1 fills and part-2
   # rewrites. mkdir is the POSIX test-and-set; "[ -e ] && touch" is a race.
-  OCRAPP_MUTEX_DIR="/var/lib/mine/${WHOAMI}/${US%.*}.$OCRAPP_NAME.mutex"
+  OCRAPP_MUTEX_DIR="$DATA_BASE_DIR/${WHOAMI}/${US%.*}.$OCRAPP_NAME.mutex"
   WE_HOLD_OCRAPP_MUTEX=""    # <<< used by cleanup()
-  PARTx_ERRORED_FLAGFILE="/var/lib/mine/${US%.*}.PARTx-ERRORED.flagfile" # used by do_trigger_ocr_mode() to see if the partx errored out and we have to abort!
-  DBG_FLAGFILE="/var/lib/mine/${US%.*}.DBG.flagfile" # will be set, if called with --debug / -D in trigger-OCR do_trigger_ocr mode!
-  FORCE_FLAGFILE="/var/lib/mine/${US%.*}.FORCE.flagfile" # will be set, if called with --force / -f in trigger-OCR do_trigger_ocr mode!
+  PARTx_ERRORED_FLAGFILE="$DATA_BASE_DIR/${US%.*}.PARTx-ERRORED.flagfile" # used by do_trigger_ocr_mode() to see if the partx errored out and we have to abort!
+  DBG_FLAGFILE="$DATA_BASE_DIR/${US%.*}.DBG.flagfile" # will be set, if called with --debug / -D in trigger-OCR do_trigger_ocr mode!
+  FORCE_FLAGFILE="$DATA_BASE_DIR/${US%.*}.FORCE.flagfile" # will be set, if called with --force / -f in trigger-OCR do_trigger_ocr mode!
   # Set when trigger-OCR was run from a terminal. part-1/part-2 are launched by
   # AUTOMATOR and so NEVER have a tty of their own -- they cannot tell an
   # interactive run from a Folder Action, so trigger-OCR has to tell them.
-  INTERACTIVE_FLAGFILE="/var/lib/mine/${US%.*}.INTERACTIVE.flagfile"
+  INTERACTIVE_FLAGFILE="$DATA_BASE_DIR/${US%.*}.INTERACTIVE.flagfile"
 
-  OCRAPP_STATEFILE="/var/lib/mine/${US%.*}.$OCRAPP_NAME.pids" # == contains "" or the PID(s) of the OCRAPP already running, when --part-1 was called
+  OCRAPP_STATEFILE="$DATA_BASE_DIR/${US%.*}.$OCRAPP_NAME.pids" # == contains "" or the PID(s) of the OCRAPP already running, when --part-1 was called
 
   # for do_health_check()
   du_params="" #="-k"
@@ -172,18 +201,18 @@ FILELIST_CNT=0; # number of files in the FILELIST
   # /bin/tcsh /bin/zsh /usr/bin/perl /usr/bin/ruby /usr/local/bin/python[3].
   WORKFLOW_SHELL="/bin/zsh"
 
-  QUEUED_FILE_MOVES_LOG="/var/lib/mine/${US%.*}.$OCRAPP_NAME.files-2-move" # <<<< contains 2 TAB separated columns: {source}\t{target}
+  QUEUED_FILE_MOVES_LOG="$DATA_BASE_DIR/${US%.*}.$OCRAPP_NAME.files-2-move" # <<<< contains 2 TAB separated columns: {source}\t{target}
   # A REFUSAL is not a FAILURE. The OCR ran; the verification gate judged the
   # result unusable and rolled back. part-2 records those here (2 TAB separated
   # columns: {original}\t{why}) so trigger-OCR's summary can say what actually
   # happened instead of calling it "FAILED to be OCRed" -- which sends you
   # hunting for a broken tool when the honest answer is "there was nothing to
   # OCR on that page".
-  REFUSED_FILES_LOG="/var/lib/mine/${US%.*}.$OCRAPP_NAME.refused"
+  REFUSED_FILES_LOG="$DATA_BASE_DIR/${US%.*}.$OCRAPP_NAME.refused"
   # Documents the OCR ran on and found no text in. They are FILED, like any
   # other success -- this list exists so the summary can say so on its own
   # line instead of hiding them inside the success total.
-  NOTEXT_FILES_LOG="/var/lib/mine/${US%.*}.$OCRAPP_NAME.notext"
+  NOTEXT_FILES_LOG="$DATA_BASE_DIR/${US%.*}.$OCRAPP_NAME.notext"
   # All files we got (via stdin and/or via command-line) that are not yet OCR-ed will have an entry in this file!
 
 # Every SETTING -- folders, languages, timeouts, the export -- has its one
@@ -203,18 +232,16 @@ FILELIST_CNT=0; # number of files in the FILELIST
 # The ONE list the search walks and every message about the search names, so the
 # two cannot drift apart. $<NAME>_CONFIG and --config come before it.
 config_search_paths() {
-  printf '%s\n' "${LINKS:-/LINKS}/default/${US%.*}.conf" "${LINKS:-/LINKS}/default/${US%.*}" \
-                "$HOME/.${US%.*}.conf" "/etc/${US%.*}.conf" "/usr/local/etc/${US%.*}.conf"
+  [ -z "$CONFIG_SEARCH_DIR" ] || printf '%s\n' "$CONFIG_SEARCH_DIR/${US%.*}.conf" "$CONFIG_SEARCH_DIR/${US%.*}"
+  printf '%s\n' "$HOME/.${US%.*}.conf" "/etc/${US%.*}.conf" "/usr/local/etc/${US%.*}.conf"
 }
 
 default_config_content() {
   cat <<'_EOCONF_'
 # my-ocr configuration -- plain shell, sourced at start-up.
 #
-# Searched in this order, first found wins:
-#   $MY_OCR_CONFIG, --config <FILE>, /LINKS/default/my-ocr.conf,
-#   /LINKS/default/my-ocr, ~/.my-ocr.conf, /etc/my-ocr.conf,
-#   /usr/local/etc/my-ocr.conf
+# Searched, first found wins: $MY_OCR_CONFIG, --config <FILE>, then the
+# list --help names.
 # This text IS my-ocr's defaults: it loads it first, then your file on top.
 # So a config holding only the lines you change is complete; anything not set
 # here keeps the default printed by 'my-ocr --create-config'.
@@ -405,6 +432,10 @@ a file called '--part-1' ;))
                  $(config_search_paths | tr '\n' ' ')
                  The file is optional: none found = the defaults --create-config
                  prints, and a file needs only the lines it changes.
+                 $SITE_CONF, when there, is read first: the site's
+                 CONFIG_SEARCH_DIR, and DATA_BASE_DIR / LOG_BASE_DIR, under
+                 which the state and log files lie (without it: /var/db,
+                 /var/log, no search directory).
 --create-config [<FILE>]
                  Print the default config, or write it to <FILE> (never over an
                  existing one). Every setting, with its default and why -- e.g.:
@@ -541,7 +572,7 @@ exit;
 # other runs), and keyed by MODE alone they shared ONE registry -- so the first
 # to finish deleted the second's files, and the second then died on an input
 # list that was no longer there. Per-mode is not unique enough; per-run is.
-CLEANUP_FILELIST_FILE="/var/log/mine/${US%.*}.$$.CLEANUP-FILELIST.log"
+CLEANUP_FILELIST_FILE="$LOG_BASE_DIR/${US%.*}.$$.CLEANUP-FILELIST.log"
 CLEANUP_PIDS=""
 CLEANUP_DONE=""
 schedule_for_cleanup() {
@@ -786,20 +817,6 @@ touch() {
   return 0
 }
 
-
-err() { ERR_CODE="$1"; [ -z "$2" ] && local msg="Please fix." || local msg="$2"; [ -z "$3" ] && local exitCode=1 || local exitCode="$3";
-  #echo "$$|DBG: err() WHAT='$WHAT'"
-  case "$WHAT" in part-1|part-2) # if --part-1 | --part-2  --> (i) NFY     --> (ii) create PARTx_ERRORED_FLAGFILE (for do_trigger_ocr() to find)!
-    if [ $NFY ]; then
-      (echo "$$|"; echo "$$|LAUNCHING: \"$my_notify\" -- \"with below ERROR $ERR_CODE\"") 1>&2
-      "$my_notify" -- "ERROR $ERR_CODE [$exitCode]:" "$msg"
-    fi
-    echo "$$|$( date +"%Y-%m-%d_%H%M.%S") [$WHAT] ERROR $ERR_CODE [$exitCode]: $msg" >>"$PARTx_ERRORED_FLAGFILE" \
-    || ( echo "$$|"; echo "$$|err() :: FAILED [$?] TO Create FLAGFILE '$PARTx_ERRORED_FLAGFILE'" ) 1>&2;;
-  esac
-  ( echo "$$|"; echo "$$|$( date +"%Y-%m-%d_%H%M.%S") [$WHAT] ERROR $ERR_CODE [$exitCode]: $msg" ) 1>&2
-  exit $exitCode;
-}
 
 
 # USED BY   do_part_1 / --part-1   and   do_part_2 / --part-2    and    do_trigger_ocr / trigger-OCR
@@ -2838,9 +2855,9 @@ run_work_alive() {
 
 # Every per-run file whose owning pid is gone, one per line.
 stale_run_files() {
-  for _sf in /var/lib/mine/"$WHOAMI"/"${US%.*}".[0-9]*.filelist \
-             /var/lib/mine/"$WHOAMI"/"${US%.*}".[0-9]*.encrypted-pdfs.filelist \
-             /var/log/mine/"${US%.*}".[0-9]*.CLEANUP-FILELIST.log*; do
+  for _sf in "$DATA_BASE_DIR"/"$WHOAMI"/"${US%.*}".[0-9]*.filelist \
+             "$DATA_BASE_DIR"/"$WHOAMI"/"${US%.*}".[0-9]*.encrypted-pdfs.filelist \
+             "$LOG_BASE_DIR"/"${US%.*}".[0-9]*.CLEANUP-FILELIST.log*; do
     [ -e "$_sf" ] || continue
     _sp="${_sf##*/}"; _sp="${_sp#"${US%.*}".}"; _sp="${_sp%%.*}"
     case "$_sp" in ''|*[!0-9]*) continue;; esac
@@ -4230,6 +4247,34 @@ rt_trash_by_mv() {
     *"LOCKED-FAILED ["?*"]"*) t_ok "trash: a refused move fails, and carries mv's own words";;
     *) t_bad "trash: a refused move fails, and carries mv's own words" "$_tt_o";;
   esac
+}
+
+# --- the site file, and nothing else, moves the state and log bases and the
+#     config search; no site directory is written into the script itself
+# shellcheck disable=SC2030,SC2031,SC2016  # each read_site runs in a subshell of its own, on purpose; the '$' in the site file's comment is the literal under test
+rt_site_conf() {
+  _sc_d="$T_TMP/site"; mkdir "$_sc_d" "$_sc_d/farm"
+  _sc_o="$(grep -nE '/var/(lib|log)/mine' "$0")"
+  if [ -z "$_sc_o" ]; then t_ok "site: no state or log directory of this site in the script"
+  else t_bad "site: no state or log directory of this site in the script" "$_sc_o"; fi
+  _sc_o=$( (DATA_BASE_DIR=/elsewhere; export DATA_BASE_DIR; SITE_CONF="$_sc_d/none"; read_site
+            printf '%s|%s|%s' "$DATA_BASE_DIR" "$LOG_BASE_DIR" "$CONFIG_SEARCH_DIR") 2>&1)
+  if [ "$_sc_o" = "/var/db|/var/log|" ]; then t_ok "site: none = the neutral bases, the environment ignored"
+  else t_bad "site: none = the neutral bases, the environment ignored" "$_sc_o"; fi
+  printf '%s\n' '# no $(...), no $VAR' 'DATA_BASE_DIR="/srv/data"' 'LOG_BASE_DIR="/srv/log"' \
+    "CONFIG_SEARCH_DIR=\"$_sc_d/farm\"" >"$_sc_d/site.conf"
+  _sc_o=$( (SITE_CONF="$_sc_d/site.conf"; read_site; printf '%s|%s|' "$DATA_BASE_DIR" "$LOG_BASE_DIR"
+            config_search_paths | head -n 2 | tr '\n' '|') 2>&1)
+  if [ "$_sc_o" = "/srv/data|/srv/log|$_sc_d/farm/${US%.*}.conf|$_sc_d/farm/${US%.*}|" ]; then
+    t_ok "site: its bases, and its search directory first (<tool>.conf, then <tool>)"
+  else t_bad "site: its bases, and its search directory first (<tool>.conf, then <tool>)" "$_sc_o"; fi
+  chmod 000 "$_sc_d/site.conf"
+  _sc_o=$( (SITE_CONF="$_sc_d/site.conf"; read_site; echo "fell back to $DATA_BASE_DIR") 2>&1)
+  case "$_sc_o" in
+    *"ERROR 179"*"cannot read"*) t_ok "site: there but unreadable is an error, never the fallback";;
+    *) t_bad "site: there but unreadable is an error, never the fallback" "$_sc_o";;
+  esac
+  chmod 600 "$_sc_d/site.conf"
 }
 
 rt_config_file() {
@@ -5825,6 +5870,7 @@ do_run_tests() {
     _rt fa_restart && rt_fa_restart
     _rt workflow_export && rt_workflow_export
     _rt config_file && rt_config_file
+    _rt site_conf && rt_site_conf
     _rt split_pref && rt_split_pref
     _rt trash_by_mv && rt_trash_by_mv
     _rt open_cmd && rt_open_cmd
