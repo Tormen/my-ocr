@@ -1,6 +1,6 @@
 #!/bin/dash
 
-# 180 == highest used errCode
+# 181 == highest used errCode
 
 US="${0##*/}";   # get filename without path
 
