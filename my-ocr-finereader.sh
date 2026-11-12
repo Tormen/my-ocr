@@ -44,12 +44,33 @@ err() { ERR_CODE="$1"; [ -z "$2" ] && local msg="Please fix." || local msg="$2";
 # The site's values for every tool, from SITE_CONF -- the one site path this
 # tool reads: DATA_BASE_DIR and LOG_BASE_DIR, under which every state and log
 # file below lies, and CONFIG_SEARCH_DIR (config_search_paths). The neutral
-# values come first, so an exported variable never takes their place. There
-# but unreadable is an error, never the fallback.
+# values come first, so an exported variable never takes their place. Only
+# plainly not there gives them: there but unreadable, a link to nothing or a
+# folder on the way this user cannot search is an error, never the fallback
+# ([ -e ] alone answers "no" for the last two).
 SITE_CONF="/LINKS/default/site.conf"
+# sh: 0 not there, 1 there ([ -r ] it: unreadable is the error), 2 cannot tell
+site_absent() {
+	_sa_p=$1
+	[ -e "$_sa_p" ] && return 1
+	[ -L "$_sa_p" ] && return 2
+	while :; do
+		_sa_d=$(dirname -- "$_sa_p")
+		[ "$_sa_d" = "$_sa_p" ] && return 0
+		if [ -e "$_sa_d" ] || [ -L "$_sa_d" ]; then
+			[ -d "$_sa_d" ] && [ -x "$_sa_d" ] && return 0
+			return 2
+		fi
+		_sa_p=$_sa_d
+	done
+}
 read_site() {
   DATA_BASE_DIR="/var/db"; LOG_BASE_DIR="/var/log"; CONFIG_SEARCH_DIR=""
-  [ -e "$SITE_CONF" ] || return 0
+  _rs_a=0; site_absent "$SITE_CONF" || _rs_a=$?
+  case $_rs_a in
+    0) return 0 ;;
+    2) err 181 "cannot tell whether '$SITE_CONF' is there -- a link to nothing, or a folder on the way $WHOAMI cannot search; its group must include $WHOAMI" ;;
+  esac
   [ -r "$SITE_CONF" ] || err 179 "cannot read '$SITE_CONF' -- the site's directories for every tool; its group must include $WHOAMI"
   # shellcheck disable=SC1090  # the path is only known at run time
   . "$SITE_CONF" || err 180 "'$SITE_CONF' failed to load"
@@ -4277,6 +4298,27 @@ rt_site_conf() {
   chmod 600 "$_sc_d/site.conf"
 }
 
+# --- the site file behind a folder this user cannot search, or a link to
+#     nothing, is an error -- never the neutral bases; plainly not there is
+# shellcheck disable=SC2030,SC2031  # each read_site runs in a subshell of its own, on purpose
+rt_site_conf_cannot_tell() {
+  _su_d="$T_TMP/site-cannot-tell"; mkdir "$_su_d" "$_su_d/locked"
+  : >"$_su_d/locked/site.conf"; chmod 000 "$_su_d/locked"
+  ln -s "$_su_d/nowhere" "$_su_d/dangling.conf"
+  for _su_c in locked/site.conf dangling.conf; do
+    _su_o=$( (SITE_CONF="$_su_d/$_su_c"; read_site; echo "fell back to $DATA_BASE_DIR") 2>&1)
+    case "$_su_o" in
+      *"ERROR 181"*"cannot tell"*) t_ok "site: $_su_c is an error, never the fallback";;
+      *) t_bad "site: $_su_c is an error, never the fallback" "$_su_o";;
+    esac
+  done
+  chmod 700 "$_su_d/locked"
+  _su_o=$( (SITE_CONF="$_su_d/absent/site.conf"; read_site
+            printf '%s|%s|%s' "$DATA_BASE_DIR" "$LOG_BASE_DIR" "$CONFIG_SEARCH_DIR") 2>&1)
+  if [ "$_su_o" = "/var/db|/var/log|" ]; then t_ok "site: plainly not there = the neutral bases"
+  else t_bad "site: plainly not there = the neutral bases" "$_su_o"; fi
+}
+
 rt_config_file() {
   _tc_d="$T_TMP/config"; mkdir -p "$_tc_d"
   # Each default exists ONCE: in default_config_content(). A second assignment
@@ -5871,6 +5913,7 @@ do_run_tests() {
     _rt workflow_export && rt_workflow_export
     _rt config_file && rt_config_file
     _rt site_conf && rt_site_conf
+    _rt site_conf_cannot_tell && rt_site_conf_cannot_tell
     _rt split_pref && rt_split_pref
     _rt trash_by_mv && rt_trash_by_mv
     _rt open_cmd && rt_open_cmd
